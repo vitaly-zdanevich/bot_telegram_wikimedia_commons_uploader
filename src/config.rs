@@ -40,6 +40,8 @@ pub struct Config {
     pub commons_api_url: String,
     /// User-Agent sent to Commons, per MediaWiki API etiquette.
     pub user_agent: String,
+    /// Optional HTTP(S) proxy URL for Commons traffic (to upload from a non-blocked IP).
+    pub commons_proxy: Option<String>,
 }
 
 impl Config {
@@ -91,6 +93,7 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| DEFAULT_COMMONS_API_URL.into()),
             user_agent,
+            commons_proxy: lookup("COMMONS_PROXY").filter(|value| !value.trim().is_empty()),
         }
     }
 

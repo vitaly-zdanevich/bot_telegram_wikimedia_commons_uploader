@@ -121,7 +121,11 @@ impl Bot {
     fn from_config(config: Config) -> Self {
         let telegram = TelegramClient::new(config.telegram_bot_token.clone().unwrap_or_default());
         let store = Store::new(&config);
-        let commons = CommonsClient::new(config.commons_api_url.clone(), config.user_agent.clone());
+        let commons = CommonsClient::new(
+            config.commons_api_url.clone(),
+            config.user_agent.clone(),
+            config.commons_proxy.clone(),
+        );
         let cipher = config
             .credential_enc_key
             .as_deref()

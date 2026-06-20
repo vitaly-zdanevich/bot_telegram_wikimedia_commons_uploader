@@ -46,6 +46,12 @@ variable "github_url" {
   default     = "https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader"
 }
 
+variable "commons_proxy" {
+  type        = string
+  description = "Optional HTTP(S) proxy URL for Commons traffic, to upload from a non-blocked IP (Wikimedia blocks AWS data-centre IPs). E.g. a proxy on Wikimedia Cloud VPS."
+  default     = ""
+}
+
 variable "default_license" {
   type        = string
   description = "Default license key: cc-by-4.0, cc-by-sa-4.0, or cc-zero."

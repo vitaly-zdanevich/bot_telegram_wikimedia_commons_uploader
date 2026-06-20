@@ -17,6 +17,7 @@ const MAX_FILENAME_STEM_BYTES: usize = 200;
 pub struct CommonsClient {
     api_url: String,
     user_agent: String,
+    proxy: Option<String>,
 }
 
 /// Result of attempting an upload.
@@ -46,18 +47,30 @@ pub struct UploadRequest {
 
 impl CommonsClient {
     /// Creates a Commons client for an API endpoint and User-Agent.
-    pub fn new(api_url: impl Into<String>, user_agent: impl Into<String>) -> Self {
+    pub fn new(
+        api_url: impl Into<String>,
+        user_agent: impl Into<String>,
+        proxy: Option<String>,
+    ) -> Self {
         Self {
             api_url: api_url.into(),
             user_agent: user_agent.into(),
+            proxy,
         }
     }
 
     /// Builds a fresh cookie-aware client so one login session spans the request chain.
+    ///
+    /// Routes through `COMMONS_PROXY` when set, so uploads can use a non-blocked IP.
     fn session_client(&self) -> Result<Client> {
-        Client::builder()
+        let mut builder = Client::builder()
             .user_agent(&self.user_agent)
-            .cookie_store(true)
+            .cookie_store(true);
+        if let Some(proxy) = &self.proxy {
+            builder =
+                builder.proxy(reqwest::Proxy::all(proxy).context("invalid COMMONS_PROXY URL")?);
+        }
+        builder
             .build()
             .context("failed to build Commons HTTP client")
     }

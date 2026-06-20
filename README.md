@@ -74,6 +74,10 @@ Affected uploads need the account to hold a global IP-block exemption, or the bo
 Commons traffic through a non-blocked IP (e.g. an outbound proxy). The bot replies with a
 clear message when this happens.
 
+Set the `commons_proxy` Terraform variable (env `COMMONS_PROXY`) to route Commons
+login/upload traffic through a clean IP — for example a small proxy on **Wikimedia Cloud
+VPS / Toolforge**, whose IPs are not blocked. Then `terraform apply` to update the Lambda.
+
 ### Commands & settings
 
 - `/start` — connect your account / resume setup
