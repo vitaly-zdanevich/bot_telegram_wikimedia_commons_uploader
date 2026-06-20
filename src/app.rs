@@ -287,6 +287,7 @@ impl Bot {
                         .await;
                 };
                 let username = profile.commons_username.clone().unwrap_or_default();
+                self.telegram.send_chat_action(chat_id, "typing").await.ok();
                 match self.commons.validate_credentials(&username, text).await {
                     Ok(()) => {
                         profile.credential_ciphertext = Some(cipher.encrypt(text)?);
@@ -513,6 +514,7 @@ impl Bot {
                 .send_message(chat_id, "This command is for administrators only.", None)
                 .await;
         }
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
         let stats = self.store.aggregate_stats().await.unwrap_or_default();
         let text = format!(
             "📊 <b>Stats</b>\nUsers: <b>{}</b>\nTotal uploads: <b>{}</b>",
@@ -686,6 +688,10 @@ impl Bot {
             .decrypt(profile.credential_ciphertext.as_deref().unwrap_or_default())
             .context("failed to decrypt stored credentials")?;
 
+        self.telegram
+            .send_chat_action(chat_id, "upload_document")
+            .await
+            .ok();
         let outcome = self
             .commons
             .upload(&UploadRequest {
