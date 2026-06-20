@@ -439,7 +439,7 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
     let mut date = None;
     for line in caption.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = strip_prefix_ci(trimmed, &["categories:", "category:"]) {
+        if let Some(rest) = strip_prefix_ci(trimmed, &["categories:", "category:", "c:"]) {
             for raw in rest.split(',') {
                 let category = clean_category(raw);
                 if !category.is_empty() {
@@ -450,7 +450,7 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
             if !rest.is_empty() {
                 source = Some(rest.to_string());
             }
-        } else if let Some(rest) = strip_prefix_ci(trimmed, &["author:"]) {
+        } else if let Some(rest) = strip_prefix_ci(trimmed, &["author:", "a:"]) {
             if !rest.is_empty() {
                 author = Some(rest.to_string());
             }
@@ -469,6 +469,64 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
         author,
         date,
     }
+}
+
+/// A standalone "set defaults" command parsed from a chat message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SettingsCommand {
+    /// Categories to add to the user's defaults.
+    pub categories: Vec<String>,
+    /// New default author, if set.
+    pub author: Option<String>,
+    /// New filename prefix, if set.
+    pub prefix: Option<String>,
+}
+
+impl SettingsCommand {
+    /// Returns true when no directive matched.
+    pub fn is_empty(&self) -> bool {
+        self.categories.is_empty() && self.author.is_none() && self.prefix.is_none()
+    }
+}
+
+/// Parses a standalone settings message. Each line may set a directive, with or without a
+/// colon and via a short alias: `Category X`/`c X`, `Author X`/`a X`, `Prefix X`/`p X`.
+pub fn parse_settings_command(text: &str) -> SettingsCommand {
+    let mut command = SettingsCommand::default();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = directive_value(trimmed, &["categories", "category", "c"]) {
+            for raw in rest.split(',') {
+                let category = clean_category(raw);
+                if !category.is_empty() {
+                    command.categories.push(category);
+                }
+            }
+        } else if let Some(rest) = directive_value(trimmed, &["author", "a"]) {
+            if !rest.is_empty() {
+                command.author = Some(rest.to_string());
+            }
+        } else if let Some(rest) = directive_value(trimmed, &["prefix", "p"]) {
+            command.prefix = Some(rest.to_string());
+        }
+    }
+    command
+}
+
+/// Returns a directive's value when the line starts with one of `keywords` followed by a
+/// colon or whitespace (colon optional). Keywords must be lower-case, longest first.
+fn directive_value<'a>(line: &'a str, keywords: &[&str]) -> Option<&'a str> {
+    let lower = line.to_ascii_lowercase();
+    for keyword in keywords {
+        if let Some(rest) = lower.strip_prefix(keyword)
+            && (rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace))
+        {
+            let after = line[keyword.len()..].trim_start();
+            let after = after.strip_prefix(':').unwrap_or(after);
+            return Some(after.trim());
+        }
+    }
+    None
 }
 
 /// Returns the text after any of the case-insensitive prefixes, if the line has one.

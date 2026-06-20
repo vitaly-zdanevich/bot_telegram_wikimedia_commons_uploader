@@ -371,6 +371,25 @@ impl Bot {
                     .await
             }
             OnboardingStep::Done => {
+                let command = crate::commons::parse_settings_command(text);
+                if !command.is_empty() {
+                    if !command.categories.is_empty() {
+                        profile.default_categories =
+                            merge_categories(&profile.default_categories, &command.categories);
+                    }
+                    if let Some(author) = command.author {
+                        profile.default_author = Some(author);
+                    }
+                    if let Some(prefix) = command.prefix {
+                        profile.filename_prefix = prefix;
+                    }
+                    touch(&mut profile);
+                    self.store.put_profile(user_id, &profile).await?;
+                    return self
+                        .telegram
+                        .send_message(chat_id, &defaults_summary(&profile), None)
+                        .await;
+                }
                 self.telegram
                     .send_message(
                         chat_id,
@@ -727,7 +746,10 @@ impl Bot {
         let wikitext = build_wikitext(&DescriptionParams {
             description: &parsed.description,
             author_username: &username,
-            author_override: parsed.author.as_deref(),
+            author_override: parsed
+                .author
+                .as_deref()
+                .or(profile.default_author.as_deref()),
             source: parsed.source.as_deref(),
             license: profile.license,
             categories: &categories,
@@ -1029,6 +1051,31 @@ fn skip_prefix_keyboard() -> InlineKeyboardMarkup {
 /// Renders a boolean as a human on/off label.
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+/// Summarizes a user's upload defaults after a settings directive.
+fn defaults_summary(profile: &Profile) -> String {
+    let mut parts = Vec::new();
+    if !profile.default_categories.is_empty() {
+        parts.push(format!(
+            "categories: {}",
+            profile.default_categories.join(", ")
+        ));
+    }
+    if let Some(author) = &profile.default_author {
+        parts.push(format!("author: {author}"));
+    }
+    if !profile.filename_prefix.is_empty() {
+        parts.push(format!("filename prefix: {}", profile.filename_prefix));
+    }
+    if parts.is_empty() {
+        "✅ Upload defaults cleared.".to_string()
+    } else {
+        format!(
+            "✅ Your upload defaults — {}",
+            escape_html(&parts.join("; "))
+        )
+    }
 }
 
 /// Updates the profile timestamps before a save.

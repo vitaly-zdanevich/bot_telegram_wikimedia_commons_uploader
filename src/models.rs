@@ -104,6 +104,8 @@ pub struct Profile {
     pub onboarding_step: OnboardingStep,
     /// Categories added to every upload (user-configured default).
     pub default_categories: Vec<String>,
+    /// Default author override applied when an upload's caption sets none.
+    pub default_author: Option<String>,
     /// Whether to reply with the Commons file link after each successful upload.
     pub return_upload_links: bool,
     /// Whether to reply with links to the categories used in each upload.
