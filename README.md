@@ -40,6 +40,11 @@ Date: 2009-12-03
 defaults (own work / your account / EXIF date). EXIF `DateTimeOriginal` and GPS are read
 automatically (date → `{{Information}}`, GPS → `{{Location dec}}`).
 
+Each file is named **`<your prefix> <caption text> <original name>`**, with emoji and line
+breaks stripped — e.g. caption "Minsk trip" + `IMG_5638.DNG` → `Minsk trip IMG_5638.webp`.
+The caption becomes a descriptive prefix on every photo of an album, and the original name
+keeps them unique (bare generic names like `IMG_5638` are otherwise blocked by Commons).
+
 ### Accepted formats
 
 Uploaded as-is when Commons accepts them: **JPEG, PNG, GIF, SVG, TIFF, WebP, XCF, PDF,
@@ -151,7 +156,7 @@ with this bot or with uploading to Wikimedia Commons in general.
 
 ## Related projects
 
-- [bot_telegram_wikimedia_commons](https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons) — Telegram bot to **search/read** Commons media.
+- [bot_telegram_wikimedia_commons](https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons) ([@wikimedia_commons_bot](https://t.me/wikimedia_commons_bot)) — Telegram bot to **search/get** Commons media.
 - [Browser extension to upload to Commons](https://gitlab.com/vitaly-zdanevich-extensions/uploading-to-wikimedia-commons).
 - [pwb_wrapper_for_simpler_uploading_to_commons](https://gitlab.com/vitaly_zdanevich_wikimedia/pwb_wrapper_for_simpler_uploading_to_commons) — CLI (Pywikibot wrapper) for simpler Commons uploads.
 - [gThumb Wikimedia Commons extension](https://gitlab.com/vitaly_zdanevich_wikimedia/gthumb-wikimedia-commons-extension).
