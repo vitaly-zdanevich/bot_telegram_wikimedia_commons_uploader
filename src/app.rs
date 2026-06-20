@@ -219,7 +219,7 @@ impl Bot {
                     .send_message(
                         chat_id,
                         "Now send the <b>bot password</b> (the generated password from that page). I delete your message immediately and store it encrypted.",
-                        None,
+                        Some(change_username_keyboard()),
                     )
                     .await
             }
@@ -298,10 +298,12 @@ impl Bot {
                     }
                     Err(error) => {
                         let text = format!(
-                            "❌ Login failed: {}\n\nThe username or bot password was wrong. Send the <b>bot password</b> again to retry, or /start to re-enter the username.",
+                            "❌ Login failed: {}\n\nThe username or bot password was wrong. Re-send the <b>bot password</b> to retry, or tap the button below to change the username.",
                             escape_html(&format!("{error}"))
                         );
-                        self.telegram.send_message(chat_id, &text, None).await
+                        self.telegram
+                            .send_message(chat_id, &text, Some(change_username_keyboard()))
+                            .await
                     }
                 }
             }
@@ -374,6 +376,15 @@ impl Bot {
             self.store.put_profile(user_id, &profile).await?;
             let text = format!("License set to <b>{}</b>.", escape_html(license.label()));
             return self.telegram.send_message(chat_id, &text, None).await;
+        }
+
+        if data == "onb:username" {
+            profile.onboarding_step = OnboardingStep::AwaitingUsername;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .prompt_step(chat_id, OnboardingStep::AwaitingUsername)
+                .await;
         }
 
         let (label, value) = match data.as_str() {
@@ -921,6 +932,17 @@ fn toggle_button(label: &str, data: &str, value: bool) -> InlineKeyboardButton {
         text: format!("{label}: {}", on_off(value)),
         callback_data: Some(data.to_string()),
         url: None,
+    }
+}
+
+/// Builds a keyboard with a single button to restart username entry.
+fn change_username_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "✏️ Change username".to_string(),
+            callback_data: Some("onb:username".to_string()),
+            url: None,
+        }]],
     }
 }
 
