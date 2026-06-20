@@ -55,8 +55,8 @@ Converted first, because Commons does **not** accept them:
 
 | Input | Converted to | Notes |
 | ----- | ------------ | ----- |
-| DNG (raw) | WebP (lossy, quality configurable) | original SHA-1/MD5 + filename recorded on the file page |
-| HEIC/HEIF | WebP (lossy) | needs the libheif build (see below) |
+| DNG (raw) | WebP (lossy) | developed from the raw, or the **embedded full-resolution JPEG** is extracted when the camera is unsupported; original SHA-1/MD5 + filename recorded |
+| HEIC/HEIF | WebP (lossy) | decoded with libheif; needs the libheif build (see below) |
 | BMP | WebP (lossless) | |
 
 > AVIF is **not** accepted by Commons (still a wishlist item), which is why DNG/HEIC/BMP

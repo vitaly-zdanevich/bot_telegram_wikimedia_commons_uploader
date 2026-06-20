@@ -90,23 +90,84 @@ pub fn passthrough_extension(file_name: Option<&str>, mime: Option<&str>) -> Str
     mime_extension(mime).unwrap_or("bin").to_string()
 }
 
-/// Decodes and develops a raw DNG into an sRGB 8-bit image via imagepipe.
+/// Decodes a DNG into an sRGB 8-bit image.
+///
+/// Tries imagepipe's full raw develop first (camera-dependent), then falls back to the
+/// embedded full-resolution JPEG preview that most DNGs carry — so DNGs from cameras
+/// imagepipe doesn't know still convert.
 fn decode_dng(bytes: &[u8]) -> Result<RawRgb> {
+    match develop_raw(bytes) {
+        Ok(image) => Ok(image),
+        Err(develop_error) => decode_largest_embedded_jpeg(bytes).ok_or_else(|| {
+            anyhow!("could not decode DNG ({develop_error}); no usable embedded JPEG preview found")
+        }),
+    }
+}
+
+/// Develops a raw file into an sRGB 8-bit image via imagepipe (camera-dependent).
+fn develop_raw(bytes: &[u8]) -> Result<RawRgb> {
     use std::io::Write;
-    let mut file = tempfile::NamedTempFile::new().context("failed to create temp file for DNG")?;
+    let mut file = tempfile::NamedTempFile::new().context("failed to create temp file for raw")?;
     file.write_all(bytes)
-        .context("failed to buffer DNG to disk")?;
+        .context("failed to buffer raw to disk")?;
     file.flush().ok();
-    let mut pipeline = imagepipe::Pipeline::new_from_file(file.path())
-        .map_err(|error| anyhow!("failed to read DNG: {error}"))?;
+    let mut pipeline =
+        imagepipe::Pipeline::new_from_file(file.path()).map_err(|error| anyhow!("{error}"))?;
     let decoded = pipeline
         .output_8bit(None)
-        .map_err(|error| anyhow!("failed to develop DNG: {error}"))?;
+        .map_err(|error| anyhow!("{error}"))?;
     Ok(RawRgb {
         width: decoded.width as u32,
         height: decoded.height as u32,
         data: decoded.data,
     })
+}
+
+/// Extracts and decodes the largest embedded JPEG (the full-size preview) from a file.
+fn decode_largest_embedded_jpeg(bytes: &[u8]) -> Option<RawRgb> {
+    for span in jpeg_spans_largest_first(bytes) {
+        if let Ok(image) = image::load_from_memory_with_format(span, image::ImageFormat::Jpeg) {
+            let rgb = image.to_rgb8();
+            if rgb.width() > 0 && rgb.height() > 0 {
+                return Some(RawRgb {
+                    width: rgb.width(),
+                    height: rgb.height(),
+                    data: rgb.into_raw(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Returns byte ranges that look like complete JPEG streams (SOI…EOI), largest first.
+fn jpeg_spans_largest_first(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF {
+            let mut end = None;
+            let mut j = i + 2;
+            while j + 1 < bytes.len() {
+                if bytes[j] == 0xFF && bytes[j + 1] == 0xD9 {
+                    end = Some(j + 2);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(found) = end {
+                spans.push((i, found));
+                i = found;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
+    spans
+        .into_iter()
+        .map(|(start, end)| &bytes[start..end])
+        .collect()
 }
 
 /// Decodes a HEIC/HEIF image into an sRGB 8-bit buffer via libheif.
@@ -326,5 +387,16 @@ mod tests {
         heic.extend_from_slice(b"ftypheic");
         assert!(is_heic_magic(&heic));
         assert!(!is_heic_magic(b"\xff\xd8\xff\xe0jpeg-data"));
+    }
+
+    #[test]
+    fn finds_largest_jpeg_span_first() {
+        let mut data = vec![0x49, 0x49]; // TIFF-ish leading bytes
+        data.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0x10, 0xFF, 0xD9]); // small span
+        data.extend_from_slice(&[0xFF, 0xD8, 0xFF, 1, 2, 3, 4, 5, 6, 0xFF, 0xD9]); // larger span
+        let spans = super::jpeg_spans_largest_first(&data);
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].len() > spans[1].len());
+        assert_eq!(&spans[0][0..3], &[0xFF, 0xD8, 0xFF]);
     }
 }

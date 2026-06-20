@@ -40,7 +40,7 @@ const RELATED_CLI: &str =
 /// How long a processed Telegram update id is remembered (suppresses webhook retries).
 const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 /// Message shown once onboarding is complete.
-const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>name</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
+const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
@@ -549,7 +549,7 @@ impl Bot {
             None => String::new(),
         };
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n<b>Set up</b>: create a bot password with <b>only “Upload new files”</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>Captions</b>: the caption becomes the description. Extra lines: <code>Categories: A, B</code>, <code>Source: https://…</code>, <code>Author: Name</code> (also apply to a whole album).\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically.\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n<b>Set up</b>: create a bot password with <b>only “Upload new files”</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>Captions</b>: the caption becomes the description. Extra lines: <code>Categories: A, B</code>, <code>Source: https://…</code>, <code>Author: Name</code> (also apply to a whole album).\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         self.telegram.send_message(chat_id, &text, None).await
@@ -630,8 +630,16 @@ impl Bot {
         let (upload_bytes, extension) = if format.needs_conversion() {
             provenance.original_sha1 = Some(sha1_hex(&original));
             provenance.original_md5 = Some(md5_hex(&original));
-            let webp = convert::to_webp(&original, format, self.config.webp_quality)?;
-            (webp, "webp".to_string())
+            match convert::to_webp(&original, format, self.config.webp_quality) {
+                Ok(webp) => (webp, "webp".to_string()),
+                Err(error) => {
+                    let text = format!(
+                        "❌ Couldn't convert this file: {}\n\nTry sending a JPEG or PNG export instead.",
+                        escape_html(&format!("{error}"))
+                    );
+                    return self.telegram.send_message(chat_id, &text, None).await;
+                }
+            }
         } else {
             let extension =
                 convert::passthrough_extension(file.file_name.as_deref(), file.mime.as_deref());
