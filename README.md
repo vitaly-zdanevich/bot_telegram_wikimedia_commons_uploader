@@ -13,10 +13,9 @@ with DynamoDB for per-user settings. Designed to stay within the AWS free tier.
 ## How it works (for users)
 
 1. Send `/start`. The bot asks you to create a **scoped Bot Password** at
-   <https://commons.wikimedia.org/wiki/Special:BotPasswords> — enable **only the Upload
-   grants**, never your real password. You get a username like `YourName@telegram` and a
-   token.
-2. Send the bot-password **username**, then the **token** (the bot deletes your token
+   <https://commons.wikimedia.org/wiki/Special:BotPasswords> — tick **only “Upload new files”**,
+   never your real password. You get a username like `YourName@telegram` and a password.
+2. Send the bot-password **username**, then the **bot password** (the bot deletes your
    message immediately and stores it **AES-256-GCM encrypted**).
 3. Pick a **license** (default **CC BY 4.0**, also CC BY-SA 4.0 or CC0) and an optional
    **filename prefix**.
@@ -137,10 +136,10 @@ datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
 
 ## Security
 
-- Each user authenticates with their **own scoped Bot Password** (Upload grant only),
-  revocable at any time at `Special:BotPasswords`.
-- Tokens are **AES-256-GCM encrypted** before storage; the bot deletes the Telegram
-  message containing your token.
+- Each user authenticates with their **own scoped Bot Password** (only the “Upload new files”
+  grant), revocable at any time at `Special:BotPasswords`.
+- Bot passwords are **AES-256-GCM encrypted** before storage; the bot deletes the Telegram
+  message containing your bot password.
 - The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.
 - Each upload is your own work under your own account, with the attribution category
   `Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich`.

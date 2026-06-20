@@ -211,14 +211,14 @@ impl Bot {
     async fn prompt_step(&self, chat_id: i64, step: OnboardingStep) -> Result<()> {
         match step {
             OnboardingStep::AwaitingUsername => {
-                let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nFirst create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and enable only the <b>Upload</b> grants.\n3. You'll get a username like <code>YourName@telegram</code> and a token.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
+                let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nFirst create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick <b>only “Upload new files”</b> (nothing else).\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
                 self.telegram.send_message(chat_id, text, None).await
             }
             OnboardingStep::AwaitingPassword => {
                 self.telegram
                     .send_message(
                         chat_id,
-                        "Now send the <b>bot password token</b>. I delete your message immediately and store the token encrypted.",
+                        "Now send the <b>bot password</b> (the generated password from that page). I delete your message immediately and store it encrypted.",
                         None,
                     )
                     .await
@@ -298,7 +298,7 @@ impl Bot {
                     }
                     Err(error) => {
                         let text = format!(
-                            "❌ Login failed: {}\n\nCheck the username and token, then send the token again.",
+                            "❌ Login failed: {}\n\nThe username or bot password was wrong. Send the <b>bot password</b> again to retry, or /start to re-enter the username.",
                             escape_html(&format!("{error}"))
                         );
                         self.telegram.send_message(chat_id, &text, None).await
@@ -527,7 +527,7 @@ impl Bot {
             None => String::new(),
         };
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n<b>Set up</b>: create a scoped bot password (Upload grant only) at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>Captions</b>: the caption becomes the description. Extra lines: <code>Categories: A, B</code>, <code>Source: https://…</code>, <code>Author: Name</code> (also apply to a whole album).\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically.\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n<b>Set up</b>: create a bot password with <b>only “Upload new files”</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>Captions</b>: the caption becomes the description. Extra lines: <code>Categories: A, B</code>, <code>Source: https://…</code>, <code>Author: Name</code> (also apply to a whole album).\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically.\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         self.telegram.send_message(chat_id, &text, None).await
