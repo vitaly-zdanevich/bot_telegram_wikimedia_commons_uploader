@@ -76,6 +76,36 @@ pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
     ok_response()
 }
 
+/// Runs the bot as a long-living server using Telegram long polling.
+///
+/// Used for non-Lambda deployments (e.g. Toolforge / Cloud VPS). Paired with a self-hosted
+/// Telegram Bot API server, the file limit rises from 20 MB to ~2 GB, and the clean server
+/// IP avoids Wikimedia's data-centre IP blocks.
+pub async fn run_polling() -> Result<()> {
+    let config = Config::from_env();
+    let bot = Bot::from_config(config);
+    tracing::info!("starting Telegram long-polling loop");
+    let mut offset = 0i64;
+    loop {
+        match bot.telegram.get_updates(offset, 50).await {
+            Ok(updates) => {
+                for update in updates {
+                    if let Some(update_id) = update.update_id {
+                        offset = update_id + 1;
+                    }
+                    if let Err(error) = bot.handle_update(update).await {
+                        tracing::error!(error = %format!("{error:#}"), "failed to handle update");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "getUpdates failed");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
 /// Returns the standard Telegram webhook success response.
 fn ok_response() -> Result<Response<Body>> {
     Ok(Response::builder()
@@ -119,7 +149,10 @@ struct FileRef {
 impl Bot {
     /// Builds a bot from runtime configuration.
     fn from_config(config: Config) -> Self {
-        let telegram = TelegramClient::new(config.telegram_bot_token.clone().unwrap_or_default());
+        let telegram = TelegramClient::new(
+            config.telegram_bot_token.clone().unwrap_or_default(),
+            config.telegram_api_base.clone(),
+        );
         let store = Store::new(&config);
         let commons = CommonsClient::new(
             config.commons_api_url.clone(),

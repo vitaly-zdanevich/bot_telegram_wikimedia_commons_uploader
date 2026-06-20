@@ -9,14 +9,16 @@ use serde_json::{Value, json};
 pub struct TelegramClient {
     client: Client,
     token: String,
+    base_url: String,
 }
 
 impl TelegramClient {
-    /// Creates a Telegram API client.
-    pub fn new(token: impl Into<String>) -> Self {
+    /// Creates a Telegram API client for a base URL (cloud API or self-hosted server).
+    pub fn new(token: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
             token: token.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
 
@@ -92,10 +94,7 @@ impl TelegramClient {
     /// The Telegram cloud Bot API only serves files up to 20 MB, so larger uploads
     /// cannot be retrieved and are reported to the user instead.
     pub async fn download_file(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.token
-        );
+        let url = format!("{}/file/bot{}/{file_path}", self.base_url, self.token);
         let response = self.client.get(url).send().await?.error_for_status()?;
         if let Some(length) = response.content_length()
             && length > max_bytes
@@ -118,6 +117,22 @@ impl TelegramClient {
         self.download_file(&path, max_bytes).await
     }
 
+    /// Long-polls for updates (server mode), returning the parsed updates.
+    pub async fn get_updates(
+        &self,
+        offset: i64,
+        timeout_secs: u64,
+    ) -> Result<Vec<crate::models::Update>> {
+        let payload = json!({
+            "offset": offset,
+            "timeout": timeout_secs,
+            "allowed_updates": ["message", "callback_query"],
+        });
+        let value = self.post_json("getUpdates", &payload).await?;
+        let result = value.get("result").cloned().unwrap_or(Value::Null);
+        Ok(serde_json::from_value(result).unwrap_or_default())
+    }
+
     /// Sends a JSON request to a Telegram Bot API method.
     async fn post_json(&self, method: &str, payload: &Value) -> Result<Value> {
         let response = self
@@ -134,9 +149,9 @@ impl TelegramClient {
         Ok(serde_json::from_str(&body)?)
     }
 
-    /// Builds the Telegram method URL.
+    /// Builds the Telegram method URL against the configured base.
     fn method_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.base_url, self.token)
     }
 }
 

@@ -12,6 +12,8 @@ const DEFAULT_GITHUB_URL: &str =
     "https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader";
 /// Default resource name prefix.
 const DEFAULT_PROJECT_NAME: &str = "telegram-wikimedia-commons-uploader-bot";
+/// Default Telegram Bot API base URL (cloud API; 20 MB download cap).
+const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
 /// Runtime configuration loaded from environment variables.
 #[derive(Clone, Debug)]
@@ -20,6 +22,8 @@ pub struct Config {
     pub telegram_bot_token: Option<String>,
     /// Secret expected in the `X-Telegram-Bot-Api-Secret-Token` header.
     pub telegram_webhook_secret: Option<String>,
+    /// Telegram Bot API base URL — the cloud API, or a self-hosted server for up to 2 GB.
+    pub telegram_api_base: String,
     /// Telegram user ids allowed to use admin commands.
     pub admin_user_ids: Vec<i64>,
     /// Project repository URL shown in `/help`.
@@ -28,6 +32,8 @@ pub struct Config {
     pub aws_region: String,
     /// DynamoDB table name for profiles and idempotency.
     pub dynamodb_table: Option<String>,
+    /// SQLite database path (server mode); takes precedence over DynamoDB when set.
+    pub sqlite_path: Option<String>,
     /// Base64 32-byte master key for AES-GCM credential encryption.
     pub credential_enc_key: Option<String>,
     /// Default license offered during onboarding.
@@ -80,10 +86,14 @@ impl Config {
             telegram_bot_token: lookup("TELEGRAM_BOT_TOKEN").filter(|value| !value.is_empty()),
             telegram_webhook_secret: lookup("TELEGRAM_WEBHOOK_SECRET")
                 .filter(|value| !value.is_empty()),
+            telegram_api_base: lookup("TELEGRAM_API_BASE")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_TELEGRAM_API_BASE.into()),
             admin_user_ids: parse_admin_ids(&lookup("ADMIN_TELEGRAM_USER_IDS").unwrap_or_default()),
             github_url,
             aws_region,
             dynamodb_table: lookup("DYNAMODB_TABLE").filter(|value| !value.is_empty()),
+            sqlite_path: lookup("SQLITE_PATH").filter(|value| !value.trim().is_empty()),
             credential_enc_key: lookup("CREDENTIAL_ENC_KEY")
                 .filter(|value| !value.trim().is_empty()),
             default_license,
