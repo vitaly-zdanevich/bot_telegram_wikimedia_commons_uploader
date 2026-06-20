@@ -160,6 +160,9 @@ pub struct InlineKeyboardButton {
     pub url: Option<String>,
 }
 
+/// Callback-data prefix for license-selection buttons (shared with the handler).
+pub const LICENSE_CALLBACK_PREFIX: &str = "license:";
+
 /// Builds the license-picker keyboard, one license per row.
 pub fn license_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
@@ -168,7 +171,7 @@ pub fn license_keyboard() -> InlineKeyboardMarkup {
             .map(|license| {
                 vec![InlineKeyboardButton {
                     text: license.label().to_string(),
-                    callback_data: Some(format!("license:{}", license.as_key())),
+                    callback_data: Some(format!("{LICENSE_CALLBACK_PREFIX}{}", license.as_key())),
                     url: None,
                 }]
             })
@@ -201,5 +204,17 @@ mod tests {
     #[test]
     fn escapes_html_special_characters() {
         assert_eq!(escape_html("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    #[test]
+    fn license_button_callback_data_parses_back() {
+        use super::LICENSE_CALLBACK_PREFIX;
+        for row in license_keyboard().inline_keyboard {
+            let data = row[0].callback_data.as_deref().unwrap();
+            let key = data
+                .strip_prefix(LICENSE_CALLBACK_PREFIX)
+                .expect("callback data must use the shared license prefix");
+            assert!(License::parse(key).is_some());
+        }
     }
 }

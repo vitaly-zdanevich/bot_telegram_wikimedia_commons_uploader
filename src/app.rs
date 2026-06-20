@@ -359,7 +359,7 @@ impl Bot {
         };
         let mut profile = self.store.get_profile(user_id).await;
 
-        if let Some(key) = data.strip_prefix("lic:") {
+        if let Some(key) = data.strip_prefix(crate::telegram::LICENSE_CALLBACK_PREFIX) {
             let Some(license) = License::parse(key) else {
                 return Ok(());
             };
