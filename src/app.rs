@@ -40,7 +40,7 @@ const RELATED_CLI: &str =
 /// How long a processed Telegram update id is remembered (suppresses webhook retries).
 const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 /// Message shown once onboarding is complete.
-const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the description, and a line like <code>Categories: Minsk, Belarus</code> sets categories.";
+const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>name</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
