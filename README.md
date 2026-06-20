@@ -13,8 +13,9 @@ with DynamoDB for per-user settings. Designed to stay within the AWS free tier.
 ## How it works (for users)
 
 1. Send `/start`. The bot asks you to create a **scoped Bot Password** at
-   <https://commons.wikimedia.org/wiki/Special:BotPasswords> — tick **only “Upload new files”**,
-   never your real password. You get a username like `YourName@telegram` and a password.
+   <https://commons.wikimedia.org/wiki/Special:BotPasswords> — tick **Upload new files** and
+   **Create, edit, and move pages** (the second is needed to write each file's description
+   page), never your real password. You get a username like `YourName@telegram` and a password.
 2. Send the bot-password **username**, then the **bot password** (the bot deletes your
    message immediately and stores it **AES-256-GCM encrypted**).
 3. Pick a **license** (default **CC BY 4.0**, also CC BY-SA 4.0 or CC0) and an optional
@@ -49,7 +50,7 @@ keeps them unique (bare generic names like `IMG_5638` are otherwise blocked by C
 
 Uploaded as-is when Commons accepts them: **JPEG, PNG, GIF, SVG, TIFF, WebP, XCF, PDF,
 DjVu, STL**, audio **WAV, MP3, OGA, OGG, Opus, FLAC, MID/MIDI** (voice messages too), and
-video **WebM, OGV, MPG/MPEG**.
+video **WebM, OGV, MPG/MPEG** — see [Commons: File types](https://commons.wikimedia.org/wiki/Commons:File_types).
 
 Converted first, because Commons does **not** accept them:
 
@@ -62,9 +63,16 @@ Converted first, because Commons does **not** accept them:
 > AVIF is **not** accepted by Commons (still a wishlist item), which is why DNG/HEIC/BMP
 > are converted to WebP rather than AVIF.
 
-**File size:** the Telegram cloud Bot API only lets bots **download files up to 20 MB**,
-so larger files are rejected with a clear message (this is a Telegram limit, not a Commons
-one). Send originals as a **file/document** for full quality.
+**File size:** the Telegram cloud Bot API only lets bots
+[**download files up to 20 MB**](https://core.telegram.org/bots/api#getfile), so larger
+files are rejected with a clear message (this is a Telegram limit, not a Commons one). Send
+originals as a **file/document** for full quality.
+
+**Wikimedia IP blocks:** Wikimedia globally blocks many data-centre IP ranges (including
+AWS) as "open proxy/webhost", so uploads from Lambda can be refused with a `blocked` error.
+Affected uploads need the account to hold a global IP-block exemption, or the bot to route
+Commons traffic through a non-blocked IP (e.g. an outbound proxy). The bot replies with a
+clear message when this happens.
 
 ### Commands & settings
 
@@ -134,15 +142,17 @@ A personal bot stays at **$0/month**: Lambda (1M req + 400k GB-s free, arm64), D
 (25 GB + 25 RCU/WCU always-free; provisioned 5/5 here), CloudWatch Logs (5 GB free,
 14-day retention), and the Lambda Function URL (no extra charge). There is **no KMS**
 (a customer key would cost $1/month) — credentials are encrypted in-app with AES-256-GCM
-using a key kept in a Lambda environment variable.
+using a key kept in a Lambda environment variable. See [AWS Free Tier](https://aws.amazon.com/free/),
+[Lambda pricing](https://aws.amazon.com/lambda/pricing/), and [DynamoDB pricing](https://aws.amazon.com/dynamodb/pricing/).
 
 The default region is `us-east-1`, closest to Wikimedia's eqiad (Ashburn, VA) write
 datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
 
 ## Security
 
-- Each user authenticates with their **own scoped Bot Password** (only the “Upload new files”
-  grant), revocable at any time at `Special:BotPasswords`.
+- Each user authenticates with their **own scoped Bot Password** (grants: “Upload new files”
+  + “Create, edit, and move pages”), revocable any time at
+  [Special:BotPasswords](https://commons.wikimedia.org/wiki/Special:BotPasswords).
 - Bot passwords are **AES-256-GCM encrypted** before storage; the bot deletes the Telegram
   message containing your bot password.
 - The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.

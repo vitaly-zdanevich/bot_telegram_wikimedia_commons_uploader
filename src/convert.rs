@@ -72,13 +72,34 @@ pub fn classify(file_name: Option<&str>, mime: Option<&str>, bytes: &[u8]) -> So
     SourceFormat::PassThrough
 }
 
-/// Converts DNG or HEIC bytes into WebP; pass-through inputs are rejected.
-pub fn to_webp(bytes: &[u8], source: SourceFormat, quality: f32) -> Result<Vec<u8>> {
+/// Converts a file into an uploadable form, returning `(bytes, extension)`.
+///
+/// DNG develops to WebP; if imagepipe can't develop the raw, the embedded full-resolution
+/// JPEG is uploaded **as-is** (extension `jpg`, no re-encode). HEIC and BMP become WebP.
+/// Pass-through inputs are rejected.
+pub fn convert(
+    bytes: &[u8],
+    source: SourceFormat,
+    quality: f32,
+) -> Result<(Vec<u8>, &'static str)> {
     match source {
-        SourceFormat::Dng => encode_webp_lossy(&decode_dng(bytes)?, quality),
-        SourceFormat::Heic => encode_webp_lossy(&decode_heic(bytes)?, quality),
-        SourceFormat::Bmp => encode_webp_lossless(&decode_bmp(bytes)?),
+        SourceFormat::Dng => convert_dng(bytes, quality),
+        SourceFormat::Heic => Ok((encode_webp_lossy(&decode_heic(bytes)?, quality)?, "webp")),
+        SourceFormat::Bmp => Ok((encode_webp_lossless(&decode_bmp(bytes)?)?, "webp")),
         SourceFormat::PassThrough => bail!("pass-through files must not be converted"),
+    }
+}
+
+/// Converts a DNG: develop the raw to WebP, otherwise upload the embedded JPEG as-is.
+fn convert_dng(bytes: &[u8], quality: f32) -> Result<(Vec<u8>, &'static str)> {
+    match develop_raw(bytes) {
+        Ok(image) => Ok((encode_webp_lossy(&image, quality)?, "webp")),
+        Err(develop_error) => match extract_largest_valid_jpeg(bytes) {
+            Some(jpeg) => Ok((jpeg.to_vec(), "jpg")),
+            None => bail!(
+                "could not decode DNG ({develop_error}); no usable embedded JPEG preview found"
+            ),
+        },
     }
 }
 
@@ -88,20 +109,6 @@ pub fn passthrough_extension(file_name: Option<&str>, mime: Option<&str>) -> Str
         return extension;
     }
     mime_extension(mime).unwrap_or("bin").to_string()
-}
-
-/// Decodes a DNG into an sRGB 8-bit image.
-///
-/// Tries imagepipe's full raw develop first (camera-dependent), then falls back to the
-/// embedded full-resolution JPEG preview that most DNGs carry — so DNGs from cameras
-/// imagepipe doesn't know still convert.
-fn decode_dng(bytes: &[u8]) -> Result<RawRgb> {
-    match develop_raw(bytes) {
-        Ok(image) => Ok(image),
-        Err(develop_error) => decode_largest_embedded_jpeg(bytes).ok_or_else(|| {
-            anyhow!("could not decode DNG ({develop_error}); no usable embedded JPEG preview found")
-        }),
-    }
 }
 
 /// Develops a raw file into an sRGB 8-bit image via imagepipe (camera-dependent).
@@ -123,21 +130,11 @@ fn develop_raw(bytes: &[u8]) -> Result<RawRgb> {
     })
 }
 
-/// Extracts and decodes the largest embedded JPEG (the full-size preview) from a file.
-fn decode_largest_embedded_jpeg(bytes: &[u8]) -> Option<RawRgb> {
-    for span in jpeg_spans_largest_first(bytes) {
-        if let Ok(image) = image::load_from_memory_with_format(span, image::ImageFormat::Jpeg) {
-            let rgb = image.to_rgb8();
-            if rgb.width() > 0 && rgb.height() > 0 {
-                return Some(RawRgb {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.into_raw(),
-                });
-            }
-        }
-    }
-    None
+/// Returns the bytes of the largest embedded JPEG that decodes cleanly (the full preview).
+fn extract_largest_valid_jpeg(bytes: &[u8]) -> Option<&[u8]> {
+    jpeg_spans_largest_first(bytes)
+        .into_iter()
+        .find(|span| image::load_from_memory_with_format(span, image::ImageFormat::Jpeg).is_ok())
 }
 
 /// Returns byte ranges that look like complete JPEG streams (SOI…EOI), largest first.

@@ -213,7 +213,7 @@ impl Bot {
     async fn prompt_step(&self, chat_id: i64, step: OnboardingStep) -> Result<()> {
         match step {
             OnboardingStep::AwaitingUsername => {
-                let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nFirst create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick <b>only “Upload new files”</b> (nothing else).\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
+                let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nFirst create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick <b>Upload new files</b> and <b>Create, edit, and move pages</b> (needed to write each file's page).\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
                 self.telegram.send_message(chat_id, text, None).await
             }
             OnboardingStep::AwaitingPassword => {
@@ -549,7 +549,7 @@ impl Bot {
             None => String::new(),
         };
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n<b>Set up</b>: create a bot password with <b>only “Upload new files”</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>Captions</b>: the caption becomes the description. Extra lines: <code>Categories: A, B</code>, <code>Source: https://…</code>, <code>Author: Name</code> (also apply to a whole album).\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n<b>Set up</b>: create a bot password with <b>Upload new files</b> + <b>Create, edit, and move pages</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>Captions</b>: the caption becomes the description. Extra lines: <code>Categories: A, B</code>, <code>Source: https://…</code>, <code>Author: Name</code> (also apply to a whole album).\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         self.telegram.send_message(chat_id, &text, None).await
@@ -630,8 +630,8 @@ impl Bot {
         let (upload_bytes, extension) = if format.needs_conversion() {
             provenance.original_sha1 = Some(sha1_hex(&original));
             provenance.original_md5 = Some(md5_hex(&original));
-            match convert::to_webp(&original, format, self.config.webp_quality) {
-                Ok(webp) => (webp, "webp".to_string()),
+            match convert::convert(&original, format, self.config.webp_quality) {
+                Ok((bytes, ext)) => (bytes, ext.to_string()),
                 Err(error) => {
                     let text = format!(
                         "❌ Couldn't convert this file: {}\n\nTry sending a JPEG or PNG export instead.",

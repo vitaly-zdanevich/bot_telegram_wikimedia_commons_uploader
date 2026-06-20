@@ -270,7 +270,7 @@ fn interpret_upload_response(response: &Value, fallback_title: &str) -> UploadOu
         let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
         let info = error.get("info").and_then(Value::as_str).unwrap_or("");
         return UploadOutcome::Failed {
-            message: format!("❌ Commons rejected the upload ({code}): {info}"),
+            message: friendly_error(code, info),
         };
     }
     let upload = response.get("upload");
@@ -331,6 +331,59 @@ fn describe_warnings(warnings: Option<&Value>) -> String {
         "❌ Commons did not upload the file because {}.",
         reasons.join("; ")
     )
+}
+
+/// Turns a Commons API error code/info into a clear, actionable message for the user.
+fn friendly_error(code: &str, info: &str) -> String {
+    match code {
+        "blocked" | "autoblocked" | "globalblocking-ipblocked"
+        | "globalblocking-ipblocked-range" => "❌ Wikimedia refused the upload because the \
+             server's IP is in a range Wikimedia blocks (AWS data-centre IPs are blocked as \
+             \"open proxy/webhost\").\n\nThis is a limitation of the bot running on AWS — not your \
+             account. Please message the author @vitaly_zdanevich (the bot needs a clean upload \
+             route).\n\nAdvanced — request an IP-block exemption for your account: \
+             https://commons.wikimedia.org/wiki/Commons:IP_block_exemption (for global blocks: \
+             https://meta.wikimedia.org/wiki/Steward_requests/Global_permissions )"
+            .to_string(),
+        "permissiondenied" | "badaccess-groups" | "writeapidenied" | "cantcreate-anon"
+        | "cantcreate" => "❌ Your bot password is missing a permission. Open \
+             https://commons.wikimedia.org/wiki/Special:BotPasswords , edit your bot password, and \
+             tick both \"Upload new files\" and \"Create, edit, and move pages\", then resend."
+            .to_string(),
+        "ratelimited" => {
+            "❌ You're uploading too fast for Commons. Please wait a minute and try again."
+                .to_string()
+        }
+        "mustbeloggedin" | "assertuserfailed" | "badtoken" => "❌ Your Commons session expired — \
+             just resend and the bot will log in again. If it keeps failing, run /start to re-enter \
+             your bot password."
+            .to_string(),
+        "abusefilter-disallowed" | "abusefilter-warning" => {
+            format!(
+                "❌ A Commons edit filter blocked this upload: {}",
+                strip_wikitext(info)
+            )
+        }
+        _ => format!(
+            "❌ Commons rejected the upload ({code}): {}",
+            strip_wikitext(info)
+        ),
+    }
+}
+
+/// Strips the most common wikitext markup so API error text reads cleanly in Telegram.
+fn strip_wikitext(text: &str) -> String {
+    let mut output = text.replace("'''", "").replace("''", "");
+    while let Some(start) = output.find("[[") {
+        let Some(rel_end) = output[start..].find("]]") else {
+            break;
+        };
+        let end = start + rel_end;
+        let inner = &output[start + 2..end];
+        let label = inner.rsplit('|').next().unwrap_or(inner).to_string();
+        output.replace_range(start..end + 2, &label);
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Builds a Commons file-page URL from a canonical title.
@@ -790,7 +843,7 @@ mod tests {
         let response = json!({"error": {"code": "ratelimited", "info": "slow down"}});
         match interpret_upload_response(&response, "x.webp") {
             super::UploadOutcome::Failed { message } => {
-                assert!(message.contains("ratelimited"));
+                assert!(message.contains("too fast"));
             }
             other => panic!("expected failure, got {other:?}"),
         }
@@ -801,5 +854,21 @@ mod tests {
         let warnings = json!({"duplicate": ["Existing1.jpg", "Existing2.jpg"]});
         let message = describe_warnings(Some(&warnings));
         assert!(message.contains("duplicate of: Existing1.jpg, Existing2.jpg"));
+    }
+
+    #[test]
+    fn friendly_error_gives_actionable_messages() {
+        assert!(super::friendly_error("blocked", "blah").contains("IP"));
+        assert!(
+            super::friendly_error("permissiondenied", "x").contains("Create, edit, and move pages")
+        );
+    }
+
+    #[test]
+    fn strip_wikitext_cleans_markup() {
+        assert_eq!(
+            super::strip_wikitext("'''Bold''' and [[m:Help|help page]] here"),
+            "Bold and help page here"
+        );
     }
 }
