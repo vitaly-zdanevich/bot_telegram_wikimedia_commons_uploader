@@ -1,0 +1,205 @@
+use crate::models::License;
+use anyhow::{Context, Result, bail};
+use reqwest::Client;
+use serde::Serialize;
+use serde_json::{Value, json};
+
+/// Telegram Bot API client.
+#[derive(Clone)]
+pub struct TelegramClient {
+    client: Client,
+    token: String,
+}
+
+impl TelegramClient {
+    /// Creates a Telegram API client.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            token: token.into(),
+        }
+    }
+
+    /// Sends an HTML-formatted text message.
+    pub async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        if let Some(markup) = reply_markup {
+            payload["reply_markup"] = serde_json::to_value(markup)?;
+        }
+        self.post_json("sendMessage", &payload).await?;
+        Ok(())
+    }
+
+    /// Deletes a message; used to scrub the user's bot-password message from the chat.
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        self.post_json(
+            "deleteMessage",
+            &json!({"chat_id": chat_id, "message_id": message_id}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Acknowledges a callback query so the client stops showing a spinner.
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<()> {
+        let mut payload = json!({"callback_query_id": callback_query_id});
+        if let Some(text) = text {
+            payload["text"] = json!(text);
+        }
+        self.post_json("answerCallbackQuery", &payload).await?;
+        Ok(())
+    }
+
+    /// Sends a chat action such as `upload_photo` while the user waits.
+    pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
+        self.post_json(
+            "sendChatAction",
+            &json!({"chat_id": chat_id, "action": action}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Resolves a Telegram `file_id` to its temporary download path via `getFile`.
+    pub async fn get_file_path(&self, file_id: &str) -> Result<String> {
+        let value = self
+            .post_json("getFile", &json!({"file_id": file_id}))
+            .await?;
+        value
+            .get("result")
+            .and_then(|result| result.get("file_path"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("Telegram getFile response is missing file_path")
+    }
+
+    /// Downloads a file by path, rejecting anything larger than `max_bytes`.
+    ///
+    /// The Telegram cloud Bot API only serves files up to 20 MB, so larger uploads
+    /// cannot be retrieved and are reported to the user instead.
+    pub async fn download_file(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{file_path}",
+            self.token
+        );
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        if let Some(length) = response.content_length()
+            && length > max_bytes
+        {
+            bail!("file is {length} bytes, larger than the {max_bytes} byte limit");
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() as u64 > max_bytes {
+            bail!(
+                "file is {} bytes, larger than the {max_bytes} byte limit",
+                bytes.len()
+            );
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Downloads a file by `file_id` (resolves the path, then downloads it).
+    pub async fn download_by_file_id(&self, file_id: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let path = self.get_file_path(file_id).await?;
+        self.download_file(&path, max_bytes).await
+    }
+
+    /// Sends a JSON request to a Telegram Bot API method.
+    async fn post_json(&self, method: &str, payload: &Value) -> Result<Value> {
+        let response = self
+            .client
+            .post(self.method_url(method))
+            .json(payload)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            bail!("Telegram method {method} failed with HTTP {status}: {body}");
+        }
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    /// Builds the Telegram method URL.
+    fn method_url(&self, method: &str) -> String {
+        format!("https://api.telegram.org/bot{}/{method}", self.token)
+    }
+}
+
+/// Telegram inline keyboard markup.
+#[derive(Clone, Debug, Serialize)]
+pub struct InlineKeyboardMarkup {
+    /// Button rows.
+    pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+}
+
+/// Telegram inline keyboard button.
+#[derive(Clone, Debug, Serialize)]
+pub struct InlineKeyboardButton {
+    /// Button label.
+    pub text: String,
+    /// Callback data sent back when pressed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_data: Option<String>,
+    /// External URL opened when pressed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Builds the license-picker keyboard, one license per row.
+pub fn license_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: License::all()
+            .iter()
+            .map(|license| {
+                vec![InlineKeyboardButton {
+                    text: license.label().to_string(),
+                    callback_data: Some(format!("license:{}", license.as_key())),
+                    url: None,
+                }]
+            })
+            .collect(),
+    }
+}
+
+/// Escapes the three characters that are special in Telegram HTML message text.
+pub fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_html, license_keyboard};
+    use crate::models::License;
+
+    #[test]
+    fn license_keyboard_has_one_button_per_license() {
+        let keyboard = license_keyboard();
+        assert_eq!(keyboard.inline_keyboard.len(), License::all().len());
+        assert_eq!(
+            keyboard.inline_keyboard[0][0].callback_data.as_deref(),
+            Some("license:cc-by-4.0")
+        );
+    }
+
+    #[test]
+    fn escapes_html_special_characters() {
+        assert_eq!(escape_html("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+}

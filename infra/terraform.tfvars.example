@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+telegram_bot_token      = "123456:replace-me"
+telegram_webhook_secret = "replace-with-a-random-string"
+# Generate with: openssl rand -base64 32
+credential_enc_key      = "replace-with-base64-32-bytes"
+admin_telegram_user_ids = "123456789"

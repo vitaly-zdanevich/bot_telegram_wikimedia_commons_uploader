@@ -1,0 +1,16 @@
+/target/
+/build/
+/.tools/
+.terraform/
+/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+!infra/terraform.tfvars.example
+/.env
+*.zip
+*.log
+coverage/
+lcov.info

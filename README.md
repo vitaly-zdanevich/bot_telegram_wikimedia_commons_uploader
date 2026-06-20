@@ -1,0 +1,164 @@
+# Telegram → Wikimedia Commons uploader bot
+
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader)
+[![Lines of Code](https://sloc.xyz/github/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader)](https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader)
+
+Public Telegram bot — **[@wikimedia_commons_uploader_bot](https://t.me/wikimedia_commons_uploader_bot)** —
+that uploads images and media you send straight to **Wikimedia Commons, under your own
+account**. Written in Rust, it runs on AWS Lambda (arm64) behind a Telegram webhook,
+with DynamoDB for per-user settings. Designed to stay within the AWS free tier.
+
+## How it works (for users)
+
+1. Send `/start`. The bot asks you to create a **scoped Bot Password** at
+   <https://commons.wikimedia.org/wiki/Special:BotPasswords> — enable **only the Upload
+   grants**, never your real password. You get a username like `YourName@telegram` and a
+   token.
+2. Send the bot-password **username**, then the **token** (the bot deletes your token
+   message immediately and stores it **AES-256-GCM encrypted**).
+3. Pick a **license** (default **CC BY 4.0**, also CC BY-SA 4.0 or CC0) and an optional
+   **filename prefix**.
+4. Send a photo or file. It is uploaded to Commons with a generated `{{Information}}`
+   page, license, categories, geotag, and provenance.
+
+### Captions
+
+A caption becomes the file description. Extra directive lines (any order,
+case-insensitive) are recognised — and for an **album** the single caption applies to
+every photo:
+
+```
+A view of the old town
+Categories: Minsk, Architecture of Belarus
+Source: https://example.com/photo/
+Author: Jane Doe
+Date: 2009-12-03
+```
+
+`Categories:` accepts many comma-separated names. `Source:`/`Author:`/`Date:` override the
+defaults (own work / your account / EXIF date). EXIF `DateTimeOriginal` and GPS are read
+automatically (date → `{{Information}}`, GPS → `{{Location dec}}`).
+
+### Accepted formats
+
+Uploaded as-is when Commons accepts them: **JPEG, PNG, GIF, SVG, TIFF, WebP, XCF, PDF,
+DjVu, STL**, audio **WAV, MP3, OGA, OGG, Opus, FLAC, MID/MIDI** (voice messages too), and
+video **WebM, OGV, MPG/MPEG**.
+
+Converted first, because Commons does **not** accept them:
+
+| Input | Converted to | Notes |
+| ----- | ------------ | ----- |
+| DNG (raw) | WebP (lossy, quality configurable) | original SHA-1/MD5 + filename recorded on the file page |
+| HEIC/HEIF | WebP (lossy) | needs the libheif build (see below) |
+| BMP | WebP (lossless) | |
+
+> AVIF is **not** accepted by Commons (still a wishlist item), which is why DNG/HEIC/BMP
+> are converted to WebP rather than AVIF.
+
+**File size:** the Telegram cloud Bot API only lets bots **download files up to 20 MB**,
+so larger files are rejected with a clear message (this is a Telegram limit, not a Commons
+one). Send originals as a **file/document** for full quality.
+
+### Commands & settings
+
+- `/start` — connect your account / resume setup
+- `/help` — usage, your uploads link, related projects, contact
+- `/settings` — license, filename prefix, default categories, and toggles (all **off** by
+  default): return upload links, return category links, return non-existing category links
+- `/forget` — delete your stored credentials and settings
+- `/stat` — admins only: total users and uploads
+
+## Deploy
+
+Prerequisites: AWS credentials, Terraform ≥ 1.6, Rust (the build script installs a
+project-local toolchain + `cargo-lambda` if missing), and a Telegram bot token from
+[@BotFather](https://t.me/BotFather).
+
+1. **Put your secrets in `infra/terraform.tfvars`** (gitignored) — copy the example:
+
+   ```bash
+   cp infra/terraform.tfvars.example infra/terraform.tfvars
+   ```
+
+   ```hcl
+   telegram_bot_token      = "123456:your-bot-token"      # from @BotFather
+   telegram_webhook_secret = "some-random-string"
+   credential_enc_key      = "base64-32-bytes"            # openssl rand -base64 32
+   admin_telegram_user_ids = "123456789"                  # optional, for /stat
+   ```
+
+   (You can instead export `TF_VAR_telegram_bot_token`, etc.)
+
+2. Deploy (builds the Lambda zip, applies Terraform, sets the webhook):
+
+   ```bash
+   ./scripts/deploy.sh
+   ```
+
+3. Update only the code later:
+
+   ```bash
+   ./scripts/update-code.sh
+   ```
+
+### HEIC support (libheif)
+
+HEIC decoding needs the C/C++ `libheif` library, which does not cross-compile cleanly,
+so it is behind the Cargo `heic` feature. `./scripts/build-lambda.sh` builds **with HEIC
+via Docker** (`scripts/build-lambda-docker.sh`, an arm64 Amazon Linux 2023 image that
+compiles libheif + libde265) when Docker is available, and otherwise falls back to a fast
+`cargo-lambda`/zig cross-build **without** HEIC (DNG and BMP still convert). Force the
+fast build with `HEIC=0 ./scripts/build-lambda.sh`.
+
+### Scripts
+
+| Script | Purpose |
+| ------ | ------- |
+| `scripts/deploy.sh` | Build, `terraform apply`, set webhook |
+| `scripts/build-lambda.sh` | Build the arm64 Lambda zip (HEIC via Docker, or `HEIC=0`) |
+| `scripts/build-lambda-docker.sh` | Build the zip with HEIC inside Docker |
+| `scripts/update-code.sh` | Rebuild and push only the Lambda code |
+| `scripts/set-webhook.sh` | Point Telegram at the Lambda Function URL |
+| `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) |
+
+## Cost — AWS free tier
+
+A personal bot stays at **$0/month**: Lambda (1M req + 400k GB-s free, arm64), DynamoDB
+(25 GB + 25 RCU/WCU always-free; provisioned 5/5 here), CloudWatch Logs (5 GB free,
+14-day retention), and the Lambda Function URL (no extra charge). There is **no KMS**
+(a customer key would cost $1/month) — credentials are encrypted in-app with AES-256-GCM
+using a key kept in a Lambda environment variable.
+
+The default region is `us-east-1`, closest to Wikimedia's eqiad (Ashburn, VA) write
+datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
+
+## Security
+
+- Each user authenticates with their **own scoped Bot Password** (Upload grant only),
+  revocable at any time at `Special:BotPasswords`.
+- Tokens are **AES-256-GCM encrypted** before storage; the bot deletes the Telegram
+  message containing your token.
+- The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.
+- Each upload is your own work under your own account, with the attribution category
+  `Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich`.
+
+## Need help uploading to Commons?
+
+Message the author **[@vitaly_zdanevich](https://t.me/vitaly_zdanevich)** — happy to help
+with this bot or with uploading to Wikimedia Commons in general.
+
+## Related projects
+
+- [bot_telegram_wikimedia_commons](https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons) — Telegram bot to **search/read** Commons media.
+- [Browser extension to upload to Commons](https://gitlab.com/vitaly-zdanevich-extensions/uploading-to-wikimedia-commons).
+- [pwb_wrapper_for_simpler_uploading_to_commons](https://gitlab.com/vitaly_zdanevich_wikimedia/pwb_wrapper_for_simpler_uploading_to_commons) — CLI (Pywikibot wrapper) for simpler Commons uploads.
+- [gThumb Wikimedia Commons extension](https://gitlab.com/vitaly_zdanevich_wikimedia/gthumb-wikimedia-commons-extension).
+- [wikipedia-userstyle-dark-minimum](https://github.com/vitaly-zdanevich/wikipedia-userstyle-dark-minimum) — dark Wikipedia theme.
+- [wiki2man_on_rust](https://gitlab.com/vitaly_zdanevich_wikimedia/wiki2man_on_rust) — convert Wikipedia articles to man pages.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

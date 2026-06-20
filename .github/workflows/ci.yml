@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  terraform:
+    name: Terraform Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive infra
+
+  sonar:
+    name: Sonar
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Skip when Sonar token is absent
+        if: ${{ env.SONAR_TOKEN == '' }}
+        run: echo "SONAR_TOKEN is not configured; skipping Sonar scan."
+      - uses: actions/checkout@v4
+        if: ${{ env.SONAR_TOKEN != '' }}
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ env.SONAR_TOKEN != '' }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ env.SONAR_TOKEN != '' }}
+      - name: Generate coverage (default features, no libheif)
+        if: ${{ env.SONAR_TOKEN != '' }}
+        run: |
+          cargo install cargo-llvm-cov --locked
+          mkdir -p coverage
+          cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+      - uses: SonarSource/sonarqube-scan-action@v4
+        if: ${{ env.SONAR_TOKEN != '' }}

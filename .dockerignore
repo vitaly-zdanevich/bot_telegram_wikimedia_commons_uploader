@@ -1,0 +1,8 @@
+/target
+/build
+/.tools
+/.git
+/infra/.terraform
+*.zip
+*.tfstate
+*.tfstate.*
