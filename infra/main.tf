@@ -24,6 +24,7 @@ locals {
     WEBP_QUALITY            = tostring(var.webp_quality)
     MAX_FILE_MB             = tostring(var.max_file_mb)
     COMMONS_USER_AGENT      = "${var.project_name}/0.1 (${var.github_url})"
+    COMMONS_PROXY           = var.commons_proxy
     RUST_LOG                = "info"
   }
 }
