@@ -443,30 +443,62 @@ pub fn sanitize_title(input: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Builds a sanitized Commons filename: `<prefix> <base> <timestamp> [suffix].<ext>`.
+/// Returns true for emoji / pictographic symbol code points (dropped from filenames).
+fn is_emoji(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(
+        code,
+        0x200D                  // zero-width joiner
+        | 0x2190..=0x21FF       // arrows
+        | 0x2300..=0x23FF       // misc technical (⌚ ⏰ …)
+        | 0x2460..=0x24FF       // enclosed alphanumerics (① …)
+        | 0x2500..=0x27BF       // shapes, misc symbols, dingbats
+        | 0x2B00..=0x2BFF       // misc symbols and arrows (⭐ …)
+        | 0xFE00..=0xFE0F       // variation selectors
+        | 0x1F000..=0x1FAFF     // emoji blocks (📍 included)
+    )
+}
+
+/// Sanitizes one filename component: drops emoji, then applies page-title rules.
+fn sanitize_filename_part(input: &str) -> String {
+    let without_emoji: String = input.chars().filter(|&ch| !is_emoji(ch)).collect();
+    sanitize_title(&without_emoji)
+}
+
+/// Builds a sanitized Commons filename: `<prefix> <caption text> <original stem>.<ext>`.
+///
+/// The caption text becomes a descriptive prefix so generic camera names like
+/// `IMG_5638` are acceptable and never collide within an album, while the original stem
+/// keeps each file unique. Newlines collapse to spaces and emoji are dropped. When there
+/// is no usable stem, `unique_token` is appended so files stay unique.
 pub fn build_filename(
     prefix: &str,
-    base: &str,
+    caption: &str,
+    original_stem: &str,
     extension: &str,
-    timestamp: &str,
-    unique_suffix: Option<&str>,
+    unique_token: &str,
 ) -> String {
     let mut parts = Vec::new();
-    let prefix = sanitize_title(prefix);
+    let prefix = sanitize_filename_part(prefix);
     if !prefix.is_empty() {
         parts.push(prefix);
     }
-    let base = sanitize_title(base);
-    parts.push(if base.is_empty() {
-        "image".to_string()
-    } else {
-        base
-    });
-    parts.push(timestamp.to_string());
-    if let Some(suffix) = unique_suffix {
-        let suffix = sanitize_title(suffix);
-        if !suffix.is_empty() {
-            parts.push(suffix);
+    let caption = sanitize_filename_part(caption);
+    if !caption.is_empty() {
+        parts.push(caption);
+    }
+    let stem = sanitize_filename_part(original_stem);
+    let has_stem = !stem.is_empty();
+    if has_stem {
+        parts.push(stem);
+    }
+    if parts.is_empty() {
+        parts.push("image".to_string());
+    }
+    if !has_stem {
+        let token = sanitize_filename_part(unique_token);
+        if !token.is_empty() {
+            parts.push(token);
         }
     }
     let stem = truncate_bytes(&parts.join(" "), MAX_FILENAME_STEM_BYTES);
@@ -635,21 +667,33 @@ mod tests {
     }
 
     #[test]
-    fn builds_filename_with_prefix_and_extension() {
-        let name = build_filename(
-            "Minsk",
-            "Old town",
-            "webp",
-            "2026-06-20 12-00-00",
-            Some("AgAD"),
-        );
-        assert_eq!(name, "Minsk Old town 2026-06-20 12-00-00 AgAD.webp");
+    fn filename_uses_caption_prefix_and_original_stem() {
+        let name = build_filename("Minsk", "Old town", "IMG_5638", "webp", "AgAD");
+        assert_eq!(name, "Minsk Old town IMG_5638.webp");
     }
 
     #[test]
-    fn builds_filename_falls_back_when_base_empty() {
-        let name = build_filename("", "", "jpg", "2026-06-20 12-00-00", None);
-        assert_eq!(name, "image 2026-06-20 12-00-00.jpg");
+    fn filename_collapses_multiline_caption_and_drops_emoji() {
+        let name = build_filename(
+            "",
+            "Храм Вознесения Господня\n📍Ждановичи",
+            "IMG_5638",
+            "webp",
+            "x",
+        );
+        assert_eq!(name, "Храм Вознесения Господня Ждановичи IMG_5638.webp");
+    }
+
+    #[test]
+    fn filename_appends_unique_token_when_no_stem() {
+        let name = build_filename("", "Old town", "", "webp", "AgAD42");
+        assert_eq!(name, "Old town AgAD42.webp");
+    }
+
+    #[test]
+    fn filename_falls_back_to_image_when_empty() {
+        let name = build_filename("", "", "", "jpg", "uniq");
+        assert_eq!(name, "image uniq.jpg");
     }
 
     #[test]

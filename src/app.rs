@@ -339,7 +339,7 @@ impl Bot {
                 self.telegram
                     .send_message(
                         chat_id,
-                        "Send me a photo or file to upload, or /help for options.",
+                        "I upload files <b>to</b> Wikimedia Commons. To <b>get/search</b> files <b>from</b> Commons, use @wikimedia_commons_bot.\n\nSend me a photo or file to upload it, or /help.",
                         None,
                     )
                     .await
@@ -633,23 +633,14 @@ impl Bot {
             return self.telegram.send_message(chat_id, &text, None).await;
         }
 
-        // Build the filename and wikitext.
-        let base = first_non_empty(&[
-            first_line(&parsed.description),
-            file_stem(file.file_name.as_deref()),
-        ])
-        .unwrap_or("image")
-        .to_string();
-        let unique_suffix = message
-            .media_group_id
-            .as_ref()
-            .map(|_| file.file_unique_id.as_str());
+        // Build the filename: caption text as a descriptive prefix and the original stem
+        // for per-file uniqueness (emoji dropped, newlines collapsed by build_filename).
         let filename = build_filename(
             &profile.filename_prefix,
-            &base,
+            &parsed.description,
+            file_stem(file.file_name.as_deref()),
             &extension,
-            &filename_timestamp(),
-            unique_suffix,
+            &file.file_unique_id,
         );
         let (latitude, longitude) = match metadata.coordinates() {
             Some((latitude, longitude)) => (Some(latitude), Some(longitude)),
@@ -978,15 +969,6 @@ fn today_iso() -> String {
         .unwrap_or_default()
 }
 
-/// Returns a filename-safe timestamp `YYYY-MM-DD HH-MM-SS` (UTC).
-fn filename_timestamp() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::macros::format_description!(
-            "[year]-[month]-[day] [hour]-[minute]-[second]"
-        ))
-        .unwrap_or_default()
-}
-
 /// Returns lower-case SHA-1 hex of the bytes.
 fn sha1_hex(bytes: &[u8]) -> String {
     use sha1::{Digest, Sha1};
@@ -999,27 +981,11 @@ fn md5_hex(bytes: &[u8]) -> String {
     hex::encode(Md5::digest(bytes))
 }
 
-/// Returns the first non-empty trimmed line of a string.
-fn first_line(text: &str) -> &str {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-}
-
 /// Returns the filename stem (without extension), if a filename is present.
 fn file_stem(file_name: Option<&str>) -> &str {
     file_name
         .map(|name| name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name))
         .unwrap_or("")
-}
-
-/// Returns the first non-empty candidate string.
-fn first_non_empty<'a>(candidates: &[&'a str]) -> Option<&'a str> {
-    candidates
-        .iter()
-        .copied()
-        .find(|value| !value.trim().is_empty())
 }
 
 /// Builds a Commons URL from a canonical `File:`/`Category:` title.
@@ -1032,7 +998,7 @@ fn commons_title_url(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_line, first_non_empty, merge_categories, parse_category_list};
+    use super::{merge_categories, parse_category_list};
 
     #[test]
     fn merges_and_deduplicates_categories() {
@@ -1049,17 +1015,5 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
-    }
-
-    #[test]
-    fn first_line_skips_blank_lines() {
-        assert_eq!(first_line("\n  \nHello\nworld"), "Hello");
-        assert_eq!(first_line("   "), "");
-    }
-
-    #[test]
-    fn first_non_empty_picks_first() {
-        assert_eq!(first_non_empty(&["", "  ", "x", "y"]), Some("x"));
-        assert_eq!(first_non_empty(&["", "  "]), None);
     }
 }
