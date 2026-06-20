@@ -39,6 +39,8 @@ const RELATED_CLI: &str =
     "https://gitlab.com/vitaly_zdanevich_wikimedia/pwb_wrapper_for_simpler_uploading_to_commons";
 /// How long a processed Telegram update id is remembered (suppresses webhook retries).
 const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
+/// Message shown once onboarding is complete.
+const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the description, and a line like <code>Categories: Minsk, Belarus</code> sets categories.";
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
@@ -236,8 +238,8 @@ impl Bot {
                 self.telegram
                     .send_message(
                         chat_id,
-                        "Send a <b>filename prefix</b> for your uploads, or send <code>skip</code> for none.",
-                        None,
+                        "Send a <b>filename prefix</b> for your uploads, or tap Skip for none.",
+                        Some(skip_prefix_keyboard()),
                     )
                     .await
             }
@@ -328,11 +330,7 @@ impl Bot {
                 touch(&mut profile);
                 self.store.put_profile(user_id, &profile).await?;
                 self.telegram
-                    .send_message(
-                        chat_id,
-                        "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the description, and a line like <code>Categories: Minsk, Belarus</code> sets categories.",
-                        None,
-                    )
+                    .send_message(chat_id, ONBOARDING_DONE_MSG, None)
                     .await
             }
             OnboardingStep::Done => {
@@ -385,6 +383,17 @@ impl Bot {
             self.store.put_profile(user_id, &profile).await?;
             return self
                 .prompt_step(chat_id, OnboardingStep::AwaitingUsername)
+                .await;
+        }
+
+        if data == "onb:skipprefix" {
+            profile.filename_prefix = String::new();
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .telegram
+                .send_message(chat_id, ONBOARDING_DONE_MSG, None)
                 .await;
         }
 
@@ -550,14 +559,32 @@ impl Bot {
     async fn handle_upload(&self, chat_id: i64, user_id: i64, message: &Message) -> Result<()> {
         let mut profile = self.store.get_profile(user_id).await;
         if !profile.is_ready() {
-            return self
-                .telegram
+            // For an album, nudge once instead of for every photo.
+            let should_nudge = match &message.media_group_id {
+                Some(group) => self
+                    .store
+                    .reserve_idempotency(&format!("ONBOARD_NUDGE#{chat_id}#{group}"), 300)
+                    .await
+                    .unwrap_or(true),
+                None => true,
+            };
+            if !should_nudge {
+                return Ok(());
+            }
+            self.telegram
                 .send_message(
                     chat_id,
-                    "Please run /start first to connect your Commons account.",
+                    "Let's finish connecting your Commons account first 👇",
                     None,
                 )
-                .await;
+                .await
+                .ok();
+            let step = if profile.onboarding_step == OnboardingStep::Done {
+                OnboardingStep::AwaitingUsername
+            } else {
+                profile.onboarding_step
+            };
+            return self.prompt_step(chat_id, step).await;
         }
         let Some(file) = extract_file(message) else {
             return Ok(());
@@ -938,6 +965,17 @@ fn change_username_keyboard() -> InlineKeyboardMarkup {
         inline_keyboard: vec![vec![InlineKeyboardButton {
             text: "✏️ Change username".to_string(),
             callback_data: Some("onb:username".to_string()),
+            url: None,
+        }]],
+    }
+}
+
+/// Builds a keyboard with a single button to skip the filename prefix.
+fn skip_prefix_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "⏭ Skip (no prefix)".to_string(),
+            callback_data: Some("onb:skipprefix".to_string()),
             url: None,
         }]],
     }
