@@ -114,9 +114,10 @@ toggles control the flow:
 - **Confirm before upload** (on by default) — send thumbnails of the first images and a
   **Confirm upload** / **Cancel** button; nothing is uploaded until you confirm.
 
-ZIP works out of the box (pure Rust). **RAR** needs the system `libunrar` and the extra
-`rar` Cargo feature (see the server build below). Archives are disabled on the Lambda build
-because Telegram's 20 MB download cap makes multi-image archives impractical there.
+ZIP works out of the box (pure Rust). **RAR** shells out to the system `unrar` command at
+runtime (no native build dependency) and needs the extra `rar` Cargo feature — the VM
+provisioning installs the `unrar` package. Archives are disabled on the Lambda build because
+Telegram's 20 MB download cap makes multi-image archives impractical there.
 
 ### Commands & settings
 
@@ -186,7 +187,7 @@ Storage uses **SQLite** instead of DynamoDB — build with the `sqlite` feature 
 ```bash
 # ZIP archives + SQLite storage
 cargo build --release --features sqlite,archive
-# add RAR (needs system libunrar, e.g. apt install libunrar-dev)
+# add RAR (shells out to the unrar CLI at runtime, e.g. apt install unrar)
 cargo build --release --features sqlite,archive,rar
 ```
 

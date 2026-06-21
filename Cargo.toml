@@ -31,7 +31,6 @@ time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-unrar = { version = "0.5", optional = true }
 urlencoding = "2"
 webp = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
@@ -47,8 +46,9 @@ sqlite = ["dep:rusqlite"]
 # Upload images from inside zip archives (VM-only). Pulls in extra image decoders
 # so archive thumbnails can be rendered for PNG/GIF/TIFF/WebP as well as JPEG/BMP.
 archive = ["dep:zip", "image/png", "image/gif", "image/tiff", "image/webp"]
-# Add RAR support to `archive` (needs the system libunrar; VM-only).
-rar = ["dep:unrar", "archive"]
+# Add RAR support to `archive`. Shells out to the system `unrar` CLI at runtime
+# (no native build dep); the VM provisioning installs the `unrar` package.
+rar = ["archive"]
 
 [[bin]]
 name = "telegram-wikimedia-commons-uploader-bot"

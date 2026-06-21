@@ -61,36 +61,63 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
     Ok(entries)
 }
 
-/// Extracts images from a rar archive via the system libunrar (`rar` feature).
+/// Extracts images from a rar archive by shelling out to the system `unrar` (`rar` feature).
+///
+/// Uses the `unrar` CLI (installed on the VM by its provisioning) rather than a vendored
+/// C++ decoder, so there is no fragile native build at compile time.
 #[cfg(feature = "rar")]
 fn extract_rar(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
-    use std::io::Write;
-    let mut temp = tempfile::NamedTempFile::new()?;
-    temp.write_all(bytes)?;
-    temp.flush().ok();
+    use anyhow::Context;
+    let dir = tempfile::tempdir()?;
+    let archive_path = dir.path().join("archive.rar");
+    std::fs::write(&archive_path, bytes)?;
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    // unrar x: extract with full paths; -o+ overwrite, -idq quiet, trailing slash = dest dir.
+    let output = std::process::Command::new("unrar")
+        .arg("x")
+        .arg("-o+")
+        .arg("-idq")
+        .arg(&archive_path)
+        .arg(format!("{}/", out_dir.display()))
+        .output()
+        .context("failed to launch `unrar` (install the unrar package)")?;
+    if !output.status.success() {
+        bail!(
+            "unrar failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
     let mut entries = Vec::new();
-    let mut cursor = unrar::Archive::new(temp.path()).open_for_processing()?;
-    while let Some(header) = cursor.read_header()? {
-        let name = header.entry().filename.to_string_lossy().to_string();
-        if header.entry().is_file() && crate::convert::is_uploadable_archive_member(&name) {
-            let (data, next) = header.read()?;
+    collect_images(&out_dir, &mut entries)?;
+    Ok(entries)
+}
+
+/// Recursively collects uploadable images from an extracted directory tree.
+#[cfg(feature = "rar")]
+fn collect_images(dir: &std::path::Path, entries: &mut Vec<ArchiveEntry>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_images(&path, entries)?;
+        } else if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && crate::convert::is_uploadable_archive_member(name)
+        {
             entries.push(ArchiveEntry {
-                name: basename(&name),
-                bytes: data,
+                name: name.to_string(),
+                bytes: std::fs::read(&path)?,
             });
-            cursor = next;
-        } else {
-            cursor = header.skip()?;
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 /// RAR stub used when the `rar` feature is disabled.
 #[cfg(not(feature = "rar"))]
 fn extract_rar(_bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
-    bail!("RAR needs the `rar` build (system libunrar). Please send a ZIP instead.")
+    bail!("RAR support is not enabled in this build. Please send a ZIP instead.")
 }
 
 /// Returns the base name of an archive entry path.
