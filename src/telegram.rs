@@ -22,23 +22,30 @@ impl TelegramClient {
         }
     }
 
-    /// Sends an HTML-formatted text message.
+    /// Sends an HTML-formatted text message, splitting anything over Telegram's
+    /// per-message limit into several messages (the keyboard rides the last one).
     pub async fn send_message(
         &self,
         chat_id: i64,
         text: &str,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> Result<()> {
-        let mut payload = json!({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": true,
-        });
-        if let Some(markup) = reply_markup {
-            payload["reply_markup"] = serde_json::to_value(markup)?;
+        let chunks = split_for_telegram(text, TELEGRAM_MESSAGE_LIMIT);
+        let last = chunks.len().saturating_sub(1);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut payload = json!({
+                "chat_id": chat_id,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+            });
+            if index == last
+                && let Some(markup) = &reply_markup
+            {
+                payload["reply_markup"] = serde_json::to_value(markup)?;
+            }
+            self.post_json("sendMessage", &payload).await?;
         }
-        self.post_json("sendMessage", &payload).await?;
         Ok(())
     }
 
@@ -230,6 +237,48 @@ pub fn license_keyboard() -> InlineKeyboardMarkup {
     }
 }
 
+/// Telegram's maximum message length, measured in UTF-16 code units.
+const TELEGRAM_MESSAGE_LIMIT: usize = 4096;
+
+/// Returns the UTF-16 length Telegram uses to enforce message limits.
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// Splits `text` into chunks within `limit` UTF-16 units, preferring line boundaries.
+///
+/// Each line keeps its own balanced HTML (our tags never span newlines), so every chunk
+/// is independently valid. A single line longer than `limit` is hard-split by characters.
+fn split_for_telegram(text: &str, limit: usize) -> Vec<String> {
+    if utf16_len(text) <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        if utf16_len(line) > limit {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            for ch in line.chars() {
+                if utf16_len(&current) + ch.len_utf16() > limit {
+                    chunks.push(std::mem::take(&mut current));
+                }
+                current.push(ch);
+            }
+        } else {
+            if utf16_len(&current) + utf16_len(line) > limit {
+                chunks.push(std::mem::take(&mut current));
+            }
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Escapes the three characters that are special in Telegram HTML message text.
 pub fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -239,7 +288,7 @@ pub fn escape_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_html, license_keyboard};
+    use super::{escape_html, license_keyboard, split_for_telegram, utf16_len};
     use crate::models::License;
 
     #[test]
@@ -255,6 +304,32 @@ mod tests {
     #[test]
     fn escapes_html_special_characters() {
         assert_eq!(escape_html("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    #[test]
+    fn short_message_is_a_single_chunk() {
+        assert_eq!(
+            split_for_telegram("hello\nworld", 4096),
+            vec!["hello\nworld".to_string()]
+        );
+    }
+
+    #[test]
+    fn long_message_splits_on_lines_and_rejoins() {
+        let text = vec!["x".repeat(100); 60].join("\n");
+        let chunks = split_for_telegram(&text, 1000);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| utf16_len(chunk) <= 1000));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn overlong_single_line_is_hard_split() {
+        let text = "y".repeat(2500);
+        let chunks = split_for_telegram(&text, 1000);
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|chunk| utf16_len(chunk) <= 1000));
+        assert_eq!(chunks.concat(), text);
     }
 
     #[test]
