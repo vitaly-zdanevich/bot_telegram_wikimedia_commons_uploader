@@ -358,6 +358,15 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
     if let Some(author) = &profile.default_author {
         item["default_author"] = json!({"S": author});
     }
+    if let Some(description) = &profile.default_description {
+        item["default_description"] = json!({"S": description});
+    }
+    if let Some(lang) = &profile.default_lang {
+        item["default_lang"] = json!({"S": lang});
+    }
+    if let Some(license) = &profile.license_override {
+        item["license_override"] = json!({"S": license});
+    }
     item
 }
 
@@ -375,6 +384,9 @@ fn item_to_profile(item: &Value) -> Profile {
             .unwrap_or_default(),
         default_categories: attr_string_list(item, "default_categories"),
         default_author: attr_string(item, "default_author"),
+        default_description: attr_string(item, "default_description"),
+        default_lang: attr_string(item, "default_lang"),
+        license_override: attr_string(item, "license_override"),
         return_upload_links: attr_bool(item, "return_upload_links").unwrap_or(false),
         return_category_links: attr_bool(item, "return_category_links").unwrap_or(false),
         return_missing_category_links: attr_bool(item, "return_missing_category_links")
@@ -424,6 +436,9 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             commons_username TEXT,
             credential_ciphertext TEXT,
             default_author TEXT,
+            default_description TEXT,
+            default_lang TEXT,
+            license_override TEXT,
             license TEXT NOT NULL DEFAULT 'cc-by-4.0',
             filename_prefix TEXT NOT NULL DEFAULT '',
             onboarding_step TEXT NOT NULL DEFAULT 'awaiting_username',
@@ -456,7 +471,7 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
@@ -474,6 +489,9 @@ fn sqlite_load_profile(
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
                 default_author: row.get(12)?,
+                default_description: row.get(13)?,
+                default_lang: row.get(14)?,
+                license_override: row.get(15)?,
             })
         },
     );
@@ -494,7 +512,7 @@ fn sqlite_put_profile(
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -510,6 +528,9 @@ fn sqlite_put_profile(
             profile.created_at,
             profile.updated_at,
             profile.default_author,
+            profile.default_description,
+            profile.default_lang,
+            profile.license_override,
         ],
     )?;
     Ok(())
@@ -596,6 +617,9 @@ mod tests {
             onboarding_step: OnboardingStep::Done,
             default_categories: vec!["Minsk".into(), "Belarus".into()],
             default_author: Some("Jane Doe".into()),
+            default_description: Some("A trip".into()),
+            default_lang: Some("en".into()),
+            license_override: None,
             return_upload_links: true,
             return_category_links: true,
             return_missing_category_links: false,
@@ -644,6 +668,9 @@ mod tests {
             onboarding_step: OnboardingStep::Done,
             default_categories: vec!["Minsk".into()],
             default_author: Some("Jane".into()),
+            default_description: Some("Trip".into()),
+            default_lang: None,
+            license_override: Some("{{PD-RU-exempt}}".into()),
             return_upload_links: true,
             return_category_links: false,
             return_missing_category_links: true,

@@ -106,6 +106,12 @@ pub struct Profile {
     pub default_categories: Vec<String>,
     /// Default author override applied when an upload's caption sets none.
     pub default_author: Option<String>,
+    /// Default description used when an upload has no caption text.
+    pub default_description: Option<String>,
+    /// Default description language code that wraps the description (e.g. `ru`).
+    pub default_lang: Option<String>,
+    /// Custom license wikitext/template overriding the picked license.
+    pub license_override: Option<String>,
     /// Whether to reply with the Commons file link after each successful upload.
     pub return_upload_links: bool,
     /// Whether to reply with links to the categories used in each upload.

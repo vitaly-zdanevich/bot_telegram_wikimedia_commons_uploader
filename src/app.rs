@@ -383,6 +383,15 @@ impl Bot {
                     if let Some(prefix) = command.prefix {
                         profile.filename_prefix = prefix;
                     }
+                    if let Some(description) = command.description {
+                        profile.default_description = Some(description);
+                    }
+                    if let Some(lang) = command.lang {
+                        profile.default_lang = Some(lang);
+                    }
+                    if let Some(license) = command.license {
+                        profile.license_override = Some(license);
+                    }
                     touch(&mut profile);
                     self.store.put_profile(user_id, &profile).await?;
                     return self
@@ -743,8 +752,13 @@ impl Bot {
             .or_else(|| metadata.date.clone())
             .unwrap_or_else(today_iso);
         let username = profile.commons_username.clone().unwrap_or_default();
+        let description = if parsed.description.trim().is_empty() {
+            profile.default_description.clone().unwrap_or_default()
+        } else {
+            parsed.description.clone()
+        };
         let wikitext = build_wikitext(&DescriptionParams {
-            description: &parsed.description,
+            description: &description,
             author_username: &username,
             author_override: parsed
                 .author
@@ -752,6 +766,8 @@ impl Bot {
                 .or(profile.default_author.as_deref()),
             source: parsed.source.as_deref(),
             license: profile.license,
+            license_override: profile.license_override.as_deref(),
+            lang: profile.default_lang.as_deref(),
             categories: &categories,
             date: &date,
             latitude,
@@ -1067,6 +1083,15 @@ fn defaults_summary(profile: &Profile) -> String {
     }
     if !profile.filename_prefix.is_empty() {
         parts.push(format!("filename prefix: {}", profile.filename_prefix));
+    }
+    if let Some(description) = &profile.default_description {
+        parts.push(format!("description: {description}"));
+    }
+    if let Some(lang) = &profile.default_lang {
+        parts.push(format!("language: {lang}"));
+    }
+    if let Some(license) = &profile.license_override {
+        parts.push(format!("license: {license}"));
     }
     if parts.is_empty() {
         "✅ Upload defaults cleared.".to_string()

@@ -480,12 +480,23 @@ pub struct SettingsCommand {
     pub author: Option<String>,
     /// New filename prefix, if set.
     pub prefix: Option<String>,
+    /// New default description, if set.
+    pub description: Option<String>,
+    /// New default description language code, if set.
+    pub lang: Option<String>,
+    /// New custom license, if set.
+    pub license: Option<String>,
 }
 
 impl SettingsCommand {
     /// Returns true when no directive matched.
     pub fn is_empty(&self) -> bool {
-        self.categories.is_empty() && self.author.is_none() && self.prefix.is_none()
+        self.categories.is_empty()
+            && self.author.is_none()
+            && self.prefix.is_none()
+            && self.description.is_none()
+            && self.lang.is_none()
+            && self.license.is_none()
     }
 }
 
@@ -508,6 +519,19 @@ pub fn parse_settings_command(text: &str) -> SettingsCommand {
             }
         } else if let Some(rest) = directive_value(trimmed, &["prefix", "p"]) {
             command.prefix = Some(rest.to_string());
+        } else if let Some(rest) = directive_value(trimmed, &["description", "caption", "cap", "d"])
+        {
+            if !rest.is_empty() {
+                command.description = Some(rest.to_string());
+            }
+        } else if let Some(rest) = directive_value(trimmed, &["language", "lang"]) {
+            if !rest.is_empty() {
+                command.lang = Some(rest.to_string());
+            }
+        } else if let Some(rest) = directive_value(trimmed, &["license", "l"])
+            && !rest.is_empty()
+        {
+            command.license = Some(rest.to_string());
         }
     }
     command
@@ -651,8 +675,12 @@ pub struct DescriptionParams<'a> {
     pub author_override: Option<&'a str>,
     /// Optional source override from the caption (defaults to `{{own}}`).
     pub source: Option<&'a str>,
-    /// Chosen license.
+    /// Chosen license (used when no custom override is set).
     pub license: License,
+    /// Custom license wikitext/template overriding `license`.
+    pub license_override: Option<&'a str>,
+    /// Optional description language code (wraps the description).
+    pub lang: Option<&'a str>,
     /// Category names to add.
     pub categories: &'a [String],
     /// Date string for the `{{Information}}` `date` field (e.g. `2026-06-20`).
@@ -667,18 +695,25 @@ pub struct DescriptionParams<'a> {
 
 /// Builds the `{{Information}}` + license + categories wikitext for a file page.
 pub fn build_wikitext(params: &DescriptionParams) -> String {
-    let description = if params.description.is_empty() {
+    let description = if params.description.trim().is_empty() {
         "Uploaded via Telegram".to_string()
     } else {
-        params.description.to_string()
+        wikitext_value(params.description)
     };
-    let source = params
+    let description = match params.lang.map(str::trim).filter(|lang| !lang.is_empty()) {
+        Some(lang) => format!("{{{{{lang}|1={description}}}}}"),
+        None => description,
+    };
+    let source = match params
         .source
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("{{own}}");
+    {
+        Some(value) => wikitext_value(value),
+        None => "{{own}}".to_string(),
+    };
     let author = match params.author_override.map(str::trim) {
-        Some(override_author) if !override_author.is_empty() => override_author.to_string(),
+        Some(override_author) if !override_author.is_empty() => wikitext_value(override_author),
         _ => {
             let account = account_name(params.author_username);
             format!("[[User:{account}|{account}]]")
@@ -698,7 +733,10 @@ pub fn build_wikitext(params: &DescriptionParams) -> String {
     wikitext.push_str("}}\n\n");
 
     wikitext.push_str("=={{int:license-header}}==\n");
-    wikitext.push_str(&format!("{{{{self|{}}}}}\n\n", params.license.as_key()));
+    wikitext.push_str(&format!(
+        "{}\n\n",
+        render_license(params.license_override, params.license)
+    ));
 
     if let (Some(latitude), Some(longitude)) = (params.latitude, params.longitude) {
         wikitext.push_str(&format!(
@@ -713,13 +751,36 @@ pub fn build_wikitext(params: &DescriptionParams) -> String {
     wikitext
 }
 
+/// Escapes characters that would break or inject into the `{{Information}}` template.
+fn wikitext_value(text: &str) -> String {
+    text.replace('{', "&#123;")
+        .replace('}', "&#125;")
+        .replace('|', "&#124;")
+}
+
+/// Renders the license wikitext from an optional custom override or the picked license.
+fn render_license(override_license: Option<&str>, license: License) -> String {
+    match override_license
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) if value.starts_with("{{") => value.to_string(),
+        Some(value) => match License::parse(value) {
+            Some(parsed) => format!("{{{{self|{}}}}}", parsed.as_key()),
+            None if value.contains(char::is_whitespace) => value.to_string(),
+            None => format!("{{{{{value}}}}}"),
+        },
+        None => format!("{{{{self|{}}}}}", license.as_key()),
+    }
+}
+
 /// Builds `{{Information field}}` provenance entries for the original file.
 fn build_other_fields(provenance: &UploadProvenance) -> String {
     let mut fields = String::new();
     if !provenance.original_filename.is_empty() {
         fields.push_str(&format!(
             "{{{{Information field|name=Original file|value={}}}}}",
-            provenance.original_filename
+            wikitext_value(&provenance.original_filename)
         ));
     }
     if let Some(sha1) = &provenance.original_sha1 {
@@ -843,6 +904,8 @@ mod tests {
             description: "Old town",
             author_username: "Example@uploader",
             license: License::CcBySa40,
+            license_override: None,
+            lang: None,
             categories: &categories,
             date: "2026-06-20",
             latitude: Some(50.45),
@@ -871,6 +934,8 @@ mod tests {
             author_override: Some("John Doe"),
             source: Some("https://example.com/cat/"),
             license: License::CcBy40,
+            license_override: None,
+            lang: None,
             categories: &[],
             date: "2026-06-20",
             latitude: None,
