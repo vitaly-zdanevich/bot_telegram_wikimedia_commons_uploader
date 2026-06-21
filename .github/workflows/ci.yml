@@ -13,7 +13,7 @@ jobs:
     name: Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,7 +30,7 @@ jobs:
     name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked
@@ -40,8 +40,8 @@ jobs:
     name: Terraform Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v4
       - run: terraform fmt -check -recursive infra
 
   sonar:
@@ -53,7 +53,7 @@ jobs:
       - name: Skip when Sonar token is absent
         if: ${{ env.SONAR_TOKEN == '' }}
         run: echo "SONAR_TOKEN is not configured; skipping Sonar scan."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: ${{ env.SONAR_TOKEN != '' }}
         with:
           fetch-depth: 0
@@ -61,11 +61,11 @@ jobs:
         if: ${{ env.SONAR_TOKEN != '' }}
       - uses: Swatinem/rust-cache@v2
         if: ${{ env.SONAR_TOKEN != '' }}
-      - name: Generate coverage (default features, no libheif)
+      - name: Generate coverage (sqlite + archive features; no libheif/rar native deps)
         if: ${{ env.SONAR_TOKEN != '' }}
         run: |
           cargo install cargo-llvm-cov --locked
           mkdir -p coverage
-          cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+          cargo llvm-cov --workspace --features sqlite,archive --lcov --output-path coverage/lcov.info
       - uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         if: ${{ env.SONAR_TOKEN != '' }}
