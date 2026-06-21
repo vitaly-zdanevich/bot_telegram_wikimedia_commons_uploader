@@ -742,7 +742,7 @@ impl Bot {
             &extension,
             &file.file_unique_id,
         );
-        let (latitude, longitude) = match metadata.coordinates() {
+        let (latitude, longitude) = match parsed.coordinates.or_else(|| metadata.coordinates()) {
             Some((latitude, longitude)) => (Some(latitude), Some(longitude)),
             None => (None, None),
         };

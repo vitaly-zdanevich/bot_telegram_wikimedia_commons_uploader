@@ -10,6 +10,7 @@ pub mod commons;
 pub mod config;
 pub mod convert;
 pub mod crypto;
+pub mod geo;
 pub mod metadata;
 pub mod models;
 pub mod store;

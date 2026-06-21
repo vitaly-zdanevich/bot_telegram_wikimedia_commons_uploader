@@ -416,7 +416,7 @@ pub fn category_url(name: &str) -> String {
 }
 
 /// A caption split into a description and category names.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParsedCaption {
     /// Description text (caption with directive lines removed).
     pub description: String,
@@ -428,6 +428,8 @@ pub struct ParsedCaption {
     pub author: Option<String>,
     /// Optional `Date:` override (e.g. `2009-12-03`).
     pub date: Option<String>,
+    /// Optional coordinates from a `Coord:` directive (latitude, longitude).
+    pub coordinates: Option<(f64, f64)>,
 }
 
 /// Parses a caption, extracting `Categories:`, `Source:`, and `Author:` directive lines.
@@ -437,6 +439,7 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
     let mut source = None;
     let mut author = None;
     let mut date = None;
+    let mut coordinates = None;
     for line in caption.lines() {
         let trimmed = line.trim();
         if let Some(rest) = strip_prefix_ci(trimmed, &["categories:", "category:", "c:"]) {
@@ -458,6 +461,12 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
             if !rest.is_empty() {
                 date = Some(rest.to_string());
             }
+        } else if let Some(rest) =
+            strip_prefix_ci(trimmed, &["coordinates:", "coord:", "location:", "gps:"])
+        {
+            if let Some(coords) = crate::geo::parse_coordinates(rest) {
+                coordinates = Some(coords);
+            }
         } else {
             description_lines.push(line);
         }
@@ -468,6 +477,7 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
         source,
         author,
         date,
+        coordinates,
     }
 }
 
@@ -823,6 +833,7 @@ mod tests {
                 source: None,
                 author: None,
                 date: None,
+                coordinates: None,
             }
         );
     }
