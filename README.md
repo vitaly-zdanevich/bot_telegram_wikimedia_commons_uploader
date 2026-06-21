@@ -46,6 +46,32 @@ breaks stripped — e.g. caption "Minsk trip" + `IMG_5638.DNG` → `Minsk trip I
 The caption becomes a descriptive prefix on every photo of an album, and the original name
 keeps them unique (bare generic names like `IMG_5638` are otherwise blocked by Commons).
 
+### Directives
+
+**In a caption** (per file; shared across an album), as `Keyword: value` lines:
+
+| Directive | Purpose |
+| --------- | ------- |
+| `Categories:` / `Category:` / `c:` | categories (comma-separated; multiple lines allowed) |
+| `Source:` | source (defaults to `{{own}}`) |
+| `Author:` / `a:` | author |
+| `Date:` | date, e.g. `2009-12-03` |
+| `Coord:` / `Coordinates:` / `Location:` / `GPS:` | a Google / Yandex / 2GIS / OpenStreetMap link, or plain `lat, lon` |
+
+**As a plain message** to set your defaults for future uploads (colon optional; short aliases):
+
+| Directive | Alias | Sets |
+| --------- | ----- | ---- |
+| `category` | `c` | default categories (added to every upload) |
+| `author` | `a` | default author |
+| `prefix` | `p` | filename prefix |
+| `description` / `caption` | `d` / `cap` | default description |
+| `language` | `lang` | description language (e.g. `ru` → `{{ru\|…}}`) |
+| `license` | `l` | custom license: a key (`cc-by-4.0`), a template (`{{PD-RU-exempt}}` or `PD-RU-exempt`), or free text |
+
+Examples: `c Minsk, Belarus` · `author Jane Doe` · `license {{PD-RU-exempt}}` ·
+`Coord: https://www.openstreetmap.org/?mlat=55.75&mlon=37.61`
+
 ### Accepted formats
 
 Uploaded as-is when Commons accepts them: **JPEG, PNG, GIF, SVG, TIFF, WebP, XCF, PDF,
