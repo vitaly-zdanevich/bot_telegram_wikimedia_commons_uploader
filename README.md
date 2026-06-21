@@ -191,6 +191,10 @@ cargo build --release --features sqlite,archive
 cargo build --release --features sqlite,archive,rar
 ```
 
+Operate it with `scripts/server-logs.sh` (journald logs) and `scripts/server-status.sh`
+(service state, memory, recent errors, Telegram `getMe`); both take the systemd unit name
+via the `SERVICE` env var (default `commons-uploader-bot`).
+
 ### Scripts
 
 | Script | Purpose |
@@ -200,7 +204,9 @@ cargo build --release --features sqlite,archive,rar
 | `scripts/build-lambda-docker.sh` | Build the zip with HEIC inside Docker |
 | `scripts/update-code.sh` | Rebuild and push only the Lambda code |
 | `scripts/set-webhook.sh` | Point Telegram at the Lambda Function URL |
-| `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) |
+| `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) — Lambda |
+| `scripts/server-logs.sh` | Read journald logs (`--since 2h`, `--errors`, `--follow`) — server |
+| `scripts/server-status.sh` | Server health: service state, memory, recent errors, `getMe` |
 
 ## Cost — AWS free tier
 

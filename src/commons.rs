@@ -223,8 +223,8 @@ impl CommonsClient {
             .unwrap_or_default();
         if result != "Success" {
             bail!(
-                "Commons login failed: {}",
-                login_failure_reason(login, result)
+                "{}",
+                login_failure_message(&login_failure_reason(login, result))
             );
         }
         Ok(())
@@ -275,6 +275,16 @@ fn login_failure_reason(login: Option<&Value>, fallback: &str) -> String {
     } else {
         fallback.to_string()
     }
+}
+
+/// Builds the user-facing message for a failed bot-password login, including recovery steps.
+fn login_failure_message(reason: &str) -> String {
+    format!(
+        "❌ Couldn't log in to Commons: {reason}.\n\nYour bot password may be wrong, expired, or \
+         revoked. Create a fresh one at https://commons.wikimedia.org/wiki/Special:BotPasswords \
+         (tick \"Upload new files\" and \"Create, edit, and move pages\"), then run /start to \
+         reconnect your account."
+    )
 }
 
 /// Turns an `action=upload` response into a success or user-facing failure.
@@ -1009,6 +1019,14 @@ mod tests {
         assert!(
             super::friendly_error("permissiondenied", "x").contains("Create, edit, and move pages")
         );
+    }
+
+    #[test]
+    fn login_failure_message_guides_reconnect() {
+        let message = super::login_failure_message("WrongPass");
+        assert!(message.contains("WrongPass"));
+        assert!(message.contains("/start"));
+        assert!(message.contains("Special:BotPasswords"));
     }
 
     #[test]

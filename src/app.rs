@@ -653,7 +653,7 @@ impl Bot {
             None => String::new(),
         };
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n<b>Set up</b>: create a bot password with <b>Upload new files</b> + <b>Create, edit, and move pages</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Everything you upload becomes public</b> under your chosen free license — anyone may reuse it, even commercially. Storage is <b>unlimited</b>, but files that aren't allowed get deleted.\n• ✅ Upload <b>your own</b> work: your photos of nature, streets, buildings, food, events you attended, your own drawings or scans.\n• ❌ Don't upload files from <b>other websites</b> or social media, screenshots of films/TV/games, company logos, book or album covers, posters — these are copyrighted.\n• ✅ Someone else's file is fine <b>only</b> if it's under a free license: Creative Commons <b>CC BY</b> or <b>CC BY-SA</b>, <b>CC0</b>, or public domain — <b>not</b> CC <b>NC</b> (Non-Commercial), which Commons forbids.\nWhat's allowed: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: create a bot password with <b>Upload new files</b> + <b>Create, edit, and move pages</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -1015,6 +1015,8 @@ impl Bot {
             .document
             .as_ref()
             .and_then(|document| document.file_name.clone());
+        // Evict expired or memory-pressuring staged archives before unpacking another.
+        prune_pending(original.len());
         let entries = match crate::archive::extract_images(&original, file_name.as_deref()) {
             Ok(entries) => entries,
             Err(error) => {
@@ -1048,6 +1050,7 @@ impl Bot {
                     user_id,
                     caption,
                     entries,
+                    created_at: now_ts(),
                 },
             );
             let keyboard = InlineKeyboardMarkup {
@@ -1160,7 +1163,7 @@ impl Bot {
         let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
         let mut links: Vec<String> = Vec::new();
         for entry in entries {
-            let unique = short_id(&entry.name);
+            let unique = short_id(&entry.bytes);
             match self
                 .process_one_file(
                     profile,
@@ -1220,6 +1223,71 @@ struct PendingArchive {
     user_id: i64,
     caption: String,
     entries: Vec<crate::archive::ArchiveEntry>,
+    /// Unix timestamp when staged, for TTL eviction.
+    created_at: i64,
+}
+
+/// How long a staged-but-unconfirmed archive is kept before eviction (30 days).
+#[cfg(feature = "archive")]
+const PENDING_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Free-memory headroom (bytes) required on top of the incoming archive before staging.
+#[cfg(feature = "archive")]
+const LOW_MEMORY_MARGIN: u64 = 256 * 1024 * 1024;
+
+/// Returns true once a staged archive is older than [`PENDING_TTL_SECS`].
+#[cfg(feature = "archive")]
+fn pending_is_expired(created_at: i64, now: i64) -> bool {
+    now.saturating_sub(created_at) >= PENDING_TTL_SECS
+}
+
+/// Parses `MemAvailable` (in kB) out of `/proc/meminfo` contents.
+#[cfg(feature = "archive")]
+fn parse_mem_available_kb(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?;
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })
+}
+
+/// Reads currently-available memory in bytes (Linux only); `None` if it can't be determined.
+#[cfg(feature = "archive")]
+fn available_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_available_kb(&meminfo).map(|kb| kb.saturating_mul(1024))
+}
+
+/// True when staging an archive of `incoming_len` bytes risks exhausting RAM.
+///
+/// When available memory is unknown (`None`), returns false so we never evict blindly.
+#[cfg(feature = "archive")]
+fn is_low_memory(available: Option<u64>, incoming_len: usize) -> bool {
+    match available {
+        Some(available) => {
+            let needed = (incoming_len as u64)
+                .saturating_mul(3)
+                .saturating_add(LOW_MEMORY_MARGIN);
+            available < needed
+        }
+        None => false,
+    }
+}
+
+/// Evicts expired staged archives, and — if memory is tight before unpacking another
+/// archive of `incoming_len` bytes — drops all staged archives to reclaim RAM.
+#[cfg(feature = "archive")]
+fn prune_pending(incoming_len: usize) {
+    let now = now_ts();
+    let mut map = archive_pending().lock().unwrap();
+    map.retain(|_, pending| !pending_is_expired(pending.created_at, now));
+    if is_low_memory(available_memory_bytes(), incoming_len) && !map.is_empty() {
+        let freed = map.len();
+        map.clear();
+        tracing::warn!(
+            freed,
+            "cleared staged archives to free memory before unpacking"
+        );
+    }
 }
 
 /// Process-wide store of archives awaiting confirmation, keyed by a short token.
@@ -1239,10 +1307,11 @@ fn new_token() -> String {
     format!("{value:x}")
 }
 
-/// Derives a short, stable per-entry id from its name (for filename uniqueness).
+/// Derives a short, content-based id from file bytes (keeps archive filenames unique
+/// even when two archives contain different files with the same name).
 #[cfg(feature = "archive")]
-fn short_id(name: &str) -> String {
-    sha1_hex(name.as_bytes())[..10].to_string()
+fn short_id(data: &[u8]) -> String {
+    sha1_hex(data)[..10].to_string()
 }
 
 /// Extracts the best file attachment from a message, if any.
@@ -1538,5 +1607,45 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
+    }
+}
+
+#[cfg(all(test, feature = "archive"))]
+mod archive_tests {
+    use super::{
+        PENDING_TTL_SECS, is_low_memory, parse_mem_available_kb, pending_is_expired, short_id,
+    };
+
+    #[test]
+    fn short_id_is_content_based_and_short() {
+        let a = short_id(b"hello");
+        assert_eq!(a.len(), 10);
+        assert_eq!(a, short_id(b"hello"));
+        assert_ne!(a, short_id(b"world"));
+    }
+
+    #[test]
+    fn parses_mem_available_line() {
+        let sample = "MemTotal:       16314072 kB\nMemFree:  123 kB\nMemAvailable:    8157036 kB\n";
+        assert_eq!(parse_mem_available_kb(sample), Some(8_157_036));
+        assert_eq!(parse_mem_available_kb("MemTotal: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn low_memory_needs_headroom_over_incoming() {
+        let mb = 1024 * 1024;
+        // 100 MB free, 50 MB incoming → needs 150 MB + 256 MB margin → low.
+        assert!(is_low_memory(Some(100 * mb), 50 * mb as usize));
+        // 2 GB free, 50 MB incoming → plenty.
+        assert!(!is_low_memory(Some(2048 * mb), 50 * mb as usize));
+        // Unknown availability → never evict.
+        assert!(!is_low_memory(None, 999 * mb as usize));
+    }
+
+    #[test]
+    fn pending_expiry_uses_ttl() {
+        assert!(!pending_is_expired(1000, 1000));
+        assert!(!pending_is_expired(1000, 1000 + PENDING_TTL_SECS - 1));
+        assert!(pending_is_expired(1000, 1000 + PENDING_TTL_SECS));
     }
 }
