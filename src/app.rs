@@ -146,6 +146,25 @@ struct FileRef {
     compressed_photo: bool,
 }
 
+/// Structured outcome of running one file through the convert + upload pipeline.
+///
+/// Reporting is left to the caller, so single files and archive members can be
+/// summarised differently (one detailed reply vs. an aggregate count).
+enum FileResult {
+    /// Uploaded successfully.
+    Uploaded {
+        filename: String,
+        url: String,
+        categories: Vec<String>,
+    },
+    /// An identical file already exists on Commons (matched by SHA-1).
+    Duplicate { titles: Vec<String> },
+    /// The file could not be converted or its type is not accepted.
+    Rejected { reason: String },
+    /// Commons refused the upload (e.g. blocked, permission denied).
+    Failed { message: String },
+}
+
 impl Bot {
     /// Builds a bot from runtime configuration.
     fn from_config(config: Config) -> Self {
@@ -421,6 +440,16 @@ impl Bot {
         let Some(chat_id) = callback.message.as_ref().map(|message| message.chat.id) else {
             return Ok(());
         };
+
+        #[cfg(feature = "archive")]
+        if let Some(token) = data.strip_prefix("arc:ok:") {
+            return self.confirm_archive(chat_id, user_id, token, true).await;
+        }
+        #[cfg(feature = "archive")]
+        if let Some(token) = data.strip_prefix("arc:no:") {
+            return self.confirm_archive(chat_id, user_id, token, false).await;
+        }
+
         let mut profile = self.store.get_profile(user_id).await;
 
         if let Some(key) = data.strip_prefix(crate::telegram::LICENSE_CALLBACK_PREFIX) {
@@ -477,6 +506,16 @@ impl Bot {
                     "Return non-existing category links",
                     profile.return_missing_category_links,
                 )
+            }
+            #[cfg(feature = "archive")]
+            "set:arclist" => {
+                profile.return_archive_file_list = !profile.return_archive_file_list;
+                ("Return archive file list", profile.return_archive_file_list)
+            }
+            #[cfg(feature = "archive")]
+            "set:arcconfirm" => {
+                profile.archive_confirm = !profile.archive_confirm;
+                ("Confirm archive before upload", profile.archive_confirm)
             }
             _ => return Ok(()),
         };
@@ -617,7 +656,130 @@ impl Bot {
             "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n<b>Set up</b>: create a bot password with <b>Upload new files</b> + <b>Create, edit, and move pages</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
+        #[cfg(feature = "archive")]
+        let text = format!(
+            "{text}\n\n📦 <b>Archives</b>: send a <b>.zip</b> (or .rar) and I upload the images inside under one caption/categories. In /settings you can show the archive's file list and require a thumbnail + <b>Confirm</b> step before uploading."
+        );
         self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Runs one file through convert/dup-check/build/upload and returns a structured result.
+    ///
+    /// Performs no user messaging; callers translate the [`FileResult`] into replies.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_one_file(
+        &self,
+        profile: &Profile,
+        caption: &str,
+        original: Vec<u8>,
+        file_name: Option<&str>,
+        mime: Option<&str>,
+        unique_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<FileResult> {
+        let parsed = parse_caption(caption);
+        let categories = merge_categories(&parsed.categories, &profile.default_categories);
+        let metadata = metadata::extract(&original);
+
+        // Convert DNG/HEIC/BMP to WebP; pass everything else through if Commons accepts it.
+        let format = convert::classify(file_name, mime, &original);
+        let mut provenance = UploadProvenance {
+            original_filename: file_name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("telegram_{unique_id}")),
+            ..UploadProvenance::default()
+        };
+        let (upload_bytes, extension) = if format.needs_conversion() {
+            provenance.original_sha1 = Some(sha1_hex(&original));
+            provenance.original_md5 = Some(md5_hex(&original));
+            match convert::convert(&original, format, self.config.webp_quality) {
+                Ok((bytes, ext)) => (bytes, ext.to_string()),
+                Err(error) => {
+                    return Ok(FileResult::Rejected {
+                        reason: format!("Couldn't convert this file: {error}"),
+                    });
+                }
+            }
+        } else {
+            let extension = convert::passthrough_extension(file_name, mime);
+            if !convert::is_commons_accepted(&extension) {
+                return Ok(FileResult::Rejected {
+                    reason: format!("Commons does not accept .{extension} files"),
+                });
+            }
+            (original, extension)
+        };
+
+        // Duplicate pre-check by content hash.
+        let upload_sha1 = sha1_hex(&upload_bytes);
+        if let Ok(existing) = self.commons.find_by_sha1(&upload_sha1).await
+            && !existing.is_empty()
+        {
+            return Ok(FileResult::Duplicate { titles: existing });
+        }
+
+        // Build the filename: caption text as a descriptive prefix and the original stem
+        // for per-file uniqueness (emoji dropped, newlines collapsed by build_filename).
+        let filename = build_filename(
+            &profile.filename_prefix,
+            &parsed.description,
+            file_stem(file_name),
+            &extension,
+            unique_id,
+        );
+        let (latitude, longitude) = match parsed.coordinates.or_else(|| metadata.coordinates()) {
+            Some((latitude, longitude)) => (Some(latitude), Some(longitude)),
+            None => (None, None),
+        };
+        let date = parsed
+            .date
+            .clone()
+            .or_else(|| metadata.date.clone())
+            .unwrap_or_else(today_iso);
+        let description = if parsed.description.trim().is_empty() {
+            profile.default_description.clone().unwrap_or_default()
+        } else {
+            parsed.description.clone()
+        };
+        let wikitext = build_wikitext(&DescriptionParams {
+            description: &description,
+            author_username: username,
+            author_override: parsed
+                .author
+                .as_deref()
+                .or(profile.default_author.as_deref()),
+            source: parsed.source.as_deref(),
+            license: profile.license,
+            license_override: profile.license_override.as_deref(),
+            lang: profile.default_lang.as_deref(),
+            categories: &categories,
+            date: &date,
+            latitude,
+            longitude,
+            provenance: &provenance,
+        });
+
+        let outcome = self
+            .commons
+            .upload(&UploadRequest {
+                username: username.to_string(),
+                password: password.to_string(),
+                filename: filename.clone(),
+                bytes: upload_bytes,
+                wikitext,
+                comment: format!("Uploaded via Telegram bot {BOT_USERNAME}"),
+            })
+            .await?;
+
+        Ok(match outcome {
+            UploadOutcome::Success { url, .. } => FileResult::Uploaded {
+                filename,
+                url,
+                categories,
+            },
+            UploadOutcome::Failed { message } => FileResult::Failed { message },
+        })
     }
 
     /// Downloads, converts if needed, and uploads one file to Commons.
@@ -677,103 +839,13 @@ impl Bot {
             }
         };
 
-        // Resolve the description and categories, sharing an album's caption across photos.
-        let caption = self.resolve_caption(message).await;
-        let parsed = parse_caption(&caption);
-        let categories = merge_categories(&parsed.categories, &profile.default_categories);
-        let metadata = metadata::extract(&original);
-
-        // Convert DNG/HEIC/BMP to WebP; pass everything else through if Commons accepts it.
-        let format = convert::classify(file.file_name.as_deref(), file.mime.as_deref(), &original);
-        let mut provenance = UploadProvenance {
-            original_filename: file
-                .file_name
-                .clone()
-                .unwrap_or_else(|| format!("telegram_{}", file.file_unique_id)),
-            ..UploadProvenance::default()
-        };
-        let (upload_bytes, extension) = if format.needs_conversion() {
-            provenance.original_sha1 = Some(sha1_hex(&original));
-            provenance.original_md5 = Some(md5_hex(&original));
-            match convert::convert(&original, format, self.config.webp_quality) {
-                Ok((bytes, ext)) => (bytes, ext.to_string()),
-                Err(error) => {
-                    let text = format!(
-                        "❌ Couldn't convert this file: {}\n\nTry sending a JPEG or PNG export instead.",
-                        escape_html(&format!("{error}"))
-                    );
-                    return self.telegram.send_message(chat_id, &text, None).await;
-                }
-            }
-        } else {
-            let extension =
-                convert::passthrough_extension(file.file_name.as_deref(), file.mime.as_deref());
-            if !convert::is_commons_accepted(&extension) {
-                let text = format!(
-                    "❌ Commons does not accept <code>.{}</code> files. Accepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). DNG, HEIC and BMP are converted automatically.",
-                    escape_html(&extension)
-                );
-                return self.telegram.send_message(chat_id, &text, None).await;
-            }
-            (original, extension)
-        };
-
-        // Duplicate pre-check by content hash.
-        let upload_sha1 = sha1_hex(&upload_bytes);
-        if let Ok(existing) = self.commons.find_by_sha1(&upload_sha1).await
-            && !existing.is_empty()
-        {
-            let links = existing
-                .iter()
-                .map(|title| format!("• {}", commons_title_url(title)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let text =
-                format!("⚠️ This exact file already exists on Commons:\n{links}\n\nSkipped.");
-            return self.telegram.send_message(chat_id, &text, None).await;
+        // Archives (zip/rar) are expanded and each member uploaded — VM-only feature.
+        #[cfg(feature = "archive")]
+        if crate::archive::is_archive(file.file_name.as_deref(), &original) {
+            return self
+                .handle_archive(chat_id, user_id, &mut profile, message, original)
+                .await;
         }
-
-        // Build the filename: caption text as a descriptive prefix and the original stem
-        // for per-file uniqueness (emoji dropped, newlines collapsed by build_filename).
-        let filename = build_filename(
-            &profile.filename_prefix,
-            &parsed.description,
-            file_stem(file.file_name.as_deref()),
-            &extension,
-            &file.file_unique_id,
-        );
-        let (latitude, longitude) = match parsed.coordinates.or_else(|| metadata.coordinates()) {
-            Some((latitude, longitude)) => (Some(latitude), Some(longitude)),
-            None => (None, None),
-        };
-        let date = parsed
-            .date
-            .clone()
-            .or_else(|| metadata.date.clone())
-            .unwrap_or_else(today_iso);
-        let username = profile.commons_username.clone().unwrap_or_default();
-        let description = if parsed.description.trim().is_empty() {
-            profile.default_description.clone().unwrap_or_default()
-        } else {
-            parsed.description.clone()
-        };
-        let wikitext = build_wikitext(&DescriptionParams {
-            description: &description,
-            author_username: &username,
-            author_override: parsed
-                .author
-                .as_deref()
-                .or(profile.default_author.as_deref()),
-            source: parsed.source.as_deref(),
-            license: profile.license,
-            license_override: profile.license_override.as_deref(),
-            lang: profile.default_lang.as_deref(),
-            categories: &categories,
-            date: &date,
-            latitude,
-            longitude,
-            provenance: &provenance,
-        });
 
         let Some(cipher) = &self.cipher else {
             return self
@@ -785,28 +857,36 @@ impl Bot {
                 )
                 .await;
         };
+        let username = profile.commons_username.clone().unwrap_or_default();
         let password = cipher
             .decrypt(profile.credential_ciphertext.as_deref().unwrap_or_default())
             .context("failed to decrypt stored credentials")?;
+        // Resolve the description and categories, sharing an album's caption across photos.
+        let caption = self.resolve_caption(message).await;
 
         self.telegram
             .send_chat_action(chat_id, "upload_document")
             .await
             .ok();
-        let outcome = self
-            .commons
-            .upload(&UploadRequest {
-                username,
-                password,
-                filename: filename.clone(),
-                bytes: upload_bytes,
-                wikitext,
-                comment: format!("Uploaded via Telegram bot {BOT_USERNAME}"),
-            })
+        let result = self
+            .process_one_file(
+                &profile,
+                &caption,
+                original,
+                file.file_name.as_deref(),
+                file.mime.as_deref(),
+                &file.file_unique_id,
+                &username,
+                &password,
+            )
             .await?;
 
-        match outcome {
-            UploadOutcome::Success { url, .. } => {
+        match result {
+            FileResult::Uploaded {
+                filename,
+                url,
+                categories,
+            } => {
                 profile.uploads_count = profile.uploads_count.saturating_add(1);
                 touch(&mut profile);
                 self.store.put_profile(user_id, &profile).await.ok();
@@ -820,7 +900,24 @@ impl Bot {
                 )
                 .await
             }
-            UploadOutcome::Failed { message } => {
+            FileResult::Duplicate { titles } => {
+                let links = titles
+                    .iter()
+                    .map(|title| format!("• {}", commons_title_url(title)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text =
+                    format!("⚠️ This exact file already exists on Commons:\n{links}\n\nSkipped.");
+                self.telegram.send_message(chat_id, &text, None).await
+            }
+            FileResult::Rejected { reason } => {
+                let text = format!(
+                    "❌ {}.\n\nAccepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). DNG, HEIC and BMP are converted automatically.",
+                    escape_html(&reason)
+                );
+                self.telegram.send_message(chat_id, &text, None).await
+            }
+            FileResult::Failed { message } => {
                 self.telegram
                     .send_message(chat_id, &escape_html(&message), None)
                     .await
@@ -900,6 +997,252 @@ impl Bot {
         );
         self.telegram.send_message(chat_id, &text, None).await
     }
+}
+
+/// Archive (zip/rar) handling — built only with the `archive` feature (VM-only).
+#[cfg(feature = "archive")]
+impl Bot {
+    /// Expands an archive and either previews it (confirm flow) or uploads every image.
+    async fn handle_archive(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        profile: &mut Profile,
+        message: &Message,
+        original: Vec<u8>,
+    ) -> Result<()> {
+        let file_name = message
+            .document
+            .as_ref()
+            .and_then(|document| document.file_name.clone());
+        let entries = match crate::archive::extract_images(&original, file_name.as_deref()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                let text = format!(
+                    "❌ Couldn't read the archive: {}",
+                    escape_html(&format!("{error}"))
+                );
+                return self.telegram.send_message(chat_id, &text, None).await;
+            }
+        };
+
+        if profile.return_archive_file_list {
+            let list = entries
+                .iter()
+                .map(|entry| format!("• {}", escape_html(&entry.name)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = format!("📦 {} image(s) inside the archive:\n{list}", entries.len());
+            self.telegram.send_message(chat_id, &text, None).await.ok();
+        }
+
+        let caption = self.resolve_caption(message).await;
+
+        if profile.archive_confirm {
+            self.send_archive_thumbnails(chat_id, &entries).await;
+            let token = new_token();
+            let count = entries.len();
+            archive_pending().lock().unwrap().insert(
+                token.clone(),
+                PendingArchive {
+                    user_id,
+                    caption,
+                    entries,
+                },
+            );
+            let keyboard = InlineKeyboardMarkup {
+                inline_keyboard: vec![vec![
+                    InlineKeyboardButton {
+                        text: "✅ Confirm upload".to_string(),
+                        callback_data: Some(format!("arc:ok:{token}")),
+                        url: None,
+                    },
+                    InlineKeyboardButton {
+                        text: "✖ Cancel".to_string(),
+                        callback_data: Some(format!("arc:no:{token}")),
+                        url: None,
+                    },
+                ]],
+            };
+            let text = format!(
+                "📦 Found <b>{count}</b> image(s). Confirm uploading to Wikimedia Commons?"
+            );
+            return self
+                .telegram
+                .send_message(chat_id, &text, Some(keyboard))
+                .await;
+        }
+
+        self.upload_entries(chat_id, user_id, profile, &caption, entries)
+            .await
+    }
+
+    /// Sends up to a handful of preview thumbnails for an archive's images.
+    async fn send_archive_thumbnails(
+        &self,
+        chat_id: i64,
+        entries: &[crate::archive::ArchiveEntry],
+    ) {
+        const MAX_THUMBS: usize = 8;
+        for entry in entries.iter().take(MAX_THUMBS) {
+            if let Some(thumb) = convert::make_thumbnail(&entry.bytes, 320) {
+                self.telegram
+                    .send_photo(chat_id, thumb, "thumb.jpg", Some(&entry.name), None)
+                    .await
+                    .ok();
+            }
+        }
+        if entries.len() > MAX_THUMBS {
+            let text = format!("… and {} more.", entries.len() - MAX_THUMBS);
+            self.telegram.send_message(chat_id, &text, None).await.ok();
+        }
+    }
+
+    /// Resolves a pending archive by token and uploads it (or cancels it).
+    async fn confirm_archive(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        token: &str,
+        proceed: bool,
+    ) -> Result<()> {
+        let pending = archive_pending().lock().unwrap().remove(token);
+        let Some(pending) = pending else {
+            return self
+                .telegram
+                .send_message(chat_id, "This archive request has expired.", None)
+                .await;
+        };
+        if pending.user_id != user_id {
+            return Ok(());
+        }
+        if !proceed {
+            return self
+                .telegram
+                .send_message(chat_id, "✖ Archive upload cancelled.", None)
+                .await;
+        }
+        let mut profile = self.store.get_profile(user_id).await;
+        self.upload_entries(
+            chat_id,
+            user_id,
+            &mut profile,
+            &pending.caption,
+            pending.entries,
+        )
+        .await
+    }
+
+    /// Uploads every extracted image, replying with an aggregate summary.
+    async fn upload_entries(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        profile: &mut Profile,
+        caption: &str,
+        entries: Vec<crate::archive::ArchiveEntry>,
+    ) -> Result<()> {
+        let Some(cipher) = &self.cipher else {
+            return self
+                .telegram
+                .send_message(chat_id, "⚠️ The bot is missing its encryption key.", None)
+                .await;
+        };
+        let username = profile.commons_username.clone().unwrap_or_default();
+        let password = cipher
+            .decrypt(profile.credential_ciphertext.as_deref().unwrap_or_default())
+            .context("failed to decrypt stored credentials")?;
+
+        self.telegram
+            .send_chat_action(chat_id, "upload_document")
+            .await
+            .ok();
+        let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
+        let mut links: Vec<String> = Vec::new();
+        for entry in entries {
+            let unique = short_id(&entry.name);
+            match self
+                .process_one_file(
+                    profile,
+                    caption,
+                    entry.bytes,
+                    Some(&entry.name),
+                    None,
+                    &unique,
+                    &username,
+                    &password,
+                )
+                .await
+            {
+                Ok(FileResult::Uploaded { filename, url, .. }) => {
+                    uploaded += 1;
+                    profile.uploads_count = profile.uploads_count.saturating_add(1);
+                    if profile.return_upload_links {
+                        links.push(format!(
+                            "• <a href=\"{url}\">{}</a>",
+                            escape_html(&filename)
+                        ));
+                    }
+                }
+                Ok(FileResult::Duplicate { .. }) => duplicate += 1,
+                Ok(FileResult::Rejected { .. }) => rejected += 1,
+                Ok(FileResult::Failed { .. }) => failed += 1,
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(error = %format!("{error:#}"), "archive member upload failed");
+                }
+            }
+        }
+        touch(profile);
+        self.store.put_profile(user_id, profile).await.ok();
+
+        let mut text = format!("📦 Archive done — ✅ {uploaded} uploaded");
+        if duplicate > 0 {
+            text.push_str(&format!(", ⚠️ {duplicate} duplicate"));
+        }
+        if rejected > 0 {
+            text.push_str(&format!(", ⛔ {rejected} skipped"));
+        }
+        if failed > 0 {
+            text.push_str(&format!(", ❌ {failed} failed"));
+        }
+        if !links.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&links.join("\n"));
+        }
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+}
+
+/// A staged archive awaiting the user's upload confirmation (in-memory; the VM is long-living).
+#[cfg(feature = "archive")]
+struct PendingArchive {
+    user_id: i64,
+    caption: String,
+    entries: Vec<crate::archive::ArchiveEntry>,
+}
+
+/// Process-wide store of archives awaiting confirmation, keyed by a short token.
+#[cfg(feature = "archive")]
+fn archive_pending() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingArchive>>
+{
+    static PENDING: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PendingArchive>>,
+    > = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Returns a short random token for a pending-archive confirmation.
+#[cfg(feature = "archive")]
+fn new_token() -> String {
+    let value: u64 = rand::random();
+    format!("{value:x}")
+}
+
+/// Derives a short, stable per-entry id from its name (for filename uniqueness).
+#[cfg(feature = "archive")]
+fn short_id(name: &str) -> String {
+    sha1_hex(name.as_bytes())[..10].to_string()
 }
 
 /// Extracts the best file attachment from a message, if any.
@@ -996,8 +1339,8 @@ fn settings_overview(profile: &Profile) -> String {
     } else {
         profile.default_categories.join(", ")
     };
-    format!(
-        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nReturn upload links: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>\n\nButtons below toggle options and the license.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>",
+    let mut text = format!(
+        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nReturn upload links: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
         escape_html(&account),
         escape_html(profile.license.label()),
         escape_html(&prefix),
@@ -1005,7 +1348,19 @@ fn settings_overview(profile: &Profile) -> String {
         on_off(profile.return_upload_links),
         on_off(profile.return_category_links),
         on_off(profile.return_missing_category_links),
-    )
+    );
+    #[cfg(feature = "archive")]
+    {
+        text.push_str(&format!(
+            "\nArchive — return file list: <b>{}</b>\nArchive — confirm before upload: <b>{}</b>",
+            on_off(profile.return_archive_file_list),
+            on_off(profile.archive_confirm),
+        ));
+    }
+    text.push_str(
+        "\n\nButtons below toggle options and the license.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>",
+    );
+    text
 }
 
 /// Builds the settings inline keyboard (toggles plus license picker).
@@ -1027,6 +1382,19 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             profile.return_missing_category_links,
         )],
     ];
+    #[cfg(feature = "archive")]
+    {
+        rows.push(vec![toggle_button(
+            "Archive: list files",
+            "set:arclist",
+            profile.return_archive_file_list,
+        )]);
+        rows.push(vec![toggle_button(
+            "Archive: confirm first",
+            "set:arcconfirm",
+            profile.archive_confirm,
+        )]);
+    }
     rows.extend(license_keyboard().inline_keyboard);
     InlineKeyboardMarkup {
         inline_keyboard: rows,

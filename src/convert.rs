@@ -48,6 +48,29 @@ pub fn is_commons_accepted(extension: &str) -> bool {
     COMMONS_ACCEPTED_EXTENSIONS.contains(&extension.as_str())
 }
 
+/// Returns true when an archive member is uploadable (accepted as-is, or convertible).
+pub fn is_uploadable_archive_member(name: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((_, ext)) => {
+            let ext = ext.to_ascii_lowercase();
+            is_commons_accepted(&ext) || matches!(ext.as_str(), "dng" | "heic" | "heif" | "bmp")
+        }
+        None => false,
+    }
+}
+
+/// Renders a small JPEG thumbnail for an archive preview, or `None` if undecodable.
+#[cfg(feature = "archive")]
+pub fn make_thumbnail(bytes: &[u8], max_edge: u32) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let thumb = image.thumbnail(max_edge, max_edge).to_rgb8();
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(thumb)
+        .write_to(&mut out, image::ImageFormat::Jpeg)
+        .ok()?;
+    Some(out.into_inner())
+}
+
 /// Classifies an incoming file by extension, MIME type, and magic bytes.
 pub fn classify(file_name: Option<&str>, mime: Option<&str>, bytes: &[u8]) -> SourceFormat {
     let extension = file_name.and_then(file_extension);

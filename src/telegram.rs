@@ -117,6 +117,42 @@ impl TelegramClient {
         self.download_file(&path, max_bytes).await
     }
 
+    /// Sends a photo (used for archive thumbnails). Built only with the `archive` feature.
+    #[cfg(feature = "archive")]
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        photo: Vec<u8>,
+        file_name: &str,
+        caption: Option<&str>,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(
+                "photo",
+                reqwest::multipart::Part::bytes(photo).file_name(file_name.to_string()),
+            );
+        if let Some(caption) = caption {
+            form = form.text("caption", caption.to_string());
+        }
+        if let Some(markup) = reply_markup {
+            form = form.text("reply_markup", serde_json::to_string(&markup)?);
+        }
+        let response = self
+            .client
+            .post(self.method_url("sendPhoto"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            bail!("Telegram sendPhoto failed with HTTP {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// Long-polls for updates (server mode), returning the parsed updates.
     pub async fn get_updates(
         &self,

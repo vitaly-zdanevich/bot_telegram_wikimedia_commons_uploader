@@ -5,6 +5,8 @@
 //! own account with a generated `{{Information}}` + license description.
 
 pub mod app;
+#[cfg(feature = "archive")]
+pub mod archive;
 pub mod aws;
 pub mod commons;
 pub mod config;

@@ -90,7 +90,7 @@ impl OnboardingStep {
 }
 
 /// One user's stored profile (one DynamoDB item per Telegram user).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Profile {
     /// Commons bot-password username, e.g. `Example@uploader`.
     pub commons_username: Option<String>,
@@ -118,12 +118,41 @@ pub struct Profile {
     pub return_category_links: bool,
     /// Whether to reply with links to categories that do not yet exist on Commons.
     pub return_missing_category_links: bool,
+    /// Whether to reply with the file list found inside an archive (off by default).
+    pub return_archive_file_list: bool,
+    /// Whether to show archive thumbnails and require a Confirm tap (on by default).
+    pub archive_confirm: bool,
     /// Number of successful uploads (for admin stats).
     pub uploads_count: u64,
     /// Unix timestamp of profile creation.
     pub created_at: i64,
     /// Unix timestamp of the last update.
     pub updated_at: i64,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            commons_username: None,
+            credential_ciphertext: None,
+            license: License::default(),
+            filename_prefix: String::new(),
+            onboarding_step: OnboardingStep::default(),
+            default_categories: Vec::new(),
+            default_author: None,
+            default_description: None,
+            default_lang: None,
+            license_override: None,
+            return_upload_links: false,
+            return_category_links: false,
+            return_missing_category_links: false,
+            return_archive_file_list: false,
+            archive_confirm: true,
+            uploads_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
 }
 
 impl Profile {

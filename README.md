@@ -104,12 +104,28 @@ Set the `commons_proxy` Terraform variable (env `COMMONS_PROXY`) to route Common
 login/upload traffic through a clean IP — for example a small proxy on **Wikimedia Cloud
 VPS / Toolforge**, whose IPs are not blocked. Then `terraform apply` to update the Lambda.
 
+### Archives (zip / rar) — server build only
+
+On the long-living server build (not Lambda), send a **`.zip`** and the bot uploads the
+images inside it, sharing one caption/categories/license across them. Two `/settings`
+toggles control the flow:
+
+- **Show file list** (off by default) — reply with the names of the images found.
+- **Confirm before upload** (on by default) — send thumbnails of the first images and a
+  **Confirm upload** / **Cancel** button; nothing is uploaded until you confirm.
+
+ZIP works out of the box (pure Rust). **RAR** needs the system `libunrar` and the extra
+`rar` Cargo feature (see the server build below). Archives are disabled on the Lambda build
+because Telegram's 20 MB download cap makes multi-image archives impractical there.
+
 ### Commands & settings
 
 - `/start` — connect your account / resume setup
 - `/help` — usage, your uploads link, related projects, contact
 - `/settings` — license, filename prefix, default categories, and toggles (all **off** by
-  default): return upload links, return category links, return non-existing category links
+  default): return upload links, return category links, return non-existing category links.
+  On the server build, two more: show an archive's file list (**off**), and require a
+  thumbnail + **Confirm** step before uploading an archive (**on**)
 - `/forget` — delete your stored credentials and settings
 - `/stat` — admins only: total users and uploads
 
@@ -154,6 +170,25 @@ via Docker** (`scripts/build-lambda-docker.sh`, an arm64 Amazon Linux 2023 image
 compiles libheif + libde265) when Docker is available, and otherwise falls back to a fast
 `cargo-lambda`/zig cross-build **without** HEIC (DNG and BMP still convert). Force the
 fast build with `HEIC=0 ./scripts/build-lambda.sh`.
+
+### Long-living server (Toolforge / Cloud VPS)
+
+Besides Lambda, the same binary runs as a long-polling server — useful on
+**Wikimedia Toolforge / Cloud VPS**, whose IPs Commons does not block. Set
+`BOT_MODE=polling` (it also auto-selects polling when not running in Lambda) and it calls
+`getUpdates` in a loop instead of serving a webhook. Pair it with a self-hosted
+[Telegram Bot API server](https://github.com/tdlib/telegram-bot-api) to raise the file
+limit from 20 MB to **~2 GB** (point `TELEGRAM_API_BASE` at it).
+
+Storage uses **SQLite** instead of DynamoDB — build with the `sqlite` feature and set
+`SQLITE_PATH`. Add archive support (and optionally RAR):
+
+```bash
+# ZIP archives + SQLite storage
+cargo build --release --features sqlite,archive
+# add RAR (needs system libunrar, e.g. apt install libunrar-dev)
+cargo build --release --features sqlite,archive,rar
+```
 
 ### Scripts
 

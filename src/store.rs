@@ -345,6 +345,8 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
         "return_upload_links": {"BOOL": profile.return_upload_links},
         "return_category_links": {"BOOL": profile.return_category_links},
         "return_missing_category_links": {"BOOL": profile.return_missing_category_links},
+        "return_archive_file_list": {"BOOL": profile.return_archive_file_list},
+        "archive_confirm": {"BOOL": profile.archive_confirm},
         "uploads_count": {"N": profile.uploads_count.to_string()},
         "created_at": {"N": profile.created_at.to_string()},
         "updated_at": {"N": profile.updated_at.to_string()},
@@ -391,6 +393,8 @@ fn item_to_profile(item: &Value) -> Profile {
         return_category_links: attr_bool(item, "return_category_links").unwrap_or(false),
         return_missing_category_links: attr_bool(item, "return_missing_category_links")
             .unwrap_or(false),
+        return_archive_file_list: attr_bool(item, "return_archive_file_list").unwrap_or(false),
+        archive_confirm: attr_bool(item, "archive_confirm").unwrap_or(true),
         uploads_count: attr_i64(item, "uploads_count").unwrap_or(0).max(0) as u64,
         created_at: attr_i64(item, "created_at").unwrap_or(0),
         updated_at: attr_i64(item, "updated_at").unwrap_or(0),
@@ -446,6 +450,8 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             return_upload_links INTEGER NOT NULL DEFAULT 0,
             return_category_links INTEGER NOT NULL DEFAULT 0,
             return_missing_category_links INTEGER NOT NULL DEFAULT 0,
+            return_archive_file_list INTEGER NOT NULL DEFAULT 0,
+            archive_confirm INTEGER NOT NULL DEFAULT 1,
             uploads_count INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
@@ -471,7 +477,7 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
@@ -492,6 +498,8 @@ fn sqlite_load_profile(
                 default_description: row.get(13)?,
                 default_lang: row.get(14)?,
                 license_override: row.get(15)?,
+                return_archive_file_list: row.get::<_, i64>(16)? != 0,
+                archive_confirm: row.get::<_, i64>(17)? != 0,
             })
         },
     );
@@ -512,7 +520,7 @@ fn sqlite_put_profile(
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -531,6 +539,8 @@ fn sqlite_put_profile(
             profile.default_description,
             profile.default_lang,
             profile.license_override,
+            profile.return_archive_file_list as i64,
+            profile.archive_confirm as i64,
         ],
     )?;
     Ok(())
@@ -623,6 +633,8 @@ mod tests {
             return_upload_links: true,
             return_category_links: true,
             return_missing_category_links: false,
+            return_archive_file_list: false,
+            archive_confirm: true,
             uploads_count: 12,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_500,
@@ -674,6 +686,8 @@ mod tests {
             return_upload_links: true,
             return_category_links: false,
             return_missing_category_links: true,
+            return_archive_file_list: true,
+            archive_confirm: false,
             uploads_count: 5,
             created_at: 1,
             updated_at: 2,
