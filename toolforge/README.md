@@ -9,8 +9,28 @@ here means these manifests + the `toolforge` CLI. The AWS `infra/` Terraform is 
 > as you go. The bot runs as a **continuous job** doing long polling (`BOT_MODE=polling`),
 > with **SQLite** storage on the tool's data dir.
 
-## 1. Get a tool account
-Request/create a tool at <https://toolsadmin.wikimedia.org/>, then from a bastion:
+## TL;DR — first-deploy checklist
+
+**Prerequisites:** a Wikimedia developer (LDAP) account with an **SSH key** uploaded, approved
+**Toolforge membership**, and (optional) an **OAuth 1.0a consumer** — the bot works on a bot
+password without it. Nothing to install locally; the `toolforge` CLI lives on the bastion.
+
+1. **SSH in:** `ssh login.toolforge.org` (§1).
+2. **Create/enter the tool:** make it at [toolsadmin](https://toolsadmin.wikimedia.org/), then `become YOURTOOL`.
+3. **Set secrets** as envvars: `BOT_MODE=polling`, `TELEGRAM_BOT_TOKEN`, `CREDENTIAL_ENC_KEY`, `SQLITE_PATH`, optional `OAUTH_CONSUMER_KEY`/`OAUTH_CONSUMER_SECRET` (§2).
+4. **Build** from Git: `toolforge build start <repo>` → `toolforge build show` (§3).
+5. **Run:** edit the image name in `toolforge/jobs.yaml`, then `toolforge jobs load toolforge/jobs.yaml` (§4).
+6. **Verify:** `toolforge jobs list`, `toolforge jobs logs commons-uploader-bot`, then message the bot `/start`.
+
+OAuth is **additive** — deploy on a bot password now; add the consumer envvars later and restart
+the job (`toolforge jobs restart commons-uploader-bot`) to pick them up.
+
+## 1. Get a tool account & SSH in
+You need a Wikimedia developer (LDAP) account with an **SSH key** registered
+([toolsadmin](https://toolsadmin.wikimedia.org/) → Striker, or Wikitech preferences) and approved
+**Toolforge membership**. The `toolforge` CLI is **preinstalled on the bastion** — there is
+nothing to install on your machine (and don't try: it authenticates with a Kubernetes cert that
+lives in the tool's home). Create/own a tool, then:
 
 ```bash
 ssh login.toolforge.org
@@ -24,7 +44,12 @@ toolforge envvars create BOT_MODE                 # value: polling
 toolforge envvars create TELEGRAM_BOT_TOKEN        # from @BotFather
 toolforge envvars create CREDENTIAL_ENC_KEY        # openssl rand -base64 32
 toolforge envvars create SQLITE_PATH               # e.g. /data/project/YOURTOOL/bot.sqlite
-# OAuth 1.0a consumer (from Special:OAuthConsumerRegistration, Upload grant):
+# OAuth 1.0a consumer (Special:OAuthConsumerRegistration). When registering, you MUST:
+#   - choose OAuth 1.0a (not 2.0),
+#   - tick "Allow consumer to specify a callback in requests" (enables the 'oob' flow),
+#   - grant BOTH "Upload new files" AND "Create, edit, and move pages".
+# These are fixed at registration — a wrong choice means re-registering. You may use a
+# proposed consumer as its owner before approval (good for self-testing).
 toolforge envvars create OAUTH_CONSUMER_KEY
 toolforge envvars create OAUTH_CONSUMER_SECRET
 # Optional self-hosted Bot API server for ~2 GB files (see step 5):
