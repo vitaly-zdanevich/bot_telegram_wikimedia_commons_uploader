@@ -32,17 +32,23 @@ toolforge envvars create OAUTH_CONSUMER_SECRET
 ```
 
 ## 3. Build the image
-The Build Service installs packages from `toolforge/Aptfile` (e.g. `unar` for RAR) and
-compiles the bot:
+The Build Service installs packages from the repo-root `Aptfile` (e.g. `unar` for RAR) and
+compiles the bot. The repo-root `project.toml` sets `RUSTFLAGS=-C target-cpu=native` so the
+binary is tuned for the build node's CPU:
 
 ```bash
 toolforge build start https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader
 toolforge build show     # wait until it succeeds
 ```
 
-If a Rust buildpack isn't available on your Toolforge, build the binary in CI instead
-(a portable build with `--features sqlite,archive,rar` and **without** `heic` needs only
-glibc + `unar` at runtime) and run it under a base image.
+> **`target-cpu=native` caveat:** it targets the *build* node's CPU, and Toolforge's run node
+> may differ. If the bot ever crashes with **illegal instruction (SIGILL)**, change
+> `project.toml` to `-C target-cpu=x86-64-v3` (portable across modern servers) and rebuild.
+
+If a Rust buildpack isn't available on your Toolforge, build the binary in CI instead (a
+portable build with `--features sqlite,archive,rar` and **without** `heic` needs only glibc +
+`unar` at runtime; pass `RUSTFLAGS=-C target-cpu=native` to that build) and run it under a
+base image.
 
 ## 4. Run the continuous job
 

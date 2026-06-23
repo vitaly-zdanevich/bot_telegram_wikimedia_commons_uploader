@@ -1,5 +1,5 @@
 # Extra Debian packages baked into the Toolforge Build Service image.
-# (One package per line; pulled from Debian main — no non-free.)
+# Cloud Native Buildpacks reads this file from the repo root. Debian main only (no non-free).
 
 # Free RAR/zip extractor used by the `rar` Cargo feature.
 unar
