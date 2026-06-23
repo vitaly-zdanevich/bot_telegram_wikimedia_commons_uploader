@@ -223,11 +223,18 @@ datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
 
 ## Security
 
-- Each user authenticates with their **own scoped Bot Password** (grants: “Upload new files”
-  + “Create, edit, and move pages”), revocable any time at
-  [Special:BotPasswords](https://commons.wikimedia.org/wiki/Special:BotPasswords).
-- Bot passwords are **AES-256-GCM encrypted** before storage; the bot deletes the Telegram
-  message containing your bot password.
+- **Two ways to connect** (the bot offers both at `/start`):
+  - **OAuth** (recommended) — authorize on-wiki and paste back a short verification code; no
+    password is shared. Uses MediaWiki OAuth 1.0a out-of-band, so there's **no callback
+    endpoint** to host (works on Lambda and Toolforge alike). Set `OAUTH_CONSUMER_KEY` /
+    `OAUTH_CONSUMER_SECRET` from
+    [Special:OAuthConsumerRegistration](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration)
+    (Upload grant) to enable it.
+  - **Bot password** — a **scoped** [Bot Password](https://commons.wikimedia.org/wiki/Special:BotPasswords)
+    (grants: “Upload new files” + “Create, edit, and move pages”), revocable any time.
+- Stored credentials (the bot-password token, or the OAuth token+secret) are **AES-256-GCM
+  encrypted** before storage and decrypted only in memory per upload; the bot deletes the
+  Telegram message containing a bot password.
 - The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.
 - Each upload is your own work under your own account, with the attribution category
   `Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich`.

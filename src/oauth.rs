@@ -245,7 +245,7 @@ impl OAuthClient {
     pub async fn initiate(&self) -> Result<(String, String)> {
         let url = self.endpoints.initiate.clone();
         let header = authorization_header(
-            "GET",
+            "POST",
             &url,
             &self.consumer,
             None,
@@ -254,7 +254,7 @@ impl OAuthClient {
         );
         let body = self
             .http
-            .get(&url)
+            .post(&url)
             .header("Authorization", header)
             .send()
             .await?
@@ -283,7 +283,7 @@ impl OAuthClient {
     ) -> Result<(String, String)> {
         let url = self.endpoints.token.clone();
         let header = authorization_header(
-            "GET",
+            "POST",
             &url,
             &self.consumer,
             Some((request_token, request_secret)),
@@ -292,7 +292,7 @@ impl OAuthClient {
         );
         let body = self
             .http
-            .get(&url)
+            .post(&url)
             .header("Authorization", header)
             .send()
             .await?

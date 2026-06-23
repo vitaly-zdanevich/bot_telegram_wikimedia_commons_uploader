@@ -357,6 +357,12 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
     if let Some(ciphertext) = &profile.credential_ciphertext {
         item["credential_ciphertext"] = json!({"S": ciphertext});
     }
+    if let Some(ciphertext) = &profile.oauth_ciphertext {
+        item["oauth_ciphertext"] = json!({"S": ciphertext});
+    }
+    if let Some(ciphertext) = &profile.oauth_pending_ciphertext {
+        item["oauth_pending_ciphertext"] = json!({"S": ciphertext});
+    }
     if let Some(author) = &profile.default_author {
         item["default_author"] = json!({"S": author});
     }
@@ -377,6 +383,8 @@ fn item_to_profile(item: &Value) -> Profile {
     Profile {
         commons_username: attr_string(item, "commons_username"),
         credential_ciphertext: attr_string(item, "credential_ciphertext"),
+        oauth_ciphertext: attr_string(item, "oauth_ciphertext"),
+        oauth_pending_ciphertext: attr_string(item, "oauth_pending_ciphertext"),
         license: attr_string(item, "license")
             .and_then(|value| License::parse(&value))
             .unwrap_or_default(),
@@ -439,6 +447,8 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             user_id INTEGER PRIMARY KEY,
             commons_username TEXT,
             credential_ciphertext TEXT,
+            oauth_ciphertext TEXT,
+            oauth_pending_ciphertext TEXT,
             default_author TEXT,
             default_description TEXT,
             default_lang TEXT,
@@ -477,13 +487,15 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
             Ok(Profile {
                 commons_username: row.get(0)?,
                 credential_ciphertext: row.get(1)?,
+                oauth_ciphertext: row.get(18)?,
+                oauth_pending_ciphertext: row.get(19)?,
                 license: License::parse(&row.get::<_, String>(2)?).unwrap_or_default(),
                 filename_prefix: row.get(3)?,
                 onboarding_step: OnboardingStep::parse(&row.get::<_, String>(4)?).unwrap_or_default(),
@@ -520,7 +532,7 @@ fn sqlite_put_profile(
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -541,6 +553,8 @@ fn sqlite_put_profile(
             profile.license_override,
             profile.return_archive_file_list as i64,
             profile.archive_confirm as i64,
+            profile.oauth_ciphertext,
+            profile.oauth_pending_ciphertext,
         ],
     )?;
     Ok(())
@@ -622,6 +636,8 @@ mod tests {
         let profile = Profile {
             commons_username: Some("Example@uploader".into()),
             credential_ciphertext: Some("base64ciphertext".into()),
+            oauth_ciphertext: Some("oauthct".into()),
+            oauth_pending_ciphertext: None,
             license: License::Cc0,
             filename_prefix: "Minsk trip".into(),
             onboarding_step: OnboardingStep::Done,
@@ -675,6 +691,8 @@ mod tests {
         let profile = Profile {
             commons_username: Some("Example@uploader".into()),
             credential_ciphertext: Some("ct".into()),
+            oauth_ciphertext: None,
+            oauth_pending_ciphertext: Some("pendingct".into()),
             license: License::CcBySa40,
             filename_prefix: "Trip".into(),
             onboarding_step: OnboardingStep::Done,

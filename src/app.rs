@@ -1,6 +1,6 @@
 use crate::commons::{
-    CommonsClient, DescriptionParams, UploadOutcome, UploadRequest, build_filename, build_wikitext,
-    category_url, parse_caption,
+    CommonsClient, DescriptionParams, UploadAuth, UploadOutcome, UploadRequest, build_filename,
+    build_wikitext, category_url, parse_caption,
 };
 use crate::config::Config;
 use crate::convert;
@@ -9,6 +9,7 @@ use crate::metadata;
 use crate::models::{
     CallbackQuery, License, Message, OnboardingStep, Profile, Update, UploadProvenance,
 };
+use crate::oauth::{Consumer, OAuthClient, OAuthEndpoints};
 use crate::store::Store;
 use crate::telegram::{
     InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, escape_html, license_keyboard,
@@ -134,6 +135,7 @@ struct Bot {
     store: Store,
     commons: CommonsClient,
     cipher: Option<Cipher>,
+    oauth: Option<OAuthClient>,
 }
 
 /// A file attachment extracted from a Telegram message.
@@ -173,10 +175,12 @@ impl Bot {
             config.telegram_api_base.clone(),
         );
         let store = Store::new(&config);
+        let oauth = build_oauth_client(&config);
         let commons = CommonsClient::new(
             config.commons_api_url.clone(),
             config.user_agent.clone(),
             config.commons_proxy.clone(),
+            oauth.clone(),
         );
         let cipher = config
             .credential_enc_key
@@ -188,6 +192,7 @@ impl Bot {
             store,
             commons,
             cipher,
+            oauth,
         }
     }
 
@@ -269,8 +274,23 @@ impl Bot {
     async fn prompt_step(&self, chat_id: i64, step: OnboardingStep) -> Result<()> {
         match step {
             OnboardingStep::AwaitingUsername => {
-                let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nFirst create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick <b>Upload new files</b> and <b>Create, edit, and move pages</b> (needed to write each file's page).\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
-                self.telegram.send_message(chat_id, text, None).await
+                if self.oauth.is_some() {
+                    let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nChoose how to connect your account:\n• <b>OAuth</b> (recommended) — authorize on the wiki and paste back a short code; you never share a password.\n• <b>Bot password</b> — create a scoped token yourself.";
+                    self.telegram
+                        .send_message(chat_id, text, Some(connect_method_keyboard()))
+                        .await
+                } else {
+                    self.send_botpassword_prompt(chat_id).await
+                }
+            }
+            OnboardingStep::AwaitingOAuthVerifier => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        "After authorizing on the wiki, paste the <b>verification code</b> it shows here.",
+                        None,
+                    )
+                    .await
             }
             OnboardingStep::AwaitingPassword => {
                 self.telegram
@@ -305,6 +325,109 @@ impl Bot {
                     .await
             }
         }
+    }
+
+    /// Sends the bot-password username prompt (the bot-password onboarding path).
+    async fn send_botpassword_prompt(&self, chat_id: i64) -> Result<()> {
+        let text = "🔑 Create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick <b>Upload new files</b> and <b>Create, edit, and move pages</b> (needed to write each file's page).\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
+        self.telegram.send_message(chat_id, text, None).await
+    }
+
+    /// Starts the OAuth out-of-band flow: gets a request token and sends the authorize link.
+    async fn start_oauth(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        let Some(oauth) = &self.oauth else {
+            return self.send_botpassword_prompt(chat_id).await;
+        };
+        let Some(cipher) = &self.cipher else {
+            return self
+                .telegram
+                .send_message(chat_id, "⚠️ The bot is missing its encryption key.", None)
+                .await;
+        };
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        let (request_token, request_secret) = match oauth.initiate().await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                let text = format!(
+                    "❌ Couldn't start OAuth: {}\n\nYou can use a bot password instead — /start.",
+                    escape_html(&format!("{error}"))
+                );
+                return self.telegram.send_message(chat_id, &text, None).await;
+            }
+        };
+        let mut profile = self.store.get_profile(user_id).await;
+        profile.oauth_pending_ciphertext =
+            Some(cipher.encrypt(&format!("{request_token}\n{request_secret}"))?);
+        profile.onboarding_step = OnboardingStep::AwaitingOAuthVerifier;
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await?;
+
+        let text = format!(
+            "🔐 Open this link, authorize the app, then paste the <b>verification code</b> it shows back here:\n\n{}",
+            oauth.authorize_url(&request_token)
+        );
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Completes the OAuth flow with the pasted verifier, storing the access token.
+    async fn finish_oauth(&self, chat_id: i64, user_id: i64, verifier: &str) -> Result<()> {
+        let (Some(oauth), Some(cipher)) = (&self.oauth, &self.cipher) else {
+            return self
+                .telegram
+                .send_message(chat_id, "⚠️ OAuth is not available right now.", None)
+                .await;
+        };
+        let mut profile = self.store.get_profile(user_id).await;
+        let Some(pending) = profile.oauth_pending_ciphertext.as_deref() else {
+            profile.onboarding_step = OnboardingStep::AwaitingUsername;
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "That request expired — let's start over with /start.",
+                    None,
+                )
+                .await;
+        };
+        let decoded = cipher
+            .decrypt(pending)
+            .context("failed to read pending OAuth token")?;
+        let (request_token, request_secret) = decoded
+            .split_once('\n')
+            .context("pending OAuth token is malformed")?;
+
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        let (access_token, access_secret) = match oauth
+            .exchange(request_token, request_secret, verifier.trim())
+            .await
+        {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                let text = format!(
+                    "❌ That code didn't work: {}\n\nOpen the link again and paste the new code, or use a bot password with /start.",
+                    escape_html(&format!("{error}"))
+                );
+                return self.telegram.send_message(chat_id, &text, None).await;
+            }
+        };
+        let username = self
+            .commons
+            .oauth_username(&access_token, &access_secret)
+            .await
+            .unwrap_or_default();
+
+        profile.oauth_ciphertext =
+            Some(cipher.encrypt(&format!("{access_token}\n{access_secret}"))?);
+        profile.oauth_pending_ciphertext = None;
+        if !username.is_empty() {
+            profile.commons_username = Some(username);
+        }
+        profile.onboarding_step = OnboardingStep::AwaitingLicense;
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await?;
+        self.prompt_step(chat_id, OnboardingStep::AwaitingLicense)
+            .await
     }
 
     /// Handles a free-text message as an answer to the current onboarding step.
@@ -365,6 +488,14 @@ impl Bot {
                             .await
                     }
                 }
+            }
+            OnboardingStep::AwaitingOAuthVerifier => {
+                if text.is_empty() {
+                    return self
+                        .prompt_step(chat_id, OnboardingStep::AwaitingOAuthVerifier)
+                        .await;
+                }
+                self.finish_oauth(chat_id, user_id, text).await
             }
             OnboardingStep::AwaitingLicense => {
                 self.telegram
@@ -471,13 +602,22 @@ impl Bot {
             return self.telegram.send_message(chat_id, &text, None).await;
         }
 
+        if data == "onb:oauth" {
+            return self.start_oauth(chat_id, user_id).await;
+        }
+
+        if data == "onb:botpass" {
+            profile.onboarding_step = OnboardingStep::AwaitingUsername;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self.send_botpassword_prompt(chat_id).await;
+        }
+
         if data == "onb:username" {
             profile.onboarding_step = OnboardingStep::AwaitingUsername;
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
-            return self
-                .prompt_step(chat_id, OnboardingStep::AwaitingUsername)
-                .await;
+            return self.send_botpassword_prompt(chat_id).await;
         }
 
         if data == "onb:skipprefix" {
@@ -653,7 +793,7 @@ impl Bot {
             None => String::new(),
         };
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: create a bot password with <b>Upload new files</b> + <b>Create, edit, and move pages</b> ticked at https://commons.wikimedia.org/wiki/Special:BotPasswords then run /start.\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -661,6 +801,50 @@ impl Bot {
             "{text}\n\n📦 <b>Archives</b>: send a <b>.zip</b> (or .rar) and I upload the images inside under one caption/categories. In /settings you can show the archive's file list and require a thumbnail + <b>Confirm</b> step before uploading."
         );
         self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Resolves how to authenticate uploads for a profile, plus the author username.
+    ///
+    /// Prefers a stored OAuth token; falls back to the bot-password credentials.
+    fn resolve_auth(&self, profile: &Profile) -> Result<(UploadAuth, String)> {
+        let cipher = self
+            .cipher
+            .as_ref()
+            .context("the bot is missing its encryption key; cannot read your credentials")?;
+        if let Some(ciphertext) = &profile.oauth_ciphertext {
+            let decoded = cipher
+                .decrypt(ciphertext)
+                .context("failed to decrypt stored OAuth token")?;
+            let (token, secret) = decoded
+                .split_once('\n')
+                .context("stored OAuth token is malformed")?;
+            let author = profile.commons_username.clone().unwrap_or_default();
+            return Ok((
+                UploadAuth::OAuth {
+                    token: token.to_string(),
+                    secret: secret.to_string(),
+                },
+                author,
+            ));
+        }
+        let username = profile
+            .commons_username
+            .clone()
+            .context("no Commons account is connected — run /start")?;
+        let ciphertext = profile
+            .credential_ciphertext
+            .as_deref()
+            .context("no credentials stored — run /start")?;
+        let password = cipher
+            .decrypt(ciphertext)
+            .context("failed to decrypt stored credentials")?;
+        Ok((
+            UploadAuth::BotPassword {
+                username: username.clone(),
+                password,
+            },
+            username,
+        ))
     }
 
     /// Runs one file through convert/dup-check/build/upload and returns a structured result.
@@ -675,8 +859,8 @@ impl Bot {
         file_name: Option<&str>,
         mime: Option<&str>,
         unique_id: &str,
-        username: &str,
-        password: &str,
+        auth: &UploadAuth,
+        author_username: &str,
     ) -> Result<FileResult> {
         let parsed = parse_caption(caption);
         let categories = merge_categories(&parsed.categories, &profile.default_categories);
@@ -744,7 +928,7 @@ impl Bot {
         };
         let wikitext = build_wikitext(&DescriptionParams {
             description: &description,
-            author_username: username,
+            author_username,
             author_override: parsed
                 .author
                 .as_deref()
@@ -763,8 +947,7 @@ impl Bot {
         let outcome = self
             .commons
             .upload(&UploadRequest {
-                username: username.to_string(),
-                password: password.to_string(),
+                auth: auth.clone(),
                 filename: filename.clone(),
                 bytes: upload_bytes,
                 wikitext,
@@ -847,20 +1030,15 @@ impl Bot {
                 .await;
         }
 
-        let Some(cipher) = &self.cipher else {
-            return self
-                .telegram
-                .send_message(
-                    chat_id,
-                    "⚠️ The bot is missing its encryption key; cannot read your credentials.",
-                    None,
-                )
-                .await;
+        let (auth, author_username) = match self.resolve_auth(&profile) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return self
+                    .telegram
+                    .send_message(chat_id, &escape_html(&format!("{error}")), None)
+                    .await;
+            }
         };
-        let username = profile.commons_username.clone().unwrap_or_default();
-        let password = cipher
-            .decrypt(profile.credential_ciphertext.as_deref().unwrap_or_default())
-            .context("failed to decrypt stored credentials")?;
         // Resolve the description and categories, sharing an album's caption across photos.
         let caption = self.resolve_caption(message).await;
 
@@ -876,8 +1054,8 @@ impl Bot {
                 file.file_name.as_deref(),
                 file.mime.as_deref(),
                 &file.file_unique_id,
-                &username,
-                &password,
+                &auth,
+                &author_username,
             )
             .await?;
 
@@ -1145,16 +1323,15 @@ impl Bot {
         caption: &str,
         entries: Vec<crate::archive::ArchiveEntry>,
     ) -> Result<()> {
-        let Some(cipher) = &self.cipher else {
-            return self
-                .telegram
-                .send_message(chat_id, "⚠️ The bot is missing its encryption key.", None)
-                .await;
+        let (auth, author_username) = match self.resolve_auth(profile) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return self
+                    .telegram
+                    .send_message(chat_id, &escape_html(&format!("{error}")), None)
+                    .await;
+            }
         };
-        let username = profile.commons_username.clone().unwrap_or_default();
-        let password = cipher
-            .decrypt(profile.credential_ciphertext.as_deref().unwrap_or_default())
-            .context("failed to decrypt stored credentials")?;
 
         self.telegram
             .send_chat_action(chat_id, "upload_document")
@@ -1172,8 +1349,8 @@ impl Bot {
                     Some(&entry.name),
                     None,
                     &unique,
-                    &username,
-                    &password,
+                    &auth,
+                    &author_username,
                 )
                 .await
             {
@@ -1479,6 +1656,24 @@ fn toggle_button(label: &str, data: &str, value: bool) -> InlineKeyboardButton {
     }
 }
 
+/// Builds the keyboard offering OAuth or bot-password onboarding.
+fn connect_method_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![InlineKeyboardButton {
+                text: "🔐 Connect with OAuth (recommended)".to_string(),
+                callback_data: Some("onb:oauth".to_string()),
+                url: None,
+            }],
+            vec![InlineKeyboardButton {
+                text: "🔑 Use a bot password".to_string(),
+                callback_data: Some("onb:botpass".to_string()),
+                url: None,
+            }],
+        ],
+    }
+}
+
 /// Builds a keyboard with a single button to restart username entry.
 fn change_username_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
@@ -1538,6 +1733,18 @@ fn defaults_summary(profile: &Profile) -> String {
             escape_html(&parts.join("; "))
         )
     }
+}
+
+/// Builds the OAuth client when a consumer is configured (otherwise OAuth is disabled).
+fn build_oauth_client(config: &Config) -> Option<OAuthClient> {
+    let key = config.oauth_consumer_key.clone()?;
+    let secret = config.oauth_consumer_secret.clone()?;
+    OAuthClient::new(
+        Consumer { key, secret },
+        OAuthEndpoints::wikimedia(),
+        &config.user_agent,
+    )
+    .ok()
 }
 
 /// Updates the profile timestamps before a save.

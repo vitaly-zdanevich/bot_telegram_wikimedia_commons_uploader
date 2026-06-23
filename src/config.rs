@@ -48,6 +48,10 @@ pub struct Config {
     pub user_agent: String,
     /// Optional HTTP(S) proxy URL for Commons traffic (to upload from a non-blocked IP).
     pub commons_proxy: Option<String>,
+    /// OAuth 1.0a consumer key (from Special:OAuthConsumerRegistration); enables OAuth login.
+    pub oauth_consumer_key: Option<String>,
+    /// OAuth 1.0a consumer secret.
+    pub oauth_consumer_secret: Option<String>,
 }
 
 impl Config {
@@ -104,6 +108,10 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_COMMONS_API_URL.into()),
             user_agent,
             commons_proxy: lookup("COMMONS_PROXY").filter(|value| !value.trim().is_empty()),
+            oauth_consumer_key: lookup("OAUTH_CONSUMER_KEY")
+                .filter(|value| !value.trim().is_empty()),
+            oauth_consumer_secret: lookup("OAUTH_CONSUMER_SECRET")
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 

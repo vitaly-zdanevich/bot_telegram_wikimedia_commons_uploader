@@ -56,6 +56,8 @@ pub enum OnboardingStep {
     AwaitingUsername,
     /// Waiting for the bot-password token.
     AwaitingPassword,
+    /// Waiting for the pasted OAuth verifier code (out-of-band flow).
+    AwaitingOAuthVerifier,
     /// Waiting for the license selection.
     AwaitingLicense,
     /// Waiting for the filename prefix.
@@ -70,6 +72,7 @@ impl OnboardingStep {
         match value {
             "awaiting_username" => Some(OnboardingStep::AwaitingUsername),
             "awaiting_password" => Some(OnboardingStep::AwaitingPassword),
+            "awaiting_oauth_verifier" => Some(OnboardingStep::AwaitingOAuthVerifier),
             "awaiting_license" => Some(OnboardingStep::AwaitingLicense),
             "awaiting_prefix" => Some(OnboardingStep::AwaitingPrefix),
             "done" => Some(OnboardingStep::Done),
@@ -82,6 +85,7 @@ impl OnboardingStep {
         match self {
             OnboardingStep::AwaitingUsername => "awaiting_username",
             OnboardingStep::AwaitingPassword => "awaiting_password",
+            OnboardingStep::AwaitingOAuthVerifier => "awaiting_oauth_verifier",
             OnboardingStep::AwaitingLicense => "awaiting_license",
             OnboardingStep::AwaitingPrefix => "awaiting_prefix",
             OnboardingStep::Done => "done",
@@ -96,6 +100,10 @@ pub struct Profile {
     pub commons_username: Option<String>,
     /// AES-GCM ciphertext (base64) of the bot-password token.
     pub credential_ciphertext: Option<String>,
+    /// AES-GCM ciphertext of the OAuth access token+secret (`token\nsecret`), when OAuth is used.
+    pub oauth_ciphertext: Option<String>,
+    /// AES-GCM ciphertext of the transient OAuth request token+secret during onboarding.
+    pub oauth_pending_ciphertext: Option<String>,
     /// License applied to uploads.
     pub license: License,
     /// Prefix prepended to generated Commons filenames.
@@ -135,6 +143,8 @@ impl Default for Profile {
         Self {
             commons_username: None,
             credential_ciphertext: None,
+            oauth_ciphertext: None,
+            oauth_pending_ciphertext: None,
             license: License::default(),
             filename_prefix: String::new(),
             onboarding_step: OnboardingStep::default(),
@@ -156,11 +166,12 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// Returns true when onboarding is complete and credentials are stored.
+    /// Returns true when onboarding is complete and some credential is stored
+    /// (an OAuth token, or a bot-password token with its username).
     pub fn is_ready(&self) -> bool {
         self.onboarding_step == OnboardingStep::Done
-            && self.commons_username.is_some()
-            && self.credential_ciphertext.is_some()
+            && (self.oauth_ciphertext.is_some()
+                || (self.commons_username.is_some() && self.credential_ciphertext.is_some()))
     }
 }
 

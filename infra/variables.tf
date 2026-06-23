@@ -52,6 +52,19 @@ variable "commons_proxy" {
   default     = ""
 }
 
+variable "oauth_consumer_key" {
+  type        = string
+  description = "Optional OAuth 1.0a consumer key (Special:OAuthConsumerRegistration) so users can connect via OAuth instead of a bot password."
+  default     = ""
+}
+
+variable "oauth_consumer_secret" {
+  type        = string
+  description = "OAuth 1.0a consumer secret paired with oauth_consumer_key."
+  default     = ""
+  sensitive   = true
+}
+
 variable "default_license" {
   type        = string
   description = "Default license key: cc-by-4.0, cc-by-sa-4.0, or cc-zero."

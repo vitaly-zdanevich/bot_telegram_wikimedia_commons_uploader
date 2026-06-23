@@ -25,6 +25,8 @@ locals {
     MAX_FILE_MB             = tostring(var.max_file_mb)
     COMMONS_USER_AGENT      = "${var.project_name}/0.1 (${var.github_url})"
     COMMONS_PROXY           = var.commons_proxy
+    OAUTH_CONSUMER_KEY      = var.oauth_consumer_key
+    OAUTH_CONSUMER_SECRET   = var.oauth_consumer_secret
     RUST_LOG                = "info"
   }
 }

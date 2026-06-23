@@ -1,4 +1,5 @@
 use crate::models::{License, UploadProvenance};
+use crate::oauth::OAuthClient;
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, multipart};
 use serde_json::Value;
@@ -18,6 +19,7 @@ pub struct CommonsClient {
     api_url: String,
     user_agent: String,
     proxy: Option<String>,
+    oauth: Option<OAuthClient>,
 }
 
 /// Result of attempting an upload.
@@ -29,12 +31,29 @@ pub enum UploadOutcome {
     Failed { message: String },
 }
 
+/// How an upload authenticates to Commons.
+#[derive(Clone)]
+pub enum UploadAuth {
+    /// Bot-password login (`User@label` + token) over a cookie session.
+    BotPassword {
+        /// Bot-password username (`Account@label`).
+        username: String,
+        /// Bot-password token.
+        password: String,
+    },
+    /// OAuth 1.0a access token + secret, signed per request.
+    OAuth {
+        /// OAuth access token.
+        token: String,
+        /// OAuth access token secret.
+        secret: String,
+    },
+}
+
 /// One upload request.
 pub struct UploadRequest {
-    /// Bot-password username (`Account@label`).
-    pub username: String,
-    /// Bot-password token.
-    pub password: String,
+    /// How to authenticate the upload.
+    pub auth: UploadAuth,
     /// Target filename including extension, without the `File:` prefix.
     pub filename: String,
     /// File bytes to upload.
@@ -47,15 +66,20 @@ pub struct UploadRequest {
 
 impl CommonsClient {
     /// Creates a Commons client for an API endpoint and User-Agent.
+    ///
+    /// `oauth` enables uploading via OAuth 1.0a (when a consumer is configured);
+    /// bot-password uploads work regardless.
     pub fn new(
         api_url: impl Into<String>,
         user_agent: impl Into<String>,
         proxy: Option<String>,
+        oauth: Option<OAuthClient>,
     ) -> Self {
         Self {
             api_url: api_url.into(),
             user_agent: user_agent.into(),
             proxy,
+            oauth,
         }
     }
 
@@ -87,30 +111,31 @@ impl CommonsClient {
     /// existing filename, duplicate, abuse filter, …) returns `Ok(UploadOutcome::Failed)`
     /// with a message meant to be shown to the user.
     pub async fn upload(&self, request: &UploadRequest) -> Result<UploadOutcome> {
+        match &request.auth {
+            UploadAuth::BotPassword { username, password } => {
+                self.upload_bot_password(request, username, password).await
+            }
+            UploadAuth::OAuth { token, secret } => self.upload_oauth(request, token, secret).await,
+        }
+    }
+
+    /// Uploads using a bot-password login over a cookie session.
+    async fn upload_bot_password(
+        &self,
+        request: &UploadRequest,
+        username: &str,
+        password: &str,
+    ) -> Result<UploadOutcome> {
         let client = self.session_client()?;
-        if let Err(error) = self
-            .login(&client, &request.username, &request.password)
-            .await
-        {
+        if let Err(error) = self.login(&client, username, password).await {
             return Ok(UploadOutcome::Failed {
                 message: format!("{error}"),
             });
         }
         let csrf_token = self.fetch_token(&client, "csrf").await?;
-        let form = multipart::Form::new()
-            .text("action", "upload")
-            .text("filename", request.filename.clone())
-            .text("comment", request.comment.clone())
-            .text("text", request.wikitext.clone())
-            .text("token", csrf_token)
-            .text("format", "json")
-            .part(
-                "file",
-                multipart::Part::bytes(request.bytes.clone()).file_name(request.filename.clone()),
-            );
         let response: Value = client
             .post(&self.api_url)
-            .multipart(form)
+            .multipart(build_upload_form(request, &csrf_token))
             .send()
             .await?
             .error_for_status()?
@@ -118,6 +143,84 @@ impl CommonsClient {
             .await
             .context("Commons upload response was not valid JSON")?;
         Ok(interpret_upload_response(&response, &request.filename))
+    }
+
+    /// Uploads using an OAuth 1.0a access token, signing each request.
+    async fn upload_oauth(
+        &self,
+        request: &UploadRequest,
+        token: &str,
+        secret: &str,
+    ) -> Result<UploadOutcome> {
+        let oauth = self
+            .oauth
+            .as_ref()
+            .context("OAuth is not configured on this bot")?;
+        let client = self.session_client()?;
+
+        // CSRF token, fetched as the OAuth-identified user.
+        let csrf_url = format!(
+            "{}?action=query&meta=tokens&type=csrf&format=json",
+            self.api_url
+        );
+        let csrf_auth = oauth.api_authorization("GET", &csrf_url, token, secret, &[]);
+        let csrf_response: Value = client
+            .get(&csrf_url)
+            .header("Authorization", csrf_auth)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons token response was not valid JSON")?;
+        let csrf_token = csrf_response
+            .get("query")
+            .and_then(|query| query.get("tokens"))
+            .and_then(|tokens| tokens.get("csrftoken"))
+            .and_then(Value::as_str)
+            .context("Commons response is missing csrftoken")?
+            .to_string();
+
+        // Multipart upload, signed (OAuth does not sign multipart bodies).
+        let upload_auth = oauth.api_authorization("POST", &self.api_url, token, secret, &[]);
+        let response: Value = client
+            .post(&self.api_url)
+            .header("Authorization", upload_auth)
+            .multipart(build_upload_form(request, &csrf_token))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons upload response was not valid JSON")?;
+        Ok(interpret_upload_response(&response, &request.filename))
+    }
+
+    /// Returns the Commons username behind an OAuth access token (for author attribution).
+    pub async fn oauth_username(&self, token: &str, secret: &str) -> Result<String> {
+        let oauth = self
+            .oauth
+            .as_ref()
+            .context("OAuth is not configured on this bot")?;
+        let client = self.session_client()?;
+        let url = format!("{}?action=query&meta=userinfo&format=json", self.api_url);
+        let auth = oauth.api_authorization("GET", &url, token, secret, &[]);
+        let response: Value = client
+            .get(&url)
+            .header("Authorization", auth)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons userinfo response was not valid JSON")?;
+        response
+            .get("query")
+            .and_then(|query| query.get("userinfo"))
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("Commons userinfo is missing the user name")
     }
 
     /// Returns existing Commons file titles whose content SHA-1 matches (duplicate check).
@@ -285,6 +388,21 @@ fn login_failure_message(reason: &str) -> String {
          (tick \"Upload new files\" and \"Create, edit, and move pages\"), then run /start to \
          reconnect your account."
     )
+}
+
+/// Builds the multipart form for an `action=upload` request.
+fn build_upload_form(request: &UploadRequest, csrf_token: &str) -> multipart::Form {
+    multipart::Form::new()
+        .text("action", "upload")
+        .text("filename", request.filename.clone())
+        .text("comment", request.comment.clone())
+        .text("text", request.wikitext.clone())
+        .text("token", csrf_token.to_string())
+        .text("format", "json")
+        .part(
+            "file",
+            multipart::Part::bytes(request.bytes.clone()).file_name(request.filename.clone()),
+        )
 }
 
 /// Turns an `action=upload` response into a success or user-facing failure.
