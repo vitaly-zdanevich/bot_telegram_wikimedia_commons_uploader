@@ -1,0 +1,22 @@
+# Toolforge continuous job for the Wikimedia Commons uploader bot (long polling).
+#
+# Load with:  toolforge jobs load toolforge/jobs.yaml
+#
+# `image` must reference the image produced by the Toolforge Build Service
+# (`toolforge build start …`); replace NAME with your tool's name. `command` is the
+# binary / Procfile process the build produces. The bot reads its config from envvars
+# (set with `toolforge envvars create …`), including BOT_MODE=polling.
+- name: commons-uploader-bot
+  command: commons-uploader-bot
+  image: tool-NAME/tool-NAME:latest
+  continuous: true
+  emails: onfailure
+
+# Optional second job: a self-hosted Telegram Bot API server to raise the file limit
+# from 20 MB to ~2 GB. The bot then talks to it via TELEGRAM_API_BASE=http://localhost:8081.
+# Running two processes that share localhost usually means bundling both in one image /
+# one wrapper command — see toolforge/README.md.
+# - name: telegram-bot-api
+#   command: telegram-bot-api --local --http-port=8081 --api-id=$TELEGRAM_API_ID --api-hash=$TELEGRAM_API_HASH
+#   image: tool-NAME/tool-NAME:latest
+#   continuous: true

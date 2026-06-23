@@ -1,0 +1,9 @@
+# Extra Debian packages baked into the Toolforge Build Service image.
+# (One package per line; pulled from Debian main — no non-free.)
+
+# Free RAR/zip extractor used by the `rar` Cargo feature.
+unar
+
+# Runtime shared libs for HEIC->WebP — uncomment only if you build with --features heic.
+# libheif1
+# libde265-0

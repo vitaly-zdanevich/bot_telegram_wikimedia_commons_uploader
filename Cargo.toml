@@ -46,8 +46,9 @@ sqlite = ["dep:rusqlite"]
 # Upload images from inside zip archives (VM-only). Pulls in extra image decoders
 # so archive thumbnails can be rendered for PNG/GIF/TIFF/WebP as well as JPEG/BMP.
 archive = ["dep:zip", "image/png", "image/gif", "image/tiff", "image/webp"]
-# Add RAR support to `archive`. Shells out to the system `unrar` CLI at runtime
-# (no native build dep); the VM provisioning installs the `unrar` package.
+# Add RAR support to `archive`. Shells out at runtime to a system extractor —
+# `unar` (free, Debian main) preferred, `unrar` as fallback — so there is no native
+# build dependency and it works on Toolforge (Aptfile: unar) and Cloud VPS alike.
 rar = ["archive"]
 
 [[bin]]

@@ -61,38 +61,61 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
     Ok(entries)
 }
 
-/// Extracts images from a rar archive by shelling out to the system `unrar` (`rar` feature).
+/// Extracts images from a rar archive via a system extractor (`rar` feature).
 ///
-/// Uses the `unrar` CLI (installed on the VM by its provisioning) rather than a vendored
-/// C++ decoder, so there is no fragile native build at compile time.
+/// Prefers `unar` (The Unarchiver — free, in Debian main, handles RAR5) and falls back to
+/// the non-free `unrar`. Avoids a fragile vendored C++ decoder at compile time, and lets the
+/// same build run on Toolforge (Aptfile: `unar`) and on a Cloud VPS.
 #[cfg(feature = "rar")]
 fn extract_rar(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
-    use anyhow::Context;
     let dir = tempfile::tempdir()?;
     let archive_path = dir.path().join("archive.rar");
     std::fs::write(&archive_path, bytes)?;
     let out_dir = dir.path().join("out");
     std::fs::create_dir_all(&out_dir)?;
 
-    // unrar x: extract with full paths; -o+ overwrite, -idq quiet, trailing slash = dest dir.
-    let output = std::process::Command::new("unrar")
-        .arg("x")
-        .arg("-o+")
-        .arg("-idq")
-        .arg(&archive_path)
-        .arg(format!("{}/", out_dir.display()))
-        .output()
-        .context("failed to launch `unrar` (install the unrar package)")?;
-    if !output.status.success() {
-        bail!(
-            "unrar failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    let out = out_dir.display().to_string();
+    let archive = archive_path.display().to_string();
+    run_extractor(
+        "unar",
+        &[
+            "-force-overwrite",
+            "-quiet",
+            "-output-directory",
+            &out,
+            &archive,
+        ],
+    )
+    .or_else(|unar_error| {
+        run_extractor("unrar", &["x", "-o+", "-idq", &archive, &format!("{out}/")]).map_err(
+            |unrar_error| {
+                anyhow::anyhow!(
+                    "no RAR extractor worked — unar: {unar_error}; unrar: {unrar_error}"
+                )
+            },
+        )
+    })?;
 
     let mut entries = Vec::new();
     collect_images(&out_dir, &mut entries)?;
     Ok(entries)
+}
+
+/// Runs an extractor command, erroring if it cannot start or exits non-zero.
+#[cfg(feature = "rar")]
+fn run_extractor(program: &str, args: &[&str]) -> Result<()> {
+    use anyhow::Context;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to launch `{program}`"))?;
+    if !output.status.success() {
+        bail!(
+            "`{program}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Recursively collects uploadable images from an extracted directory tree.
