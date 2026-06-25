@@ -4,6 +4,8 @@ telegram_webhook_secret = "replace-with-a-random-string"
 # Generate with: openssl rand -base64 32
 credential_enc_key      = "replace-with-base64-32-bytes"
 admin_telegram_user_ids = "123456789"
+# Optional: set true to resize archive preview images to small JPEG thumbnails.
+# archive_thumbnail_resize = false
 # Optional: let users connect via OAuth (Special:OAuthConsumerRegistration, Upload grant)
 # instead of a bot password. Leave unset to offer bot password only.
 # oauth_consumer_key    = ""

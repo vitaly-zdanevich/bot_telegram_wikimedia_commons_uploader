@@ -157,7 +157,7 @@ impl Default for Profile {
             default_description: None,
             default_lang: None,
             license_override: None,
-            return_upload_links: false,
+            return_upload_links: true,
             return_category_links: false,
             return_missing_category_links: false,
             return_archive_file_list: false,

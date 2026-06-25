@@ -77,6 +77,12 @@ variable "webp_quality" {
   default     = 90
 }
 
+variable "archive_thumbnail_resize" {
+  type        = bool
+  description = "Resize archive preview images to small JPEG thumbnails before sending. Defaults off to avoid slow full-image decodes."
+  default     = false
+}
+
 variable "max_file_mb" {
   type        = number
   description = "Maximum file size the bot downloads from Telegram. The cloud Bot API cap is 20 MB."

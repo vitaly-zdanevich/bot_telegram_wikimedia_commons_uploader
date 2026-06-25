@@ -13,21 +13,22 @@ locals {
   dynamodb_table_name = "${var.project_name}-data"
 
   environment_variables = {
-    PROJECT_NAME            = var.project_name
-    TELEGRAM_BOT_TOKEN      = var.telegram_bot_token
-    TELEGRAM_WEBHOOK_SECRET = var.telegram_webhook_secret
-    CREDENTIAL_ENC_KEY      = var.credential_enc_key
-    ADMIN_TELEGRAM_USER_IDS = var.admin_telegram_user_ids
-    GITHUB_URL              = var.github_url
-    DYNAMODB_TABLE          = aws_dynamodb_table.data.name
-    DEFAULT_LICENSE         = var.default_license
-    WEBP_QUALITY            = tostring(var.webp_quality)
-    MAX_FILE_MB             = tostring(var.max_file_mb)
-    COMMONS_USER_AGENT      = "${var.project_name}/0.1 (${var.github_url})"
-    COMMONS_PROXY           = var.commons_proxy
-    OAUTH_CONSUMER_KEY      = var.oauth_consumer_key
-    OAUTH_CONSUMER_SECRET   = var.oauth_consumer_secret
-    RUST_LOG                = "info"
+    PROJECT_NAME             = var.project_name
+    TELEGRAM_BOT_TOKEN       = var.telegram_bot_token
+    TELEGRAM_WEBHOOK_SECRET  = var.telegram_webhook_secret
+    CREDENTIAL_ENC_KEY       = var.credential_enc_key
+    ADMIN_TELEGRAM_USER_IDS  = var.admin_telegram_user_ids
+    GITHUB_URL               = var.github_url
+    DYNAMODB_TABLE           = aws_dynamodb_table.data.name
+    DEFAULT_LICENSE          = var.default_license
+    WEBP_QUALITY             = tostring(var.webp_quality)
+    MAX_FILE_MB              = tostring(var.max_file_mb)
+    ARCHIVE_THUMBNAIL_RESIZE = tostring(var.archive_thumbnail_resize)
+    COMMONS_USER_AGENT       = "${var.project_name}/0.1 (${var.github_url})"
+    COMMONS_PROXY            = var.commons_proxy
+    OAUTH_CONSUMER_KEY       = var.oauth_consumer_key
+    OAUTH_CONSUMER_SECRET    = var.oauth_consumer_secret
+    RUST_LOG                 = "info"
   }
 }
 

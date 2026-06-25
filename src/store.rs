@@ -397,7 +397,8 @@ fn item_to_profile(item: &Value) -> Profile {
         default_description: attr_string(item, "default_description"),
         default_lang: attr_string(item, "default_lang"),
         license_override: attr_string(item, "license_override"),
-        return_upload_links: attr_bool(item, "return_upload_links").unwrap_or(false),
+        return_upload_links: attr_bool(item, "return_upload_links")
+            .unwrap_or_else(|| Profile::default().return_upload_links),
         return_category_links: attr_bool(item, "return_category_links").unwrap_or(false),
         return_missing_category_links: attr_bool(item, "return_missing_category_links")
             .unwrap_or(false),
@@ -457,7 +458,7 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             filename_prefix TEXT NOT NULL DEFAULT '',
             onboarding_step TEXT NOT NULL DEFAULT 'awaiting_username',
             default_categories TEXT NOT NULL DEFAULT '[]',
-            return_upload_links INTEGER NOT NULL DEFAULT 0,
+            return_upload_links INTEGER NOT NULL DEFAULT 1,
             return_category_links INTEGER NOT NULL DEFAULT 0,
             return_missing_category_links INTEGER NOT NULL DEFAULT 0,
             return_archive_file_list INTEGER NOT NULL DEFAULT 0,
@@ -666,7 +667,16 @@ mod tests {
         let profile = item_to_profile(&item);
         assert_eq!(profile.commons_username, None);
         assert_eq!(profile.license, License::CcBy40);
+        assert!(profile.return_upload_links);
         assert!(!profile.is_ready());
+
+        let mut legacy_item = item;
+        legacy_item
+            .as_object_mut()
+            .expect("profile item is an object")
+            .remove("return_upload_links");
+        let legacy_profile = item_to_profile(&legacy_item);
+        assert!(legacy_profile.return_upload_links);
     }
 
     #[tokio::test]

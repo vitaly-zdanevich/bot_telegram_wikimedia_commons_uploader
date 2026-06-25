@@ -18,6 +18,8 @@ const DEFAULT_GITHUB_URL: &str =
 const DEFAULT_PROJECT_NAME: &str = "telegram-wikimedia-commons-uploader-bot";
 /// Default Telegram Bot API base URL (cloud API; 20 MB download cap).
 const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+/// Whether archive previews are resized to small JPEG thumbnails before sending.
+const DEFAULT_ARCHIVE_THUMBNAIL_RESIZE: bool = false;
 
 /// Runtime configuration loaded from environment variables.
 #[derive(Clone, Debug)]
@@ -50,6 +52,8 @@ pub struct Config {
     pub max_conversion_file_bytes: u64,
     /// Maximum archive input size and extracted uploadable member total.
     pub max_archive_file_bytes: u64,
+    /// Whether archive preview photos are decoded/resized before sending to Telegram.
+    pub archive_thumbnail_resize: bool,
     /// Commons Action API endpoint.
     pub commons_api_url: String,
     /// User-Agent sent to Commons, per MediaWiki API etiquette.
@@ -97,6 +101,9 @@ impl Config {
         let default_license = lookup("DEFAULT_LICENSE")
             .and_then(|value| License::parse(&value))
             .unwrap_or_default();
+        let archive_thumbnail_resize = lookup("ARCHIVE_THUMBNAIL_RESIZE")
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(DEFAULT_ARCHIVE_THUMBNAIL_RESIZE);
         let github_url = lookup("GITHUB_URL").unwrap_or_else(|| DEFAULT_GITHUB_URL.into());
         let user_agent = lookup("COMMONS_USER_AGENT").unwrap_or_else(|| {
             format!(
@@ -124,6 +131,7 @@ impl Config {
             max_file_bytes,
             max_conversion_file_bytes,
             max_archive_file_bytes,
+            archive_thumbnail_resize,
             commons_api_url: lookup("COMMONS_API_URL")
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| DEFAULT_COMMONS_API_URL.into()),
@@ -142,6 +150,14 @@ impl Config {
     }
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Parses comma-separated Telegram numeric user ids.
 fn parse_admin_ids(value: &str) -> Vec<i64> {
     value
@@ -153,8 +169,8 @@ fn parse_admin_ids(value: &str) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_MAX_ARCHIVE_FILE_MB, DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_WEBP_QUALITY,
-        parse_admin_ids,
+        Config, DEFAULT_ARCHIVE_THUMBNAIL_RESIZE, DEFAULT_MAX_ARCHIVE_FILE_MB,
+        DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_WEBP_QUALITY, parse_admin_ids,
     };
     use crate::models::License;
     use std::collections::HashMap;
@@ -192,6 +208,10 @@ mod tests {
             DEFAULT_MAX_ARCHIVE_FILE_MB * 1024 * 1024
         );
         assert_eq!(
+            config.archive_thumbnail_resize,
+            DEFAULT_ARCHIVE_THUMBNAIL_RESIZE
+        );
+        assert_eq!(
             config.commons_api_url,
             "https://commons.wikimedia.org/w/api.php"
         );
@@ -211,6 +231,7 @@ mod tests {
             ("MAX_FILE_MB", "10"),
             ("MAX_CONVERSION_FILE_MB", "128"),
             ("MAX_ARCHIVE_FILE_MB", "2048"),
+            ("ARCHIVE_THUMBNAIL_RESIZE", "false"),
         ]);
 
         assert_eq!(config.telegram_bot_token.as_deref(), Some("token"));
@@ -224,6 +245,7 @@ mod tests {
         assert_eq!(config.max_file_bytes, 10 * 1024 * 1024);
         assert_eq!(config.max_conversion_file_bytes, 128 * 1024 * 1024);
         assert_eq!(config.max_archive_file_bytes, 2048 * 1024 * 1024);
+        assert!(!config.archive_thumbnail_resize);
         assert!(config.is_admin(42));
         assert!(!config.is_admin(1));
     }

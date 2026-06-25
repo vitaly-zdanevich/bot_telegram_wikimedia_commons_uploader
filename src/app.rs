@@ -182,27 +182,30 @@ fn spawn_archive_thumbnail_preview(
     followup: ArchivePreviewFollowup,
 ) {
     tokio::spawn(async move {
+        let resize = config.archive_thumbnail_resize;
         let bot = Bot::from_config(config);
         let _typing = ChatActionGuard::start(bot.telegram.clone(), chat_id, "typing");
         tracing::info!(
             user_id,
             chat_id,
             token,
+            resize,
             "starting archive thumbnail preview"
         );
-        let completed = match send_archive_thumbnail_preview(&bot.telegram, chat_id, &token).await {
-            Ok(completed) => completed,
-            Err(error) => {
-                tracing::warn!(
-                    user_id,
-                    chat_id,
-                    token,
-                    error = %format!("{error:#}"),
-                    "archive thumbnail preview failed"
-                );
-                false
-            }
-        };
+        let completed =
+            match send_archive_thumbnail_preview(&bot.telegram, chat_id, &token, resize).await {
+                Ok(completed) => completed,
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        chat_id,
+                        token,
+                        error = %format!("{error:#}"),
+                        "archive thumbnail preview failed"
+                    );
+                    false
+                }
+            };
         if !completed || !pending_archive_manifest_path(&token).exists() {
             return;
         }
@@ -237,6 +240,7 @@ async fn send_archive_thumbnail_preview(
     telegram: &TelegramClient,
     chat_id: i64,
     token: &str,
+    resize: bool,
 ) -> Result<bool> {
     if !pending_archive_manifest_path(token).exists() {
         return Ok(false);
@@ -253,15 +257,23 @@ async fn send_archive_thumbnail_preview(
                     .with_context(|| format!("failed to read archive preview {}", path.display()));
             }
         };
-        if let Some(thumb) = convert::make_thumbnail(&bytes, 320)
-            && let Err(error) = telegram
-                .send_photo(chat_id, thumb, "thumb.jpg", Some(&entry.name), None)
-                .await
+        let preview = if resize {
+            convert::make_thumbnail(&bytes, 320).map(|thumb| (thumb, "thumb.jpg".to_string()))
+        } else {
+            Some((bytes, entry.name.clone()))
+        };
+        let Some((photo, file_name)) = preview else {
+            continue;
+        };
+        if let Err(error) = telegram
+            .send_photo(chat_id, photo, &file_name, Some(&entry.name), None)
+            .await
         {
             tracing::warn!(
                 chat_id,
                 token,
                 name = %entry.name,
+                resize,
                 error = %format!("{error:#}"),
                 "failed to send archive thumbnail"
             );
@@ -1989,15 +2001,17 @@ impl Bot {
             "starting archive upload"
         );
         let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
-        let mut links: Vec<String> = Vec::new();
+        let mut rejected_reasons: Vec<(String, u32)> = Vec::new();
+        let mut failed_reasons: Vec<(String, u32)> = Vec::new();
         for (index, entry) in entries.into_iter().enumerate() {
             let member_index = index + 1;
+            let entry_name = entry.name.clone();
             tracing::info!(
                 user_id,
                 chat_id,
                 member_index,
                 count = entry_count,
-                name = %entry.name,
+                name = %entry_name,
                 "uploading archive member"
             );
             send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
@@ -2019,18 +2033,60 @@ impl Bot {
                     uploaded += 1;
                     profile.uploads_count = profile.uploads_count.saturating_add(1);
                     if profile.return_upload_links {
-                        links.push(format!(
-                            "• <a href=\"{url}\">{}</a>",
+                        let text = format!(
+                            "✅ Uploaded {member_index}/{entry_count}: <a href=\"{url}\">{}</a>",
                             escape_html(&filename)
-                        ));
+                        );
+                        if let Err(error) = self.telegram.send_message(chat_id, &text, None).await {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                member_index,
+                                count = entry_count,
+                                "failed to send archive upload link"
+                            );
+                        }
                     }
                 }
                 Ok(FileResult::Duplicate { .. }) => duplicate += 1,
-                Ok(FileResult::Rejected { .. }) => rejected += 1,
-                Ok(FileResult::Failed { .. }) => failed += 1,
+                Ok(FileResult::Rejected { reason }) => {
+                    rejected += 1;
+                    tracing::warn!(
+                        user_id,
+                        chat_id,
+                        member_index,
+                        count = entry_count,
+                        name = %entry_name,
+                        reason = %reason,
+                        "archive member rejected"
+                    );
+                    record_archive_reason(&mut rejected_reasons, reason);
+                }
+                Ok(FileResult::Failed { message }) => {
+                    failed += 1;
+                    tracing::warn!(
+                        user_id,
+                        chat_id,
+                        member_index,
+                        count = entry_count,
+                        name = %entry_name,
+                        message = %message,
+                        "archive member upload failed"
+                    );
+                    record_archive_reason(&mut failed_reasons, message);
+                }
                 Err(error) => {
                     failed += 1;
-                    tracing::warn!(error = %format!("{error:#}"), "archive member upload failed");
+                    let message = format!("{error:#}");
+                    tracing::warn!(
+                        user_id,
+                        chat_id,
+                        member_index,
+                        count = entry_count,
+                        name = %entry_name,
+                        error = %message,
+                        "archive member upload failed"
+                    );
+                    record_archive_reason(&mut failed_reasons, message);
                 }
             }
         }
@@ -2047,10 +2103,8 @@ impl Bot {
         if failed > 0 {
             text.push_str(&format!(", ❌ {failed} failed"));
         }
-        if !links.is_empty() {
-            text.push_str("\n\n");
-            text.push_str(&links.join("\n"));
-        }
+        append_archive_reasons(&mut text, "Skipped reasons", &rejected_reasons);
+        append_archive_reasons(&mut text, "Failed reasons", &failed_reasons);
         tracing::info!(
             user_id,
             chat_id,
@@ -2668,6 +2722,62 @@ fn skip_prefix_keyboard() -> InlineKeyboardMarkup {
 /// Renders a boolean as a human on/off label.
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+/// Adds a grouped archive failure/rejection reason while preserving first-seen order.
+#[cfg(feature = "archive")]
+fn record_archive_reason(reasons: &mut Vec<(String, u32)>, reason: String) {
+    let reason = reason.trim().to_string();
+    if reason.is_empty() {
+        return;
+    }
+    if let Some((_, count)) = reasons
+        .iter_mut()
+        .find(|(existing, _)| existing.as_str() == reason.as_str())
+    {
+        *count = count.saturating_add(1);
+        return;
+    }
+    reasons.push((reason, 1));
+}
+
+/// Appends a short grouped reason list to an archive summary.
+#[cfg(feature = "archive")]
+fn append_archive_reasons(text: &mut String, heading: &str, reasons: &[(String, u32)]) {
+    if reasons.is_empty() {
+        return;
+    }
+    const MAX_REASONS: usize = 5;
+    text.push_str(&format!("\n\n<b>{heading}</b>:"));
+    for (reason, count) in reasons.iter().take(MAX_REASONS) {
+        if *count > 1 {
+            text.push_str(&format!(
+                "\n• {count} files: {}",
+                escape_html(&truncate_reason(reason))
+            ));
+        } else {
+            text.push_str(&format!("\n• {}", escape_html(&truncate_reason(reason))));
+        }
+    }
+    if reasons.len() > MAX_REASONS {
+        text.push_str(&format!(
+            "\n… and {} more reason(s).",
+            reasons.len() - MAX_REASONS
+        ));
+    }
+}
+
+/// Keeps a single reason compact enough for Telegram summary messages.
+#[cfg(feature = "archive")]
+fn truncate_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 700;
+    let mut chars = reason.chars();
+    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 /// Returns a natural label for an image count.
