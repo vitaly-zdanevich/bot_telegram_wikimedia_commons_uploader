@@ -9,6 +9,13 @@ BOT_API_BIN="${TELEGRAM_BOT_API_BIN:-$TOOL_DATA_DIR/bin/telegram-bot-api}"
 BOT_API_DIR="${TELEGRAM_BOT_API_DIR:-$TOOL_DATA_DIR/telegram-bot-api}"
 BOT_API_LOG="${TELEGRAM_BOT_API_LOG:-$TOOL_DATA_DIR/telegram-bot-api.log}"
 
+APT_LAYER="${APT_LAYER:-/layers/fagiani_apt/apt}"
+if [[ -d "$APT_LAYER" ]]; then
+  export PATH="$APT_LAYER/usr/bin:${PATH:-}"
+  APT_LD_LIBRARY_PATH="$APT_LAYER/usr/lib/x86_64-linux-gnu:$APT_LAYER/usr/lib:$APT_LAYER/lib/x86_64-linux-gnu:$APT_LAYER/lib:$APT_LAYER/usr/lib/GNUstep"
+  export LD_LIBRARY_PATH="$APT_LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 pids=()
 cleanup() {
   for pid in "${pids[@]:-}"; do
