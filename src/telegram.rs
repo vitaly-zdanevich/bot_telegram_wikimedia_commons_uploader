@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::path::Path;
 
 /// Telegram Bot API client.
 #[derive(Clone)]
@@ -101,6 +102,19 @@ impl TelegramClient {
     /// The Telegram cloud Bot API only serves files up to 20 MB, so larger uploads
     /// cannot be retrieved and are reported to the user instead.
     pub async fn download_file(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        if Path::new(file_path).is_absolute() {
+            let metadata = std::fs::metadata(file_path)
+                .with_context(|| format!("failed to stat Telegram file {file_path}"))?;
+            if metadata.len() > max_bytes {
+                bail!(
+                    "file is {} bytes, larger than the {max_bytes} byte limit",
+                    metadata.len()
+                );
+            }
+            return std::fs::read(file_path)
+                .with_context(|| format!("failed to read Telegram file {file_path}"));
+        }
+
         let url = format!("{}/file/bot{}/{file_path}", self.base_url, self.token);
         let response = self.client.get(url).send().await?.error_for_status()?;
         if let Some(length) = response.content_length()
@@ -288,8 +302,30 @@ pub fn escape_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_html, license_keyboard, split_for_telegram, utf16_len};
+    use super::{TelegramClient, escape_html, license_keyboard, split_for_telegram, utf16_len};
     use crate::models::License;
+
+    #[tokio::test]
+    async fn download_file_reads_absolute_local_path() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram-local-file-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"hello").unwrap();
+
+        let client = TelegramClient::new("token", "http://example.test");
+        let bytes = client
+            .download_file(path.to_str().unwrap(), 10)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(bytes, b"hello");
+    }
 
     #[test]
     fn license_keyboard_has_one_button_per_license() {

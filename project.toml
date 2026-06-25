@@ -16,4 +16,5 @@ value = "-C target-cpu=native"
 [com.heroku.buildpacks.deb-packages]
 install = [
     "unar",
+    "curl",
 ]

@@ -16,7 +16,7 @@ password without it. Nothing to install locally; the `toolforge` CLI lives on th
 
 1. **SSH in:** `ssh vitaly-zdanevich@login.toolforge.org` (§1).
 2. **Create/enter the tool:** make it at [toolsadmin](https://toolsadmin.wikimedia.org/), then `become YOURTOOL`.
-3. **Set secrets** as envvars: `BOT_MODE=webhook`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `CREDENTIAL_ENC_KEY`, `SQLITE_PATH`, optional `OAUTH_CONSUMER_KEY`/`OAUTH_CONSUMER_SECRET` (§2).
+3. **Set secrets** as envvars: `BOT_MODE=webhook`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `CREDENTIAL_ENC_KEY`, `SQLITE_PATH`, optional `OAUTH_CONSUMER_KEY`/`OAUTH_CONSUMER_SECRET` and local Bot API credentials (§2, §5).
 4. **Build** from Git: `toolforge build start <repo>` → `toolforge build show` (§3).
 5. **Run:** `cp toolforge/service.template ~/service.template`, then `toolforge webservice buildservice start --mount=all --health-check-path=/healthz` (§4).
 6. **Register webhook:** locally run `TOOLFORGE_TOOL=YOURTOOL ./scripts/set-webhook.sh`.
@@ -53,8 +53,11 @@ toolforge envvars create SQLITE_PATH               # e.g. /data/project/YOURTOOL
 # proposed consumer as its owner before approval (good for self-testing).
 toolforge envvars create OAUTH_CONSUMER_KEY
 toolforge envvars create OAUTH_CONSUMER_SECRET
-# Optional self-hosted Bot API server for ~2 GB files (see step 5):
-# toolforge envvars create TELEGRAM_API_BASE       # e.g. http://localhost:8081
+# Optional local Bot API server in the same webservice pod (see step 5):
+# toolforge envvars create TELEGRAM_API_ID         # from https://my.telegram.org/apps
+# toolforge envvars create TELEGRAM_API_HASH       # from https://my.telegram.org/apps
+# toolforge envvars create TELEGRAM_BOT_API_CLOUD_LOGOUT 1  # first local switch only
+# toolforge envvars create MAX_FILE_MB             # optional; keep conservative until streaming
 ```
 
 ## 3. Build the image
@@ -96,9 +99,24 @@ toolforge jobs load toolforge/jobs.yaml
 toolforge jobs logs commons-uploader-bot -f
 ```
 
-## 5. (Optional) self-hosted Bot API server for ~2 GB files
-Without it the public Bot API caps downloads at 20 MB. To lift that, run
-[`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api) (needs `api_id`/`api_hash`
-from <https://my.telegram.org>) and point the bot at it via `TELEGRAM_API_BASE`. Because
-two Toolforge jobs don't share `localhost`, the simplest layout is to bundle the API server
-and the bot in **one** job (a wrapper that starts the server in the background, then the bot).
+## 5. (Optional) local Bot API server
+Without it the public Bot API caps downloads at 20 MB. To lift that, place the official
+[`telegram-bot-api`](https://github.com/tdlib/telegram-bot-api) executable at:
+
+```bash
+/data/project/YOURTOOL/bin/telegram-bot-api
+```
+
+Then set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` from <https://my.telegram.org/apps>.
+`Procfile` starts `scripts/run-toolforge-webhook.sh`, which launches `telegram-bot-api`
+on `127.0.0.1:8081` in `--local` mode, exports `TELEGRAM_API_BASE` for the Rust bot, and
+registers a loopback webhook to `http://127.0.0.1:$PORT/telegram`.
+
+For the first switch from Telegram's cloud Bot API, set:
+
+```bash
+toolforge envvars create TELEGRAM_BOT_API_CLOUD_LOGOUT 1
+```
+
+Remove it after a successful local start. The server can handle much larger files, but the
+Rust bot still buffers downloads in memory, so raise `MAX_FILE_MB` deliberately.

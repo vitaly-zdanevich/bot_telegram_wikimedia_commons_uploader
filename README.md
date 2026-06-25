@@ -180,7 +180,8 @@ Commons does not block. On Toolforge, set `BOT_MODE=webhook` and run it as a bui
 webservice at `https://<tool>.toolforge.org/telegram`; for a private VM/systemd service,
 set `BOT_MODE=polling` to call `getUpdates` in a loop instead. Pair either mode with a self-hosted
 [Telegram Bot API server](https://github.com/tdlib/telegram-bot-api) to raise the file
-limit from 20 MB to **~2 GB** (point `TELEGRAM_API_BASE` at it).
+limit from 20 MB to larger files; the Toolforge wrapper starts a local server automatically
+when `/data/project/<tool>/bin/telegram-bot-api` and `TELEGRAM_API_ID/HASH` are present.
 
 Storage uses **SQLite** instead of DynamoDB — build with the `sqlite` feature and set
 `SQLITE_PATH`. Add archive support (and optionally RAR):
