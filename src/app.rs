@@ -162,6 +162,114 @@ fn spawn_archive_upload(
     });
 }
 
+#[cfg(feature = "archive")]
+enum ArchivePreviewFollowup {
+    Confirm {
+        count: usize,
+    },
+    Prefix {
+        count: usize,
+        sample_name: Option<String>,
+    },
+}
+
+#[cfg(feature = "archive")]
+fn spawn_archive_thumbnail_preview(
+    config: Config,
+    chat_id: i64,
+    user_id: i64,
+    token: String,
+    followup: ArchivePreviewFollowup,
+) {
+    tokio::spawn(async move {
+        let bot = Bot::from_config(config);
+        let _typing = ChatActionGuard::start(bot.telegram.clone(), chat_id, "typing");
+        tracing::info!(
+            user_id,
+            chat_id,
+            token,
+            "starting archive thumbnail preview"
+        );
+        let completed = match send_archive_thumbnail_preview(&bot.telegram, chat_id, &token).await {
+            Ok(completed) => completed,
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    token,
+                    error = %format!("{error:#}"),
+                    "archive thumbnail preview failed"
+                );
+                false
+            }
+        };
+        if !completed || !pending_archive_manifest_path(&token).exists() {
+            return;
+        }
+
+        match followup {
+            ArchivePreviewFollowup::Confirm { count } => {
+                bot.send_archive_confirmation(chat_id, &token, count, None)
+                    .await
+                    .ok();
+            }
+            ArchivePreviewFollowup::Prefix { count, sample_name } => {
+                let profile = bot.store.get_profile(user_id).await;
+                if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+                    bot.prompt_archive_prefix(chat_id, count, sample_name.as_deref())
+                        .await
+                        .ok();
+                }
+            }
+        }
+        tracing::info!(
+            user_id,
+            chat_id,
+            token,
+            completed,
+            "finished archive thumbnail preview"
+        );
+    });
+}
+
+#[cfg(feature = "archive")]
+async fn send_archive_thumbnail_preview(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    token: &str,
+) -> Result<bool> {
+    if !pending_archive_manifest_path(token).exists() {
+        return Ok(false);
+    }
+    let manifest = read_pending_archive_manifest(token)?;
+    let dir = pending_archive_token_dir(token);
+    for entry in manifest.entries {
+        let path = dir.join(&entry.file_name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read archive preview {}", path.display()));
+            }
+        };
+        if let Some(thumb) = convert::make_thumbnail(&bytes, 320)
+            && let Err(error) = telegram
+                .send_photo(chat_id, thumb, "thumb.jpg", Some(&entry.name), None)
+                .await
+        {
+            tracing::warn!(
+                chat_id,
+                token,
+                name = %entry.name,
+                error = %format!("{error:#}"),
+                "failed to send archive thumbnail"
+            );
+        }
+    }
+    Ok(true)
+}
+
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: LambdaRequest) -> Result<LambdaResponse<Body>> {
     handle_webhook_payload(request.headers(), request.body().as_ref()).await?;
@@ -1627,11 +1735,16 @@ impl Bot {
 
         let caption = self.resolve_caption(message).await;
         let needs_prefix = archive_needs_filename_prefix(&entries);
+        tracing::info!(
+            user_id,
+            chat_id,
+            count = entries.len(),
+            needs_prefix,
+            confirm_before_upload = profile.archive_confirm,
+            "archive extracted"
+        );
 
         if profile.archive_confirm || needs_prefix {
-            if profile.archive_confirm {
-                self.send_archive_thumbnails(chat_id, &entries).await;
-            }
             let token = new_token();
             let count = entries.len();
             let sample_name = if needs_prefix {
@@ -1649,24 +1762,57 @@ impl Bot {
                 confirm_before_upload: profile.archive_confirm,
                 created_at: now_ts(),
             };
-            if let Err(error) = persist_pending_archive(&token, &pending) {
-                tracing::warn!(
-                    token,
-                    error = %format!("{error:#}"),
-                    "failed to persist pending archive"
-                );
-            }
+            let persisted = match persist_pending_archive(&token, &pending) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        token,
+                        error = %format!("{error:#}"),
+                        "failed to persist pending archive"
+                    );
+                    false
+                }
+            };
             archive_pending()
                 .lock()
                 .unwrap()
                 .insert(token.clone(), pending);
+            tracing::info!(
+                user_id,
+                chat_id,
+                token,
+                count,
+                needs_prefix,
+                confirm_before_upload = profile.archive_confirm,
+                "archive staged"
+            );
             if needs_prefix {
                 profile.onboarding_step = OnboardingStep::AwaitingArchivePrefix;
                 touch(profile);
                 self.store.put_profile(user_id, profile).await?;
+                if profile.archive_confirm && persisted {
+                    spawn_archive_thumbnail_preview(
+                        self.config.clone(),
+                        chat_id,
+                        user_id,
+                        token,
+                        ArchivePreviewFollowup::Prefix { count, sample_name },
+                    );
+                    return Ok(());
+                }
                 return self
                     .prompt_archive_prefix(chat_id, count, sample_name.as_deref())
                     .await;
+            }
+            if profile.archive_confirm && persisted {
+                spawn_archive_thumbnail_preview(
+                    self.config.clone(),
+                    chat_id,
+                    user_id,
+                    token,
+                    ArchivePreviewFollowup::Confirm { count },
+                );
+                return Ok(());
             }
             return self
                 .send_archive_confirmation(chat_id, &token, count, None)
@@ -1675,22 +1821,6 @@ impl Bot {
 
         self.upload_entries(chat_id, user_id, profile, &caption, entries)
             .await
-    }
-
-    /// Sends preview thumbnails for all decodable images in an archive.
-    async fn send_archive_thumbnails(
-        &self,
-        chat_id: i64,
-        entries: &[crate::archive::ArchiveEntry],
-    ) {
-        for entry in entries {
-            if let Some(thumb) = convert::make_thumbnail(&entry.bytes, 320) {
-                self.telegram
-                    .send_photo(chat_id, thumb, "thumb.jpg", Some(&entry.name), None)
-                    .await
-                    .ok();
-            }
-        }
     }
 
     /// Asks for a required filename prefix before continuing an archive upload.
