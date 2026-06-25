@@ -1,4 +1,5 @@
 use exif::{Exif, Field, In, Tag, Value};
+use std::path::Path;
 
 /// Image metadata extracted from EXIF for the Commons description page.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,10 +27,27 @@ pub fn extract(bytes: &[u8]) -> ImageMetadata {
     let Ok(exif) = exif::Reader::new().read_from_container(&mut std::io::Cursor::new(bytes)) else {
         return ImageMetadata::default();
     };
+    metadata_from_exif(&exif)
+}
+
+/// Best-effort EXIF extraction from a local file path.
+pub fn extract_path(path: &Path) -> ImageMetadata {
+    let Ok(file) = std::fs::File::open(path) else {
+        return ImageMetadata::default();
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) else {
+        return ImageMetadata::default();
+    };
+    metadata_from_exif(&exif)
+}
+
+/// Converts a parsed EXIF block into the fields used in Commons wikitext.
+fn metadata_from_exif(exif: &Exif) -> ImageMetadata {
     ImageMetadata {
-        date: capture_date(&exif),
-        latitude: gps_coordinate(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, 'S'),
-        longitude: gps_coordinate(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, 'W'),
+        date: capture_date(exif),
+        latitude: gps_coordinate(exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, 'S'),
+        longitude: gps_coordinate(exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, 'W'),
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::commons::{
-    CommonsClient, DescriptionParams, UploadAuth, UploadOutcome, UploadRequest, build_filename,
-    build_wikitext, category_url, parse_caption,
+    CommonsClient, DescriptionParams, UploadAuth, UploadData, UploadOutcome, UploadRequest,
+    build_filename, build_wikitext, category_url, parse_caption,
 };
 use crate::config::Config;
 use crate::convert;
@@ -12,7 +12,8 @@ use crate::models::{
 use crate::oauth::{Consumer, OAuthClient, OAuthEndpoints};
 use crate::store::Store;
 use crate::telegram::{
-    InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, escape_html, license_keyboard,
+    InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramFile, escape_html,
+    license_keyboard,
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -26,6 +27,7 @@ use hyper_util::rt::TokioIo;
 use lambda_http::{Body, Request as LambdaRequest, Response as LambdaResponse};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::Path;
 use tokio::net::TcpListener;
 
 /// Telegram handle of the author, shown in `/help`.
@@ -53,6 +55,8 @@ const RELATED_CLI: &str =
 const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 /// Message shown once onboarding is complete.
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
+/// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
+const FILE_SNIFF_BYTES: usize = 512;
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: LambdaRequest) -> Result<LambdaResponse<Body>> {
@@ -881,8 +885,11 @@ impl Bot {
             }
             None => String::new(),
         };
+        let max_upload_size = format_size_limit(self.config.max_file_bytes);
+        let conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
+        let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: 20 MB (Telegram bot download limit).\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -944,7 +951,7 @@ impl Bot {
         &self,
         profile: &Profile,
         caption: &str,
-        original: Vec<u8>,
+        original: TelegramFile,
         file_name: Option<&str>,
         mime: Option<&str>,
         unique_id: &str,
@@ -953,21 +960,31 @@ impl Bot {
     ) -> Result<FileResult> {
         let parsed = parse_caption(caption);
         let categories = merge_categories(&parsed.categories, &profile.default_categories);
-        let metadata = metadata::extract(&original);
+        let metadata = metadata_from_telegram_file(&original);
 
         // Convert DNG/HEIC/BMP to WebP; pass everything else through if Commons accepts it.
-        let format = convert::classify(file_name, mime, &original);
+        let sniff = original.read_prefix(FILE_SNIFF_BYTES)?;
+        let format = convert::classify(file_name, mime, &sniff);
         let mut provenance = UploadProvenance {
             original_filename: file_name
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("telegram_{unique_id}")),
             ..UploadProvenance::default()
         };
-        let (upload_bytes, extension) = if format.needs_conversion() {
+        let (upload_data, extension) = if format.needs_conversion() {
+            if original.len() > self.config.max_conversion_file_bytes {
+                let limit = format_size_limit(self.config.max_conversion_file_bytes);
+                return Ok(FileResult::Rejected {
+                    reason: format!(
+                        "This format needs conversion, and conversion is currently limited to {limit}"
+                    ),
+                });
+            }
+            let original = original.into_bytes()?;
             provenance.original_sha1 = Some(sha1_hex(&original));
             provenance.original_md5 = Some(md5_hex(&original));
             match convert::convert(&original, format, self.config.webp_quality) {
-                Ok((bytes, ext)) => (bytes, ext.to_string()),
+                Ok((bytes, ext)) => (UploadData::Bytes(bytes), ext.to_string()),
                 Err(error) => {
                     return Ok(FileResult::Rejected {
                         reason: format!("Couldn't convert this file: {error}"),
@@ -981,11 +998,11 @@ impl Bot {
                     reason: format!("Commons does not accept .{extension} files"),
                 });
             }
-            (original, extension)
+            (upload_data_from_telegram_file(original), extension)
         };
 
         // Duplicate pre-check by content hash.
-        let upload_sha1 = sha1_hex(&upload_bytes);
+        let upload_sha1 = sha1_hex_upload_data(&upload_data)?;
         if let Ok(existing) = self.commons.find_by_sha1(&upload_sha1).await
             && !existing.is_empty()
         {
@@ -1038,7 +1055,7 @@ impl Bot {
             .upload(&UploadRequest {
                 auth: auth.clone(),
                 filename: filename.clone(),
-                bytes: upload_bytes,
+                data: upload_data,
                 wikitext,
                 comment: format!("Uploaded via Telegram bot {BOT_USERNAME}"),
             })
@@ -1101,10 +1118,10 @@ impl Bot {
             .ok();
         let original = match self
             .telegram
-            .download_by_file_id(&file.file_id, self.config.max_file_bytes)
+            .resolve_by_file_id(&file.file_id, self.config.max_file_bytes)
             .await
         {
-            Ok(bytes) => bytes,
+            Ok(file) => file,
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "download failed");
                 return self.reject_too_large(chat_id).await;
@@ -1113,10 +1130,43 @@ impl Bot {
 
         // Archives (zip/rar) are expanded and each member uploaded — VM-only feature.
         #[cfg(feature = "archive")]
-        if crate::archive::is_archive(file.file_name.as_deref(), &original) {
-            return self
-                .handle_archive(chat_id, user_id, &mut profile, message, original)
-                .await;
+        {
+            let sniff = match original.read_prefix(FILE_SNIFF_BYTES) {
+                Ok(sniff) => sniff,
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to inspect Telegram file");
+                    return self
+                        .telegram
+                        .send_message(
+                            chat_id,
+                            "❌ Couldn't read this Telegram file. Please resend it.",
+                            None,
+                        )
+                        .await;
+                }
+            };
+            if crate::archive::is_archive(file.file_name.as_deref(), &sniff) {
+                if original.len() > self.config.max_archive_file_bytes {
+                    return self.reject_archive_too_large(chat_id).await;
+                }
+                let original = match original.into_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "failed to read archive");
+                        return self
+                            .telegram
+                            .send_message(
+                                chat_id,
+                                "❌ Couldn't read this Telegram archive. Please resend it.",
+                                None,
+                            )
+                            .await;
+                    }
+                };
+                return self
+                    .handle_archive(chat_id, user_id, &mut profile, message, original)
+                    .await;
+            }
         }
 
         let (auth, author_username) = match self.resolve_auth(&profile) {
@@ -1256,11 +1306,21 @@ impl Bot {
         self.telegram.send_message(chat_id, &text, None).await
     }
 
-    /// Tells the user a file is over the 20 MB Telegram download limit.
+    /// Tells the user a file is over the configured upload limit.
     async fn reject_too_large(&self, chat_id: i64) -> Result<()> {
-        let limit_mb = self.config.max_file_bytes / (1024 * 1024);
+        let limit = format_size_limit(self.config.max_file_bytes);
         let text = format!(
-            "❌ That file is too large. Telegram only lets bots download files up to {limit_mb} MB. Please send a smaller export."
+            "❌ That file is too large. This bot is configured to accept files up to {limit}. Please send a smaller export."
+        );
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Tells the user an archive is over the configured archive processing limit.
+    async fn reject_archive_too_large(&self, chat_id: i64) -> Result<()> {
+        let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
+        let upload_limit = format_size_limit(self.config.max_file_bytes);
+        let text = format!(
+            "❌ Archives larger than {archive_limit} are not supported yet because they must be extracted before upload. Accepted files that do not need conversion can be uploaded up to {upload_limit}."
         );
         self.telegram.send_message(chat_id, &text, None).await
     }
@@ -1284,7 +1344,11 @@ impl Bot {
             .and_then(|document| document.file_name.clone());
         // Evict expired or memory-pressuring staged archives before unpacking another.
         prune_pending(original.len());
-        let entries = match crate::archive::extract_images(&original, file_name.as_deref()) {
+        let entries = match crate::archive::extract_images_with_limit(
+            &original,
+            file_name.as_deref(),
+            self.config.max_archive_file_bytes,
+        ) {
             Ok(entries) => entries,
             Err(error) => {
                 let text = format!(
@@ -1434,7 +1498,7 @@ impl Bot {
                 .process_one_file(
                     profile,
                     caption,
-                    entry.bytes,
+                    TelegramFile::Bytes(entry.bytes),
                     Some(&entry.name),
                     None,
                     &unique,
@@ -1863,10 +1927,65 @@ fn sha1_hex(bytes: &[u8]) -> String {
     hex::encode(Sha1::digest(bytes))
 }
 
+/// Returns lower-case SHA-1 hex of the upload data without loading disk-backed files.
+fn sha1_hex_upload_data(data: &UploadData) -> Result<String> {
+    match data {
+        UploadData::Bytes(bytes) => Ok(sha1_hex(bytes)),
+        UploadData::File { path, .. } => sha1_hex_path(path),
+    }
+}
+
+/// Returns lower-case SHA-1 hex of a file, streaming it in bounded chunks.
+fn sha1_hex_path(path: &Path) -> Result<String> {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open upload file {}", path.display()))?;
+    let mut hasher = Sha1::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read upload file {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Returns lower-case MD5 hex of the bytes.
 fn md5_hex(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     hex::encode(Md5::digest(bytes))
+}
+
+/// Extracts metadata from either in-memory Telegram bytes or a local Bot API file path.
+fn metadata_from_telegram_file(file: &TelegramFile) -> metadata::ImageMetadata {
+    match file {
+        TelegramFile::Bytes(bytes) => metadata::extract(bytes),
+        TelegramFile::LocalPath { path, .. } => metadata::extract_path(path),
+    }
+}
+
+/// Converts a resolved Telegram file into Commons upload data.
+fn upload_data_from_telegram_file(file: TelegramFile) -> UploadData {
+    match file {
+        TelegramFile::Bytes(bytes) => UploadData::Bytes(bytes),
+        TelegramFile::LocalPath { path, size } => UploadData::File { path, len: size },
+    }
+}
+
+/// Formats a byte limit for user-facing messages.
+fn format_size_limit(bytes: u64) -> String {
+    let mb = bytes / (1024 * 1024);
+    if mb >= 1024 {
+        format!("{:.1} GB ({mb} MB)", mb as f64 / 1024.0)
+    } else {
+        format!("{mb} MB")
+    }
 }
 
 /// Returns the filename stem (without extension), if a filename is present.

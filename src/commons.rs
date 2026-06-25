@@ -3,6 +3,7 @@ use crate::oauth::OAuthClient;
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, multipart};
 use serde_json::Value;
+use std::path::PathBuf;
 
 /// Attribution category added to every file uploaded by this bot.
 const BOT_CATEGORY: &str =
@@ -56,12 +57,30 @@ pub struct UploadRequest {
     pub auth: UploadAuth,
     /// Target filename including extension, without the `File:` prefix.
     pub filename: String,
-    /// File bytes to upload.
-    pub bytes: Vec<u8>,
+    /// File content to upload.
+    pub data: UploadData,
     /// Wikitext description page contents.
     pub wikitext: String,
     /// Upload comment / edit summary.
     pub comment: String,
+}
+
+/// File content for a Commons upload.
+pub enum UploadData {
+    /// Small or converted upload held in memory.
+    Bytes(Vec<u8>),
+    /// Large local file streamed from disk.
+    File { path: PathBuf, len: u64 },
+}
+
+impl UploadData {
+    /// Returns the upload size in bytes.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => bytes.len() as u64,
+            Self::File { len, .. } => *len,
+        }
+    }
 }
 
 impl CommonsClient {
@@ -135,7 +154,7 @@ impl CommonsClient {
         let csrf_token = self.fetch_token(&client, "csrf").await?;
         let response: Value = client
             .post(&self.api_url)
-            .multipart(build_upload_form(request, &csrf_token))
+            .multipart(build_upload_form(request, &csrf_token).await?)
             .send()
             .await?
             .error_for_status()?
@@ -186,7 +205,7 @@ impl CommonsClient {
         let response: Value = client
             .post(&self.api_url)
             .header("Authorization", upload_auth)
-            .multipart(build_upload_form(request, &csrf_token))
+            .multipart(build_upload_form(request, &csrf_token).await?)
             .send()
             .await?
             .error_for_status()?
@@ -391,18 +410,24 @@ fn login_failure_message(reason: &str) -> String {
 }
 
 /// Builds the multipart form for an `action=upload` request.
-fn build_upload_form(request: &UploadRequest, csrf_token: &str) -> multipart::Form {
-    multipart::Form::new()
+async fn build_upload_form(request: &UploadRequest, csrf_token: &str) -> Result<multipart::Form> {
+    let file_part = match &request.data {
+        UploadData::Bytes(bytes) => {
+            multipart::Part::bytes(bytes.clone()).file_name(request.filename.clone())
+        }
+        UploadData::File { path, .. } => multipart::Part::file(path)
+            .await
+            .with_context(|| format!("failed to open upload file {}", path.display()))?
+            .file_name(request.filename.clone()),
+    };
+    Ok(multipart::Form::new()
         .text("action", "upload")
         .text("filename", request.filename.clone())
         .text("comment", request.comment.clone())
         .text("text", request.wikitext.clone())
         .text("token", csrf_token.to_string())
         .text("format", "json")
-        .part(
-            "file",
-            multipart::Part::bytes(request.bytes.clone()).file_name(request.filename.clone()),
-        )
+        .part("file", file_part))
 }
 
 /// Turns an `action=upload` response into a success or user-facing failure.

@@ -3,6 +3,10 @@ use std::env;
 
 /// Default maximum downloadable file size — the Telegram cloud Bot API `getFile` cap.
 const DEFAULT_MAX_FILE_MB: u64 = 20;
+/// Default cap for image formats that need full decode/re-encode in memory.
+const DEFAULT_MAX_CONVERSION_FILE_MB: u64 = 100;
+/// Default cap for archive input and extracted uploadable members.
+const DEFAULT_MAX_ARCHIVE_FILE_MB: u64 = 100;
 /// Default lossy WebP quality used when converting DNG files.
 const DEFAULT_WEBP_QUALITY: f32 = 90.0;
 /// Default Commons Action API endpoint.
@@ -42,6 +46,10 @@ pub struct Config {
     pub webp_quality: f32,
     /// Maximum file size the bot will download from Telegram.
     pub max_file_bytes: u64,
+    /// Maximum file size for formats that need conversion in memory.
+    pub max_conversion_file_bytes: u64,
+    /// Maximum archive input size and extracted uploadable member total.
+    pub max_archive_file_bytes: u64,
     /// Commons Action API endpoint.
     pub commons_api_url: String,
     /// User-Agent sent to Commons, per MediaWiki API etiquette.
@@ -69,6 +77,17 @@ impl Config {
         let max_file_bytes = lookup("MAX_FILE_MB")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_FILE_MB)
+            * 1024
+            * 1024;
+        let max_conversion_file_bytes = lookup("MAX_CONVERSION_FILE_MB")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_CONVERSION_FILE_MB)
+            * 1024
+            * 1024;
+        let max_archive_file_bytes = lookup("MAX_ARCHIVE_FILE_MB")
+            .or_else(|| lookup("MAX_IN_MEMORY_FILE_MB"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_ARCHIVE_FILE_MB)
             * 1024
             * 1024;
         let webp_quality = lookup("WEBP_QUALITY")
@@ -103,6 +122,8 @@ impl Config {
             default_license,
             webp_quality,
             max_file_bytes,
+            max_conversion_file_bytes,
+            max_archive_file_bytes,
             commons_api_url: lookup("COMMONS_API_URL")
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| DEFAULT_COMMONS_API_URL.into()),
@@ -131,7 +152,10 @@ fn parse_admin_ids(value: &str) -> Vec<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_WEBP_QUALITY, parse_admin_ids};
+    use super::{
+        Config, DEFAULT_MAX_ARCHIVE_FILE_MB, DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_WEBP_QUALITY,
+        parse_admin_ids,
+    };
     use crate::models::License;
     use std::collections::HashMap;
 
@@ -160,6 +184,14 @@ mod tests {
         assert_eq!(config.webp_quality, DEFAULT_WEBP_QUALITY);
         assert_eq!(config.max_file_bytes, 20 * 1024 * 1024);
         assert_eq!(
+            config.max_conversion_file_bytes,
+            DEFAULT_MAX_CONVERSION_FILE_MB * 1024 * 1024
+        );
+        assert_eq!(
+            config.max_archive_file_bytes,
+            DEFAULT_MAX_ARCHIVE_FILE_MB * 1024 * 1024
+        );
+        assert_eq!(
             config.commons_api_url,
             "https://commons.wikimedia.org/w/api.php"
         );
@@ -177,6 +209,8 @@ mod tests {
             ("DEFAULT_LICENSE", "cc-zero"),
             ("WEBP_QUALITY", "250"),
             ("MAX_FILE_MB", "10"),
+            ("MAX_CONVERSION_FILE_MB", "128"),
+            ("MAX_ARCHIVE_FILE_MB", "2048"),
         ]);
 
         assert_eq!(config.telegram_bot_token.as_deref(), Some("token"));
@@ -188,7 +222,17 @@ mod tests {
         assert_eq!(config.default_license, License::Cc0);
         assert_eq!(config.webp_quality, 100.0);
         assert_eq!(config.max_file_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.max_conversion_file_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.max_archive_file_bytes, 2048 * 1024 * 1024);
         assert!(config.is_admin(42));
         assert!(!config.is_admin(1));
+    }
+
+    #[test]
+    fn max_in_memory_file_mb_remains_archive_fallback() {
+        let config = config_from_pairs(&[("MAX_IN_MEMORY_FILE_MB", "512")]);
+
+        assert_eq!(config.max_conversion_file_bytes, 100 * 1024 * 1024);
+        assert_eq!(config.max_archive_file_bytes, 512 * 1024 * 1024);
     }
 }

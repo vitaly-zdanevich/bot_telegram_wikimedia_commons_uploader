@@ -22,15 +22,24 @@ pub fn is_archive(file_name: Option<&str>, bytes: &[u8]) -> bool {
 
 /// Extracts uploadable image entries from a zip or rar archive.
 pub fn extract_images(bytes: &[u8], file_name: Option<&str>) -> Result<Vec<ArchiveEntry>> {
+    extract_images_with_limit(bytes, file_name, u64::MAX)
+}
+
+/// Extracts uploadable image entries, rejecting archives whose uploadable members exceed a cap.
+pub fn extract_images_with_limit(
+    bytes: &[u8],
+    file_name: Option<&str>,
+    max_total_entry_bytes: u64,
+) -> Result<Vec<ArchiveEntry>> {
     let is_rar = bytes.starts_with(b"Rar!")
         || file_name.is_some_and(|name| {
             let lower = name.to_ascii_lowercase();
             lower.ends_with(".rar") || lower.ends_with(".cbr")
         });
     let entries = if is_rar {
-        extract_rar(bytes)?
+        extract_rar(bytes, max_total_entry_bytes)?
     } else {
-        extract_zip(bytes)?
+        extract_zip(bytes, max_total_entry_bytes)?
     };
     if entries.is_empty() {
         bail!("no uploadable images found in the archive");
@@ -39,9 +48,10 @@ pub fn extract_images(bytes: &[u8], file_name: Option<&str>) -> Result<Vec<Archi
 }
 
 /// Extracts images from a zip archive (pure Rust).
-fn extract_zip(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
+fn extract_zip(bytes: &[u8], max_total_entry_bytes: u64) -> Result<Vec<ArchiveEntry>> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let mut entries = Vec::new();
+    let mut total = 0u64;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
         if !file.is_file() {
@@ -51,6 +61,10 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
         if !crate::convert::is_uploadable_archive_member(&name) {
             continue;
         }
+        total = total
+            .checked_add(file.size())
+            .ok_or_else(|| anyhow::anyhow!("archive is too large after extraction"))?;
+        ensure_archive_limit(total, max_total_entry_bytes)?;
         let mut buffer = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut buffer)?;
         entries.push(ArchiveEntry {
@@ -67,7 +81,7 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
 /// the non-free `unrar`. Avoids a fragile vendored C++ decoder at compile time, and lets the
 /// same build run on Toolforge (Aptfile: `unar`) and on a Cloud VPS.
 #[cfg(feature = "rar")]
-fn extract_rar(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
+fn extract_rar(bytes: &[u8], max_total_entry_bytes: u64) -> Result<Vec<ArchiveEntry>> {
     let dir = tempfile::tempdir()?;
     let archive_path = dir.path().join("archive.rar");
     std::fs::write(&archive_path, bytes)?;
@@ -97,7 +111,7 @@ fn extract_rar(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
     })?;
 
     let mut entries = Vec::new();
-    collect_images(&out_dir, &mut entries)?;
+    collect_images(&out_dir, &mut entries, max_total_entry_bytes, &mut 0)?;
     Ok(entries)
 }
 
@@ -120,14 +134,23 @@ fn run_extractor(program: &str, args: &[&str]) -> Result<()> {
 
 /// Recursively collects uploadable images from an extracted directory tree.
 #[cfg(feature = "rar")]
-fn collect_images(dir: &std::path::Path, entries: &mut Vec<ArchiveEntry>) -> Result<()> {
+fn collect_images(
+    dir: &std::path::Path,
+    entries: &mut Vec<ArchiveEntry>,
+    max_total_entry_bytes: u64,
+    total: &mut u64,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_images(&path, entries)?;
+            collect_images(&path, entries, max_total_entry_bytes, total)?;
         } else if let Some(name) = path.file_name().and_then(|name| name.to_str())
             && crate::convert::is_uploadable_archive_member(name)
         {
+            *total = total
+                .checked_add(path.metadata()?.len())
+                .ok_or_else(|| anyhow::anyhow!("archive is too large after extraction"))?;
+            ensure_archive_limit(*total, max_total_entry_bytes)?;
             entries.push(ArchiveEntry {
                 name: name.to_string(),
                 bytes: std::fs::read(&path)?,
@@ -139,8 +162,19 @@ fn collect_images(dir: &std::path::Path, entries: &mut Vec<ArchiveEntry>) -> Res
 
 /// RAR stub used when the `rar` feature is disabled.
 #[cfg(not(feature = "rar"))]
-fn extract_rar(_bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
+fn extract_rar(_bytes: &[u8], _max_total_entry_bytes: u64) -> Result<Vec<ArchiveEntry>> {
     bail!("RAR support is not enabled in this build. Please send a ZIP instead.")
+}
+
+/// Rejects archive extraction once uploadable members exceed the configured cap.
+fn ensure_archive_limit(total: u64, max_total_entry_bytes: u64) -> Result<()> {
+    if total > max_total_entry_bytes {
+        bail!(
+            "archive contains more than {} MB of uploadable files",
+            max_total_entry_bytes / (1024 * 1024)
+        );
+    }
+    Ok(())
 }
 
 /// Returns the base name of an archive entry path.
@@ -150,7 +184,7 @@ fn basename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_images, is_archive};
+    use super::{extract_images, extract_images_with_limit, is_archive};
 
     #[test]
     fn detects_archives() {
@@ -176,6 +210,24 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "photo.jpg");
         assert_eq!(entries[0].bytes, b"pretend jpeg bytes");
+    }
+
+    #[test]
+    fn rejects_zip_when_uploadable_members_exceed_limit() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("a.jpg", options).unwrap();
+        zip.write_all(b"12345").unwrap();
+        zip.start_file("b.jpg", options).unwrap();
+        zip.write_all(b"67890").unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+
+        let error = match extract_images_with_limit(&bytes, Some("album.zip"), 9) {
+            Ok(_) => panic!("archive over the extracted-size limit was accepted"),
+            Err(error) => error,
+        };
+        assert!(format!("{error}").contains("archive contains more than"));
     }
 
     #[test]

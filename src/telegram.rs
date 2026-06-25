@@ -3,7 +3,70 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// File content resolved from Telegram.
+#[derive(Clone, Debug)]
+pub enum TelegramFile {
+    /// Small files downloaded into memory.
+    Bytes(Vec<u8>),
+    /// Local path returned by a self-hosted Telegram Bot API server running with `--local`.
+    LocalPath { path: PathBuf, size: u64 },
+}
+
+impl TelegramFile {
+    /// Returns the file size in bytes.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => bytes.len() as u64,
+            Self::LocalPath { size, .. } => *size,
+        }
+    }
+
+    /// Returns the in-memory bytes, if this file is memory-backed.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::LocalPath { .. } => None,
+        }
+    }
+
+    /// Returns the local file path, if this file is disk-backed.
+    pub fn as_path(&self) -> Option<&Path> {
+        match self {
+            Self::Bytes(_) => None,
+            Self::LocalPath { path, .. } => Some(path),
+        }
+    }
+
+    /// Reads up to `max_len` bytes from the beginning of the file.
+    pub fn read_prefix(&self, max_len: usize) -> Result<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes[..bytes.len().min(max_len)].to_vec()),
+            Self::LocalPath { path, .. } => {
+                let file = std::fs::File::open(path)
+                    .with_context(|| format!("failed to open Telegram file {}", path.display()))?;
+                let mut buffer = Vec::new();
+                file.take(max_len as u64)
+                    .read_to_end(&mut buffer)
+                    .with_context(|| {
+                        format!("failed to read Telegram file prefix {}", path.display())
+                    })?;
+                Ok(buffer)
+            }
+        }
+    }
+
+    /// Reads the whole file into memory. Use only for bounded conversion/archive paths.
+    pub fn into_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes),
+            Self::LocalPath { path, .. } => std::fs::read(&path)
+                .with_context(|| format!("failed to read Telegram file {}", path.display())),
+        }
+    }
+}
 
 /// Telegram Bot API client.
 #[derive(Clone)]
@@ -97,11 +160,11 @@ impl TelegramClient {
             .context("Telegram getFile response is missing file_path")
     }
 
-    /// Downloads a file by path, rejecting anything larger than `max_bytes`.
+    /// Resolves a file by path, rejecting anything larger than `max_bytes`.
     ///
-    /// The Telegram cloud Bot API only serves files up to 20 MB, so larger uploads
-    /// cannot be retrieved and are reported to the user instead.
-    pub async fn download_file(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    /// A self-hosted Bot API server running with `--local` returns absolute paths; those are kept
+    /// as paths so large files can be streamed onward without loading them into this process.
+    pub async fn resolve_file(&self, file_path: &str, max_bytes: u64) -> Result<TelegramFile> {
         if Path::new(file_path).is_absolute() {
             let metadata = std::fs::metadata(file_path)
                 .with_context(|| format!("failed to stat Telegram file {file_path}"))?;
@@ -111,8 +174,10 @@ impl TelegramClient {
                     metadata.len()
                 );
             }
-            return std::fs::read(file_path)
-                .with_context(|| format!("failed to read Telegram file {file_path}"));
+            return Ok(TelegramFile::LocalPath {
+                path: PathBuf::from(file_path),
+                size: metadata.len(),
+            });
         }
 
         let url = format!("{}/file/bot{}/{file_path}", self.base_url, self.token);
@@ -129,7 +194,18 @@ impl TelegramClient {
                 bytes.len()
             );
         }
-        Ok(bytes.to_vec())
+        Ok(TelegramFile::Bytes(bytes.to_vec()))
+    }
+
+    /// Downloads a file by path into memory, rejecting anything larger than `max_bytes`.
+    pub async fn download_file(&self, file_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        self.resolve_file(file_path, max_bytes).await?.into_bytes()
+    }
+
+    /// Resolves a file by `file_id` (resolves the path, then returns bytes or a local path).
+    pub async fn resolve_by_file_id(&self, file_id: &str, max_bytes: u64) -> Result<TelegramFile> {
+        let path = self.get_file_path(file_id).await?;
+        self.resolve_file(&path, max_bytes).await
     }
 
     /// Downloads a file by `file_id` (resolves the path, then downloads it).
@@ -302,7 +378,9 @@ pub fn escape_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TelegramClient, escape_html, license_keyboard, split_for_telegram, utf16_len};
+    use super::{
+        TelegramClient, TelegramFile, escape_html, license_keyboard, split_for_telegram, utf16_len,
+    };
     use crate::models::License;
 
     #[tokio::test]
@@ -325,6 +403,37 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
         assert_eq!(bytes, b"hello");
+    }
+
+    #[tokio::test]
+    async fn resolve_file_preserves_absolute_local_path() {
+        let path = std::env::temp_dir().join(format!(
+            "telegram-local-file-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"hello").unwrap();
+
+        let client = TelegramClient::new("token", "http://example.test");
+        let resolved = client
+            .resolve_file(path.to_str().unwrap(), 10)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        match resolved {
+            TelegramFile::LocalPath {
+                path: resolved_path,
+                size,
+            } => {
+                assert_eq!(resolved_path, path);
+                assert_eq!(size, 5);
+            }
+            TelegramFile::Bytes(_) => panic!("absolute local path was copied into memory"),
+        }
     }
 
     #[test]
