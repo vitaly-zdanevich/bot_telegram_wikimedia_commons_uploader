@@ -1723,10 +1723,8 @@ impl Bot {
             }
         };
 
-        self.telegram
-            .send_chat_action(chat_id, "upload_document")
-            .await
-            .ok();
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        let _typing = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
         let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
         let mut links: Vec<String> = Vec::new();
         for entry in entries {
