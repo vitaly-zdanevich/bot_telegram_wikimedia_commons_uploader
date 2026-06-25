@@ -442,7 +442,7 @@ fn attr_string_list(item: &Value, key: &str) -> Vec<String> {
 /// Opens (and migrates) the SQLite database.
 #[cfg(feature = "sqlite")]
 fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
-    let connection = rusqlite::Connection::open(path)?;
+    let mut connection = rusqlite::Connection::open(path)?;
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS profiles (
             user_id INTEGER PRIMARY KEY,
@@ -475,9 +475,29 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
         CREATE TABLE IF NOT EXISTS idempotency (
             key TEXT PRIMARY KEY,
             expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL DEFAULT 0
         );",
     )?;
+    run_sqlite_migrations(&mut connection)?;
     Ok(connection)
+}
+
+/// Applies one-time SQLite data migrations.
+#[cfg(feature = "sqlite")]
+fn run_sqlite_migrations(connection: &mut rusqlite::Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES ('return_upload_links_default_on', strftime('%s', 'now'))",
+        [],
+    )?;
+    if inserted > 0 {
+        transaction.execute("UPDATE profiles SET return_upload_links = 1", [])?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 /// Loads a profile from SQLite (returns default when absent).
@@ -692,6 +712,56 @@ mod tests {
         let error = anyhow::anyhow!("...ConditionalCheckFailedException...");
         assert!(is_conditional_check_failed(&error));
         assert!(!is_conditional_check_failed(&anyhow::anyhow!("other")));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_migration_enables_upload_links_once() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    return_upload_links INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO profiles (user_id, return_upload_links) VALUES (1, 0)",
+                [],
+            )
+            .unwrap();
+
+        super::run_sqlite_migrations(&mut connection).unwrap();
+        let enabled: i64 = connection
+            .query_row(
+                "SELECT return_upload_links FROM profiles WHERE user_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+
+        connection
+            .execute(
+                "UPDATE profiles SET return_upload_links = 0 WHERE user_id = 1",
+                [],
+            )
+            .unwrap();
+        super::run_sqlite_migrations(&mut connection).unwrap();
+        let disabled: i64 = connection
+            .query_row(
+                "SELECT return_upload_links FROM profiles WHERE user_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disabled, 0);
     }
 
     #[cfg(feature = "sqlite")]
