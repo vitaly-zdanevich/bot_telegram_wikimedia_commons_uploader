@@ -39,8 +39,6 @@ if [[ -x "$BOT_API_BIN" ]]; then
       --http-ip-address=127.0.0.1 \
       --http-port="$BOT_API_PORT" \
       --dir="$BOT_API_DIR" \
-      --api-id="$TELEGRAM_API_ID" \
-      --api-hash="$TELEGRAM_API_HASH" \
       ${TELEGRAM_BOT_API_EXTRA_ARGS:-} >"$BOT_API_LOG" 2>&1 &
     pids+=("$!")
     export TELEGRAM_API_BASE="http://127.0.0.1:$BOT_API_PORT"
