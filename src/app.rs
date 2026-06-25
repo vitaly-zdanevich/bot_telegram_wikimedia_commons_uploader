@@ -63,27 +63,102 @@ const FILE_SNIFF_BYTES: usize = 512;
 /// Keeps Telegram's chat action visible while a long operation is running.
 #[cfg(feature = "archive")]
 struct ChatActionGuard {
-    task: tokio::task::JoinHandle<()>,
+    stop: std::sync::mpsc::Sender<()>,
 }
 
 #[cfg(feature = "archive")]
 impl ChatActionGuard {
     fn start(telegram: TelegramClient, chat_id: i64, action: &'static str) -> Self {
-        let task = tokio::spawn(async move {
-            loop {
-                telegram.send_chat_action(chat_id, action).await.ok();
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            }
-        });
-        Self { task }
+        let (stop, stopped) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("telegram-chat-action".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "failed to start chat action runtime");
+                        return;
+                    }
+                };
+                loop {
+                    if let Err(error) = runtime.block_on(telegram.send_chat_action(chat_id, action))
+                    {
+                        tracing::warn!(
+                            chat_id,
+                            action,
+                            error = %format!("{error:#}"),
+                            "failed to send Telegram chat action"
+                        );
+                    }
+                    if stopped
+                        .recv_timeout(std::time::Duration::from_secs(4))
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("chat action helper thread should start");
+        Self { stop }
     }
 }
 
 #[cfg(feature = "archive")]
 impl Drop for ChatActionGuard {
     fn drop(&mut self) {
-        self.task.abort();
+        let _ = self.stop.send(());
     }
+}
+
+/// Logs and suppresses failures when sending a best-effort Telegram chat action.
+async fn send_chat_action_best_effort(telegram: &TelegramClient, chat_id: i64, action: &str) {
+    if let Err(error) = telegram.send_chat_action(chat_id, action).await {
+        tracing::warn!(
+            chat_id,
+            action,
+            error = %format!("{error:#}"),
+            "failed to send Telegram chat action"
+        );
+    }
+}
+
+#[cfg(feature = "archive")]
+fn spawn_archive_upload(
+    config: Config,
+    chat_id: i64,
+    user_id: i64,
+    caption: String,
+    entries: Vec<crate::archive::ArchiveEntry>,
+) {
+    tokio::spawn(async move {
+        let bot = Bot::from_config(config);
+        let mut profile = bot.store.get_profile(user_id).await;
+        if let Err(error) = bot
+            .upload_entries(chat_id, user_id, &mut profile, &caption, entries)
+            .await
+        {
+            tracing::error!(
+                user_id,
+                chat_id,
+                error = %format!("{error:#}"),
+                "archive upload task failed"
+            );
+            bot.telegram
+                .send_message(
+                    chat_id,
+                    &format!(
+                        "❌ Archive upload failed: {}",
+                        escape_html(&format!("{error}"))
+                    ),
+                    None,
+                )
+                .await
+                .ok();
+        }
+    });
 }
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
@@ -1734,8 +1809,8 @@ impl Bot {
                 .send_message(chat_id, "✖ Archive upload cancelled.", None)
                 .await;
         }
-        let mut profile = self.store.get_profile(user_id).await;
         let image_label = image_count_label(count);
+        send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         self.telegram
             .send_message(
                 chat_id,
@@ -1744,14 +1819,14 @@ impl Bot {
             )
             .await
             .ok();
-        self.upload_entries(
+        spawn_archive_upload(
+            self.config.clone(),
             chat_id,
             user_id,
-            &mut profile,
-            &pending.caption,
+            pending.caption,
             pending.entries,
-        )
-        .await
+        );
+        Ok(())
     }
 
     /// Uploads every extracted image, replying with an aggregate summary.
@@ -1774,7 +1849,7 @@ impl Bot {
             }
         };
 
-        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         let _typing = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
         tracing::info!(
             user_id,
@@ -1784,7 +1859,17 @@ impl Bot {
         );
         let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
         let mut links: Vec<String> = Vec::new();
-        for entry in entries {
+        for (index, entry) in entries.into_iter().enumerate() {
+            let member_index = index + 1;
+            tracing::info!(
+                user_id,
+                chat_id,
+                member_index,
+                count = entry_count,
+                name = %entry.name,
+                "uploading archive member"
+            );
+            send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
             let unique = short_id(&entry.bytes);
             match self
                 .process_one_file(
