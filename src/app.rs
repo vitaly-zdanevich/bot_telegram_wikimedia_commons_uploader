@@ -58,6 +58,32 @@ const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll
 /// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
 const FILE_SNIFF_BYTES: usize = 512;
 
+/// Keeps Telegram's chat action visible while a long operation is running.
+#[cfg(feature = "archive")]
+struct ChatActionGuard {
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "archive")]
+impl ChatActionGuard {
+    fn start(telegram: TelegramClient, chat_id: i64, action: &'static str) -> Self {
+        let task = tokio::spawn(async move {
+            loop {
+                telegram.send_chat_action(chat_id, action).await.ok();
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            }
+        });
+        Self { task }
+    }
+}
+
+#[cfg(feature = "archive")]
+impl Drop for ChatActionGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: LambdaRequest) -> Result<LambdaResponse<Body>> {
     handle_webhook_payload(request.headers(), request.body().as_ref()).await?;
@@ -1212,6 +1238,27 @@ impl Bot {
             return self.reject_too_large(chat_id).await;
         }
 
+        #[cfg(feature = "archive")]
+        let mut archive_chat_action = if crate::archive::is_archive(file.file_name.as_deref(), &[])
+        {
+            self.telegram.send_chat_action(chat_id, "typing").await.ok();
+            Some(ChatActionGuard::start(
+                self.telegram.clone(),
+                chat_id,
+                "typing",
+            ))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "archive")]
+        if archive_chat_action.is_none() {
+            self.telegram
+                .send_chat_action(chat_id, "upload_document")
+                .await
+                .ok();
+        }
+        #[cfg(not(feature = "archive"))]
         self.telegram
             .send_chat_action(chat_id, "upload_document")
             .await
@@ -1246,6 +1293,12 @@ impl Bot {
                 }
             };
             if crate::archive::is_archive(file.file_name.as_deref(), &sniff) {
+                if archive_chat_action.is_none() {
+                    self.telegram.send_chat_action(chat_id, "typing").await.ok();
+                    archive_chat_action.get_or_insert_with(|| {
+                        ChatActionGuard::start(self.telegram.clone(), chat_id, "typing")
+                    });
+                }
                 if original.len() > self.config.max_archive_file_bytes {
                     return self.reject_archive_too_large(chat_id).await;
                 }
@@ -1416,6 +1469,7 @@ impl Bot {
     }
 
     /// Tells the user an archive is over the configured archive processing limit.
+    #[cfg(feature = "archive")]
     async fn reject_archive_too_large(&self, chat_id: i64) -> Result<()> {
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let upload_limit = format_size_limit(self.config.max_file_bytes);
@@ -1465,7 +1519,11 @@ impl Bot {
                 .map(|entry| format!("• {}", escape_html(&entry.name)))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let text = format!("📦 {} image(s) inside the archive:\n{list}", entries.len());
+            let count = entries.len();
+            let text = format!(
+                "📦 {count} {} inside the archive:\n{list}",
+                image_count_label(count)
+            );
             self.telegram.send_message(chat_id, &text, None).await.ok();
         }
 
@@ -1537,8 +1595,9 @@ impl Bot {
         sample_name: Option<&str>,
     ) -> Result<()> {
         let sample = sample_name.unwrap_or("IMG_...");
+        let image_label = image_count_label(count);
         let text = format!(
-            "📦 Found <b>{count}</b> image(s). At least one filename starts with <code>IMG_</code>{example}, so send a short <b>filename prefix</b> before upload.\n\nExample: <code>Minsk trip</code>",
+            "📦 Found <b>{count}</b> {image_label}. At least one filename starts with <code>IMG_</code>{example}, so send a short <b>filename prefix</b> before upload.\n\nExample: <code>Minsk trip</code>",
             example = if sample == "IMG_..." {
                 String::new()
             } else {
@@ -1570,13 +1629,16 @@ impl Bot {
                 },
             ]],
         };
+        let image_label = image_count_label(count);
         let text = match prefix {
             Some(prefix) => format!(
-                "Filename prefix set to <code>{}</code>.\n\n📦 Found <b>{count}</b> image(s). Confirm uploading to Wikimedia Commons?",
+                "Filename prefix set to <code>{}</code>.\n\n📦 Found <b>{count}</b> {image_label}. Confirm uploading to Wikimedia Commons?",
                 escape_html(prefix)
             ),
             None => {
-                format!("📦 Found <b>{count}</b> image(s). Confirm uploading to Wikimedia Commons?")
+                format!(
+                    "📦 Found <b>{count}</b> {image_label}. Confirm uploading to Wikimedia Commons?"
+                )
             }
         };
         self.telegram
@@ -2053,6 +2115,12 @@ fn skip_prefix_keyboard() -> InlineKeyboardMarkup {
 /// Renders a boolean as a human on/off label.
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+/// Returns a natural label for an image count.
+#[cfg(feature = "archive")]
+fn image_count_label(count: usize) -> &'static str {
+    if count == 1 { "image" } else { "images" }
 }
 
 /// Summarizes a user's upload defaults after a settings directive.
