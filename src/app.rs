@@ -1411,24 +1411,19 @@ impl Bot {
             .await
     }
 
-    /// Sends up to a handful of preview thumbnails for an archive's images.
+    /// Sends preview thumbnails for all decodable images in an archive.
     async fn send_archive_thumbnails(
         &self,
         chat_id: i64,
         entries: &[crate::archive::ArchiveEntry],
     ) {
-        const MAX_THUMBS: usize = 8;
-        for entry in entries.iter().take(MAX_THUMBS) {
+        for entry in entries {
             if let Some(thumb) = convert::make_thumbnail(&entry.bytes, 320) {
                 self.telegram
                     .send_photo(chat_id, thumb, "thumb.jpg", Some(&entry.name), None)
                     .await
                     .ok();
             }
-        }
-        if entries.len() > MAX_THUMBS {
-            let text = format!("… and {} more.", entries.len() - MAX_THUMBS);
-            self.telegram.send_message(chat_id, &text, None).await.ok();
         }
     }
 
