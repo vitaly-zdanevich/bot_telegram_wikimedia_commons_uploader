@@ -20,7 +20,8 @@ password without it. Nothing to install locally; the `toolforge` CLI lives on th
 4. **Build** from Git: `toolforge build start <repo>` → `toolforge build show` (§3).
 5. **Run:** `cp toolforge/service.template ~/service.template`, then `toolforge webservice buildservice start --mount=all --health-check-path=/healthz` (§4).
 6. **Register webhook:** locally run `TOOLFORGE_TOOL=YOURTOOL ./scripts/set-webhook.sh`.
-7. **Verify:** `toolforge webservice status`, `toolforge webservice buildservice logs -f`, then message the bot `/start`.
+7. **Verify:** `toolforge webservice status`, `toolforge webservice buildservice logs -f`
+   or locally `./scripts/toolforge-logs.sh -f`, then message the bot `/start`.
 
 OAuth is **additive** — deploy on a bot password now; add the consumer envvars later and restart
 the job (`toolforge jobs restart commons-uploader-bot`) to pick them up.
@@ -90,6 +91,15 @@ toolforge webservice buildservice logs -f
 
 `scripts/toolforge-webhook-deploy.sh` wraps steps 3–4 when run from a checkout on the bastion
 after `become YOURTOOL`.
+
+From a local checkout, `scripts/toolforge-logs.sh` SSHes to the bastion and reads the
+webservice logs with `kubectl logs`. Common forms:
+
+```bash
+./scripts/toolforge-logs.sh
+./scripts/toolforge-logs.sh --since 2h --errors
+./scripts/toolforge-logs.sh --follow
+```
 
 To keep using long polling instead, set `BOT_MODE=polling`, edit the image in
 `toolforge/jobs.yaml`, and run:

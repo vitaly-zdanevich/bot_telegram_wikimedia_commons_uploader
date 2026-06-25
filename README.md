@@ -1,5 +1,9 @@
 # Telegram → Wikimedia Commons uploader bot
 
+<p align="center">
+  <img src="logo.png" alt="Telegram to Wikimedia Commons uploader bot logo" width="180">
+</p>
+
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader)
 [![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_bot_telegram_wikimedia_commons_uploader)
@@ -211,6 +215,7 @@ via the `SERVICE` env var (default `commons-uploader-bot`).
 | `scripts/toolforge-webhook-deploy.sh` | Build and start the Toolforge webhook webservice |
 | `scripts/toolforge-deploy.sh` | Build and load the older Toolforge long-polling job |
 | `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) — Lambda |
+| `scripts/toolforge-logs.sh` | Read Toolforge webservice logs (`--tail 200`, `--since 2h`, `--errors`, `--follow`) |
 | `scripts/server-logs.sh` | Read journald logs (`--since 2h`, `--errors`, `--follow`) — server |
 | `scripts/server-status.sh` | Server health: service state, memory, recent errors, `getMe` |
 

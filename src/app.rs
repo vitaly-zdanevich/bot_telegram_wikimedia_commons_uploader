@@ -777,8 +777,19 @@ impl Bot {
             .await
             .ok();
         let Some(chat_id) = callback.message.as_ref().map(|message| message.chat.id) else {
+            tracing::warn!(
+                user_id,
+                callback_data = %data,
+                "callback query has no message context"
+            );
             return Ok(());
         };
+        tracing::info!(
+            user_id,
+            chat_id,
+            callback_data = %data,
+            "handling Telegram callback"
+        );
 
         #[cfg(feature = "archive")]
         if let Some(token) = data.strip_prefix("arc:ok:") {
@@ -1675,6 +1686,13 @@ impl Bot {
     ) -> Result<()> {
         let pending = take_pending_archive(token);
         let Some(pending) = pending else {
+            tracing::warn!(
+                user_id,
+                chat_id,
+                token,
+                proceed,
+                "pending archive not found during confirmation"
+            );
             return self
                 .telegram
                 .send_message(
@@ -1685,8 +1703,31 @@ impl Bot {
                 .await;
         };
         if pending.user_id != user_id {
-            return Ok(());
+            tracing::warn!(
+                user_id,
+                pending_user_id = pending.user_id,
+                chat_id,
+                token,
+                "archive confirmation clicked by a different user"
+            );
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "This archive confirmation belongs to another Telegram user.",
+                    None,
+                )
+                .await;
         }
+        let count = pending.entries.len();
+        tracing::info!(
+            user_id,
+            chat_id,
+            token,
+            proceed,
+            count,
+            "archive confirmation received"
+        );
         if !proceed {
             return self
                 .telegram
@@ -1694,6 +1735,15 @@ impl Bot {
                 .await;
         }
         let mut profile = self.store.get_profile(user_id).await;
+        let image_label = image_count_label(count);
+        self.telegram
+            .send_message(
+                chat_id,
+                &format!("Uploading {count} {image_label} to Wikimedia Commons…"),
+                None,
+            )
+            .await
+            .ok();
         self.upload_entries(
             chat_id,
             user_id,
@@ -1713,6 +1763,7 @@ impl Bot {
         caption: &str,
         entries: Vec<crate::archive::ArchiveEntry>,
     ) -> Result<()> {
+        let entry_count = entries.len();
         let (auth, author_username) = match self.resolve_auth(profile) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1725,6 +1776,12 @@ impl Bot {
 
         self.telegram.send_chat_action(chat_id, "typing").await.ok();
         let _typing = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
+        tracing::info!(
+            user_id,
+            chat_id,
+            count = entry_count,
+            "starting archive upload"
+        );
         let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
         let mut links: Vec<String> = Vec::new();
         for entry in entries {
@@ -1778,6 +1835,16 @@ impl Bot {
             text.push_str("\n\n");
             text.push_str(&links.join("\n"));
         }
+        tracing::info!(
+            user_id,
+            chat_id,
+            count = entry_count,
+            uploaded,
+            duplicate,
+            rejected,
+            failed,
+            "finished archive upload"
+        );
         self.telegram.send_message(chat_id, &text, None).await
     }
 }
