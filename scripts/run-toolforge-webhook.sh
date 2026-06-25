@@ -8,6 +8,7 @@ TOOL_DATA_DIR="${TOOL_DATA_DIR:-/data/project/${TOOLFORGE_TOOL:-bot-telegram-com
 BOT_API_BIN="${TELEGRAM_BOT_API_BIN:-$TOOL_DATA_DIR/bin/telegram-bot-api}"
 BOT_API_DIR="${TELEGRAM_BOT_API_DIR:-$TOOL_DATA_DIR/telegram-bot-api}"
 BOT_API_LOG="${TELEGRAM_BOT_API_LOG:-$TOOL_DATA_DIR/telegram-bot-api.log}"
+export TOOL_DATA_DIR
 
 APT_LAYER="${APT_LAYER:-/layers/fagiani_apt/apt}"
 if [[ -d "$APT_LAYER" ]]; then

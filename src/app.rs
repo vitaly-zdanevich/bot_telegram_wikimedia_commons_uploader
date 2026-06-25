@@ -28,6 +28,8 @@ use lambda_http::{Body, Request as LambdaRequest, Response as LambdaResponse};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
+#[cfg(feature = "archive")]
+use std::path::PathBuf;
 use tokio::net::TcpListener;
 
 /// Telegram handle of the author, shown in `/help`.
@@ -662,18 +664,23 @@ impl Bot {
                         )
                         .await;
                 }
-                profile.filename_prefix = text.to_string();
-                profile.onboarding_step = OnboardingStep::Done;
-                touch(&mut profile);
-                self.store.put_profile(user_id, &profile).await?;
 
                 let Some(pending) = pending else {
+                    profile.filename_prefix = text.to_string();
+                    profile.onboarding_step = OnboardingStep::Done;
+                    touch(&mut profile);
+                    self.store.put_profile(user_id, &profile).await?;
                     let text = format!(
-                        "Filename prefix set to <code>{}</code>, but the archive request expired. Please resend the archive.",
+                        "Filename prefix set to <code>{}</code>, but I no longer have the pending archive. Please resend the archive.",
                         escape_html(&profile.filename_prefix)
                     );
                     return self.telegram.send_message(chat_id, &text, None).await;
                 };
+
+                profile.filename_prefix = text.to_string();
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
 
                 if pending.confirm_before_upload {
                     return self
@@ -686,7 +693,7 @@ impl Bot {
                         .await;
                 }
 
-                let pending_archive = archive_pending().lock().unwrap().remove(&pending.token);
+                let pending_archive = take_pending_archive(&pending.token);
                 if let Some(pending_archive) = pending_archive {
                     let text = format!(
                         "Filename prefix set to <code>{}</code>. Uploading archive…",
@@ -705,7 +712,11 @@ impl Bot {
                 }
 
                 self.telegram
-                    .send_message(chat_id, "This archive request has expired.", None)
+                    .send_message(
+                        chat_id,
+                        "I no longer have the pending archive. Please resend the archive.",
+                        None,
+                    )
                     .await
             }
             #[cfg(not(feature = "archive"))]
@@ -1544,16 +1555,24 @@ impl Bot {
             } else {
                 None
             };
-            archive_pending().lock().unwrap().insert(
-                token.clone(),
-                PendingArchive {
-                    user_id,
-                    caption,
-                    entries,
-                    confirm_before_upload: profile.archive_confirm,
-                    created_at: now_ts(),
-                },
-            );
+            let pending = PendingArchive {
+                user_id,
+                caption,
+                entries,
+                confirm_before_upload: profile.archive_confirm,
+                created_at: now_ts(),
+            };
+            if let Err(error) = persist_pending_archive(&token, &pending) {
+                tracing::warn!(
+                    token,
+                    error = %format!("{error:#}"),
+                    "failed to persist pending archive"
+                );
+            }
+            archive_pending()
+                .lock()
+                .unwrap()
+                .insert(token.clone(), pending);
             if needs_prefix {
                 profile.onboarding_step = OnboardingStep::AwaitingArchivePrefix;
                 touch(profile);
@@ -1654,11 +1673,15 @@ impl Bot {
         token: &str,
         proceed: bool,
     ) -> Result<()> {
-        let pending = archive_pending().lock().unwrap().remove(token);
+        let pending = take_pending_archive(token);
         let Some(pending) = pending else {
             return self
                 .telegram
-                .send_message(chat_id, "This archive request has expired.", None)
+                .send_message(
+                    chat_id,
+                    "I no longer have the pending archive. Please resend the archive.",
+                    None,
+                )
                 .await;
         };
         if pending.user_id != user_id {
@@ -1778,6 +1801,24 @@ struct PendingArchiveSummary {
     count: usize,
     sample_name: Option<String>,
     confirm_before_upload: bool,
+    created_at: i64,
+}
+
+#[cfg(feature = "archive")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PendingArchiveManifest {
+    user_id: i64,
+    caption: String,
+    confirm_before_upload: bool,
+    created_at: i64,
+    entries: Vec<PendingArchiveManifestEntry>,
+}
+
+#[cfg(feature = "archive")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PendingArchiveManifestEntry {
+    name: String,
+    file_name: String,
 }
 
 /// How long a staged-but-unconfirmed archive is kept before eviction (30 days).
@@ -1811,9 +1852,9 @@ fn pending_archive_summary_for_user(user_id: i64) -> Option<PendingArchiveSummar
     let now = now_ts();
     let mut map = archive_pending().lock().unwrap();
     map.retain(|_, pending| !pending_is_expired(pending.created_at, now));
-    map.iter()
+    let mut summaries = map
+        .iter()
         .filter(|(_, pending)| pending.user_id == user_id)
-        .max_by_key(|(_, pending)| pending.created_at)
         .map(|(token, pending)| PendingArchiveSummary {
             token: token.clone(),
             count: pending.entries.len(),
@@ -1823,7 +1864,15 @@ fn pending_archive_summary_for_user(user_id: i64) -> Option<PendingArchiveSummar
                 .find(|entry| archive_entry_needs_filename_prefix(&entry.name))
                 .map(|entry| entry.name.clone()),
             confirm_before_upload: pending.confirm_before_upload,
+            created_at: pending.created_at,
         })
+        .collect::<Vec<_>>();
+    drop(map);
+
+    summaries.extend(disk_pending_archive_summaries_for_user(user_id, now));
+    summaries
+        .into_iter()
+        .max_by_key(|summary| summary.created_at)
 }
 
 #[cfg(feature = "archive")]
@@ -1831,7 +1880,230 @@ fn remove_pending_archives_for_user(user_id: i64) -> usize {
     let mut map = archive_pending().lock().unwrap();
     let before = map.len();
     map.retain(|_, pending| pending.user_id != user_id);
-    before.saturating_sub(map.len())
+    let removed = before.saturating_sub(map.len());
+    drop(map);
+    removed + remove_disk_pending_archives_for_user(user_id)
+}
+
+#[cfg(feature = "archive")]
+fn take_pending_archive(token: &str) -> Option<PendingArchive> {
+    let pending = archive_pending().lock().unwrap().remove(token);
+    let pending = pending.or_else(|| match load_pending_archive(token) {
+        Ok(pending) => Some(pending),
+        Err(error) => {
+            tracing::warn!(
+                token,
+                error = %format!("{error:#}"),
+                "failed to load persisted pending archive"
+            );
+            None
+        }
+    });
+    if pending.is_some()
+        && let Err(error) = remove_pending_archive_files(token)
+    {
+        tracing::warn!(
+            token,
+            error = %format!("{error:#}"),
+            "failed to remove pending archive files"
+        );
+    }
+    pending
+}
+
+#[cfg(feature = "archive")]
+fn persist_pending_archive(token: &str, pending: &PendingArchive) -> Result<()> {
+    let dir = pending_archive_token_dir(token);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to replace pending archive {}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create pending archive dir {}", dir.display()))?;
+
+    let mut manifest_entries = Vec::with_capacity(pending.entries.len());
+    for (index, entry) in pending.entries.iter().enumerate() {
+        let file_name = format!("entry-{index:06}");
+        let path = dir.join(&file_name);
+        std::fs::write(&path, &entry.bytes)
+            .with_context(|| format!("failed to write pending archive entry {}", path.display()))?;
+        manifest_entries.push(PendingArchiveManifestEntry {
+            name: entry.name.clone(),
+            file_name,
+        });
+    }
+
+    let manifest = PendingArchiveManifest {
+        user_id: pending.user_id,
+        caption: pending.caption.clone(),
+        confirm_before_upload: pending.confirm_before_upload,
+        created_at: pending.created_at,
+        entries: manifest_entries,
+    };
+    let manifest_path = pending_archive_manifest_path(token);
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).context("failed to serialize pending archive manifest")?;
+    std::fs::write(&manifest_path, manifest_bytes).with_context(|| {
+        format!(
+            "failed to write pending archive manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "archive")]
+fn load_pending_archive(token: &str) -> Result<PendingArchive> {
+    let manifest = read_pending_archive_manifest(token)?;
+    let now = now_ts();
+    if pending_is_expired(manifest.created_at, now) {
+        remove_pending_archive_files(token).ok();
+        anyhow::bail!("pending archive expired");
+    }
+    let dir = pending_archive_token_dir(token);
+    let mut entries = Vec::with_capacity(manifest.entries.len());
+    for entry in manifest.entries {
+        let path = dir.join(&entry.file_name);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("failed to read pending archive entry {}", path.display()))?;
+        entries.push(crate::archive::ArchiveEntry {
+            name: entry.name,
+            bytes,
+        });
+    }
+    Ok(PendingArchive {
+        user_id: manifest.user_id,
+        caption: manifest.caption,
+        entries,
+        confirm_before_upload: manifest.confirm_before_upload,
+        created_at: manifest.created_at,
+    })
+}
+
+#[cfg(feature = "archive")]
+fn read_pending_archive_manifest(token: &str) -> Result<PendingArchiveManifest> {
+    let path = pending_archive_manifest_path(token);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed to read pending archive manifest {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse pending archive manifest {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(feature = "archive")]
+fn disk_pending_archive_summaries_for_user(user_id: i64, now: i64) -> Vec<PendingArchiveSummary> {
+    let Ok(dirs) = std::fs::read_dir(pending_archive_dir()) else {
+        return Vec::new();
+    };
+    let mut summaries = Vec::new();
+    for dir in dirs.flatten() {
+        let Ok(file_type) = dir.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let token = dir.file_name().to_string_lossy().to_string();
+        let manifest = match read_pending_archive_manifest(&token) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::warn!(
+                    token,
+                    error = %format!("{error:#}"),
+                    "failed to read pending archive manifest"
+                );
+                continue;
+            }
+        };
+        if pending_is_expired(manifest.created_at, now) {
+            remove_pending_archive_files(&token).ok();
+            continue;
+        }
+        if manifest.user_id != user_id {
+            continue;
+        }
+        summaries.push(PendingArchiveSummary {
+            token,
+            count: manifest.entries.len(),
+            sample_name: manifest
+                .entries
+                .iter()
+                .find(|entry| archive_entry_needs_filename_prefix(&entry.name))
+                .map(|entry| entry.name.clone()),
+            confirm_before_upload: manifest.confirm_before_upload,
+            created_at: manifest.created_at,
+        });
+    }
+    summaries
+}
+
+#[cfg(feature = "archive")]
+fn remove_disk_pending_archives_for_user(user_id: i64) -> usize {
+    let Ok(dirs) = std::fs::read_dir(pending_archive_dir()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for dir in dirs.flatten() {
+        let Ok(file_type) = dir.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let token = dir.file_name().to_string_lossy().to_string();
+        let Ok(manifest) = read_pending_archive_manifest(&token) else {
+            continue;
+        };
+        if manifest.user_id == user_id && remove_pending_archive_files(&token).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(feature = "archive")]
+fn remove_pending_archive_files(token: &str) -> Result<()> {
+    let dir = pending_archive_token_dir(token);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to remove pending archive dir {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "archive")]
+fn pending_archive_manifest_path(token: &str) -> PathBuf {
+    pending_archive_token_dir(token).join("manifest.json")
+}
+
+#[cfg(feature = "archive")]
+fn pending_archive_token_dir(token: &str) -> PathBuf {
+    pending_archive_dir().join(token)
+}
+
+#[cfg(feature = "archive")]
+fn pending_archive_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("PENDING_ARCHIVE_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("TOOL_DATA_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir).join("pending-archives");
+    }
+    if let Ok(tool) = std::env::var("TOOLFORGE_TOOL")
+        && !tool.trim().is_empty()
+    {
+        return PathBuf::from("/data/project")
+            .join(tool)
+            .join("pending-archives");
+    }
+    std::env::temp_dir().join("telegram-wikimedia-commons-uploader-pending-archives")
 }
 
 /// Parses `MemAvailable` (in kB) out of `/proc/meminfo` contents.

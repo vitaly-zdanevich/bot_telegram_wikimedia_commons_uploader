@@ -81,6 +81,11 @@ impl UploadData {
             Self::File { len, .. } => *len,
         }
     }
+
+    /// Returns true when the upload has no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl CommonsClient {

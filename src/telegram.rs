@@ -24,6 +24,11 @@ impl TelegramFile {
         }
     }
 
+    /// Returns true when the file has no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns the in-memory bytes, if this file is memory-backed.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
