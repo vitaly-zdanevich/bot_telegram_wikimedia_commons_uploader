@@ -114,6 +114,7 @@ impl Drop for ChatActionGuard {
 }
 
 /// Logs and suppresses failures when sending a best-effort Telegram chat action.
+#[cfg(feature = "archive")]
 async fn send_chat_action_best_effort(telegram: &TelegramClient, chat_id: i64, action: &str) {
     if let Err(error) = telegram.send_chat_action(chat_id, action).await {
         tracing::warn!(
