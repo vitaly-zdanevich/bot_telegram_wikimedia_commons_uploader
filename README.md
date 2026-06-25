@@ -111,8 +111,10 @@ images inside it, sharing one caption/categories/license across them. Two `/sett
 toggles control the flow:
 
 - **Show file list** (off by default) — reply with the names of the images found.
-- **Confirm before upload** (on by default) — send thumbnails of the first images and a
-  **Confirm upload** / **Cancel** button; nothing is uploaded until you confirm.
+- **Confirm before upload** (on by default) — send thumbnails of all previewable images and
+  a **Confirm upload** / **Cancel** button; nothing is uploaded until you confirm. If an
+  archive contains a generic `IMG_...` filename, the bot asks for a filename prefix before
+  upload.
 
 ZIP works out of the box (pure Rust). **RAR** shells out to a system extractor at runtime —
 `unar` (free, in Debian main) preferred, `unrar` as fallback — behind the extra `rar` Cargo

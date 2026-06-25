@@ -62,6 +62,8 @@ pub enum OnboardingStep {
     AwaitingLicense,
     /// Waiting for the filename prefix.
     AwaitingPrefix,
+    /// Waiting for a filename prefix required by a staged archive with generic names.
+    AwaitingArchivePrefix,
     /// Onboarding complete; ready to upload.
     Done,
 }
@@ -75,6 +77,7 @@ impl OnboardingStep {
             "awaiting_oauth_verifier" => Some(OnboardingStep::AwaitingOAuthVerifier),
             "awaiting_license" => Some(OnboardingStep::AwaitingLicense),
             "awaiting_prefix" => Some(OnboardingStep::AwaitingPrefix),
+            "awaiting_archive_prefix" => Some(OnboardingStep::AwaitingArchivePrefix),
             "done" => Some(OnboardingStep::Done),
             _ => None,
         }
@@ -88,6 +91,7 @@ impl OnboardingStep {
             OnboardingStep::AwaitingOAuthVerifier => "awaiting_oauth_verifier",
             OnboardingStep::AwaitingLicense => "awaiting_license",
             OnboardingStep::AwaitingPrefix => "awaiting_prefix",
+            OnboardingStep::AwaitingArchivePrefix => "awaiting_archive_prefix",
             OnboardingStep::Done => "done",
         }
     }
@@ -345,8 +349,10 @@ mod tests {
         for step in [
             OnboardingStep::AwaitingUsername,
             OnboardingStep::AwaitingPassword,
+            OnboardingStep::AwaitingOAuthVerifier,
             OnboardingStep::AwaitingLicense,
             OnboardingStep::AwaitingPrefix,
+            OnboardingStep::AwaitingArchivePrefix,
             OnboardingStep::Done,
         ] {
             assert_eq!(OnboardingStep::parse(step.as_str()), Some(step));

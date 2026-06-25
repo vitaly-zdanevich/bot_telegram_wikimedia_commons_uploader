@@ -412,6 +412,15 @@ impl Bot {
                     )
                     .await
             }
+            OnboardingStep::AwaitingArchivePrefix => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        "Send a <b>filename prefix</b> for the pending archive. A prefix is required because at least one image filename starts with <code>IMG_</code>.",
+                        None,
+                    )
+                    .await
+            }
             OnboardingStep::Done => {
                 self.telegram
                     .send_message(chat_id, "✅ All set! Send me a photo or file.", None)
@@ -613,6 +622,75 @@ impl Bot {
                     .send_message(chat_id, ONBOARDING_DONE_MSG, None)
                     .await
             }
+            #[cfg(feature = "archive")]
+            OnboardingStep::AwaitingArchivePrefix => {
+                let pending = pending_archive_summary_for_user(user_id);
+                if text.is_empty() || text.eq_ignore_ascii_case("skip") {
+                    return self
+                        .prompt_archive_prefix(
+                            chat_id,
+                            pending.as_ref().map(|summary| summary.count).unwrap_or(0),
+                            pending
+                                .as_ref()
+                                .and_then(|summary| summary.sample_name.as_deref()),
+                        )
+                        .await;
+                }
+                profile.filename_prefix = text.to_string();
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+
+                let Some(pending) = pending else {
+                    let text = format!(
+                        "Filename prefix set to <code>{}</code>, but the archive request expired. Please resend the archive.",
+                        escape_html(&profile.filename_prefix)
+                    );
+                    return self.telegram.send_message(chat_id, &text, None).await;
+                };
+
+                if pending.confirm_before_upload {
+                    return self
+                        .send_archive_confirmation(
+                            chat_id,
+                            &pending.token,
+                            pending.count,
+                            Some(&profile.filename_prefix),
+                        )
+                        .await;
+                }
+
+                let pending_archive = archive_pending().lock().unwrap().remove(&pending.token);
+                if let Some(pending_archive) = pending_archive {
+                    let text = format!(
+                        "Filename prefix set to <code>{}</code>. Uploading archive…",
+                        escape_html(&profile.filename_prefix)
+                    );
+                    self.telegram.send_message(chat_id, &text, None).await.ok();
+                    return self
+                        .upload_entries(
+                            chat_id,
+                            user_id,
+                            &mut profile,
+                            &pending_archive.caption,
+                            pending_archive.entries,
+                        )
+                        .await;
+                }
+
+                self.telegram
+                    .send_message(chat_id, "This archive request has expired.", None)
+                    .await
+            }
+            #[cfg(not(feature = "archive"))]
+            OnboardingStep::AwaitingArchivePrefix => {
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+                self.telegram
+                    .send_message(chat_id, "Archive support is not enabled here.", None)
+                    .await
+            }
             OnboardingStep::Done => {
                 let command = crate::commons::parse_settings_command(text);
                 if !command.is_empty() {
@@ -714,6 +792,19 @@ impl Bot {
         }
 
         if data == "onb:skipprefix" {
+            #[cfg(feature = "archive")]
+            if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+                let pending = pending_archive_summary_for_user(user_id);
+                return self
+                    .prompt_archive_prefix(
+                        chat_id,
+                        pending.as_ref().map(|summary| summary.count).unwrap_or(0),
+                        pending
+                            .as_ref()
+                            .and_then(|summary| summary.sample_name.as_deref()),
+                    )
+                    .await;
+            }
             profile.filename_prefix = String::new();
             profile.onboarding_step = OnboardingStep::Done;
             touch(&mut profile);
@@ -842,6 +933,17 @@ impl Bot {
     /// Cancels an in-progress onboarding step.
     async fn cmd_cancel(&self, chat_id: i64, user_id: i64) -> Result<()> {
         let mut profile = self.store.get_profile(user_id).await;
+        #[cfg(feature = "archive")]
+        if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+            remove_pending_archives_for_user(user_id);
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .telegram
+                .send_message(chat_id, "✖ Archive upload cancelled.", None)
+                .await;
+        }
         if profile.is_ready() {
             profile.onboarding_step = OnboardingStep::Done;
             touch(&mut profile);
@@ -1087,14 +1189,12 @@ impl Bot {
             if !should_nudge {
                 return Ok(());
             }
-            self.telegram
-                .send_message(
-                    chat_id,
-                    "Let's finish connecting your Commons account first 👇",
-                    None,
-                )
-                .await
-                .ok();
+            let text = if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+                "Send a filename prefix for the pending archive first 👇"
+            } else {
+                "Let's finish connecting your Commons account first 👇"
+            };
+            self.telegram.send_message(chat_id, text, None).await.ok();
             let step = if profile.onboarding_step == OnboardingStep::Done {
                 OnboardingStep::AwaitingUsername
             } else {
@@ -1370,40 +1470,42 @@ impl Bot {
         }
 
         let caption = self.resolve_caption(message).await;
+        let needs_prefix = archive_needs_filename_prefix(&entries);
 
-        if profile.archive_confirm {
-            self.send_archive_thumbnails(chat_id, &entries).await;
+        if profile.archive_confirm || needs_prefix {
+            if profile.archive_confirm {
+                self.send_archive_thumbnails(chat_id, &entries).await;
+            }
             let token = new_token();
             let count = entries.len();
+            let sample_name = if needs_prefix {
+                entries
+                    .iter()
+                    .find(|entry| archive_entry_needs_filename_prefix(&entry.name))
+                    .map(|entry| entry.name.clone())
+            } else {
+                None
+            };
             archive_pending().lock().unwrap().insert(
                 token.clone(),
                 PendingArchive {
                     user_id,
                     caption,
                     entries,
+                    confirm_before_upload: profile.archive_confirm,
                     created_at: now_ts(),
                 },
             );
-            let keyboard = InlineKeyboardMarkup {
-                inline_keyboard: vec![vec![
-                    InlineKeyboardButton {
-                        text: "✅ Confirm upload".to_string(),
-                        callback_data: Some(format!("arc:ok:{token}")),
-                        url: None,
-                    },
-                    InlineKeyboardButton {
-                        text: "✖ Cancel".to_string(),
-                        callback_data: Some(format!("arc:no:{token}")),
-                        url: None,
-                    },
-                ]],
-            };
-            let text = format!(
-                "📦 Found <b>{count}</b> image(s). Confirm uploading to Wikimedia Commons?"
-            );
+            if needs_prefix {
+                profile.onboarding_step = OnboardingStep::AwaitingArchivePrefix;
+                touch(profile);
+                self.store.put_profile(user_id, profile).await?;
+                return self
+                    .prompt_archive_prefix(chat_id, count, sample_name.as_deref())
+                    .await;
+            }
             return self
-                .telegram
-                .send_message(chat_id, &text, Some(keyboard))
+                .send_archive_confirmation(chat_id, &token, count, None)
                 .await;
         }
 
@@ -1425,6 +1527,61 @@ impl Bot {
                     .ok();
             }
         }
+    }
+
+    /// Asks for a required filename prefix before continuing an archive upload.
+    async fn prompt_archive_prefix(
+        &self,
+        chat_id: i64,
+        count: usize,
+        sample_name: Option<&str>,
+    ) -> Result<()> {
+        let sample = sample_name.unwrap_or("IMG_...");
+        let text = format!(
+            "📦 Found <b>{count}</b> image(s). At least one filename starts with <code>IMG_</code>{example}, so send a short <b>filename prefix</b> before upload.\n\nExample: <code>Minsk trip</code>",
+            example = if sample == "IMG_..." {
+                String::new()
+            } else {
+                format!(" (for example <code>{}</code>)", escape_html(sample))
+            }
+        );
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Sends the final archive upload confirmation.
+    async fn send_archive_confirmation(
+        &self,
+        chat_id: i64,
+        token: &str,
+        count: usize,
+        prefix: Option<&str>,
+    ) -> Result<()> {
+        let keyboard = InlineKeyboardMarkup {
+            inline_keyboard: vec![vec![
+                InlineKeyboardButton {
+                    text: "✅ Confirm upload".to_string(),
+                    callback_data: Some(format!("arc:ok:{token}")),
+                    url: None,
+                },
+                InlineKeyboardButton {
+                    text: "✖ Cancel".to_string(),
+                    callback_data: Some(format!("arc:no:{token}")),
+                    url: None,
+                },
+            ]],
+        };
+        let text = match prefix {
+            Some(prefix) => format!(
+                "Filename prefix set to <code>{}</code>.\n\n📦 Found <b>{count}</b> image(s). Confirm uploading to Wikimedia Commons?",
+                escape_html(prefix)
+            ),
+            None => {
+                format!("📦 Found <b>{count}</b> image(s). Confirm uploading to Wikimedia Commons?")
+            }
+        };
+        self.telegram
+            .send_message(chat_id, &text, Some(keyboard))
+            .await
     }
 
     /// Resolves a pending archive by token and uploads it (or cancels it).
@@ -1548,8 +1705,17 @@ struct PendingArchive {
     user_id: i64,
     caption: String,
     entries: Vec<crate::archive::ArchiveEntry>,
+    confirm_before_upload: bool,
     /// Unix timestamp when staged, for TTL eviction.
     created_at: i64,
+}
+
+#[cfg(feature = "archive")]
+struct PendingArchiveSummary {
+    token: String,
+    count: usize,
+    sample_name: Option<String>,
+    confirm_before_upload: bool,
 }
 
 /// How long a staged-but-unconfirmed archive is kept before eviction (30 days).
@@ -1564,6 +1730,46 @@ const LOW_MEMORY_MARGIN: u64 = 256 * 1024 * 1024;
 #[cfg(feature = "archive")]
 fn pending_is_expired(created_at: i64, now: i64) -> bool {
     now.saturating_sub(created_at) >= PENDING_TTL_SECS
+}
+
+#[cfg(feature = "archive")]
+fn archive_needs_filename_prefix(entries: &[crate::archive::ArchiveEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| archive_entry_needs_filename_prefix(&entry.name))
+}
+
+#[cfg(feature = "archive")]
+fn archive_entry_needs_filename_prefix(name: &str) -> bool {
+    name.starts_with("IMG_")
+}
+
+#[cfg(feature = "archive")]
+fn pending_archive_summary_for_user(user_id: i64) -> Option<PendingArchiveSummary> {
+    let now = now_ts();
+    let mut map = archive_pending().lock().unwrap();
+    map.retain(|_, pending| !pending_is_expired(pending.created_at, now));
+    map.iter()
+        .filter(|(_, pending)| pending.user_id == user_id)
+        .max_by_key(|(_, pending)| pending.created_at)
+        .map(|(token, pending)| PendingArchiveSummary {
+            token: token.clone(),
+            count: pending.entries.len(),
+            sample_name: pending
+                .entries
+                .iter()
+                .find(|entry| archive_entry_needs_filename_prefix(&entry.name))
+                .map(|entry| entry.name.clone()),
+            confirm_before_upload: pending.confirm_before_upload,
+        })
+}
+
+#[cfg(feature = "archive")]
+fn remove_pending_archives_for_user(user_id: i64) -> usize {
+    let mut map = archive_pending().lock().unwrap();
+    let before = map.len();
+    map.retain(|_, pending| pending.user_id != user_id);
+    before.saturating_sub(map.len())
 }
 
 /// Parses `MemAvailable` (in kB) out of `/proc/meminfo` contents.
@@ -2023,7 +2229,8 @@ mod tests {
 #[cfg(all(test, feature = "archive"))]
 mod archive_tests {
     use super::{
-        PENDING_TTL_SECS, is_low_memory, parse_mem_available_kb, pending_is_expired, short_id,
+        PENDING_TTL_SECS, archive_entry_needs_filename_prefix, archive_needs_filename_prefix,
+        is_low_memory, parse_mem_available_kb, pending_is_expired, short_id,
     };
 
     #[test]
@@ -2057,5 +2264,23 @@ mod archive_tests {
         assert!(!pending_is_expired(1000, 1000));
         assert!(!pending_is_expired(1000, 1000 + PENDING_TTL_SECS - 1));
         assert!(pending_is_expired(1000, 1000 + PENDING_TTL_SECS));
+    }
+
+    #[test]
+    fn archive_prefix_is_required_for_img_names() {
+        assert!(archive_entry_needs_filename_prefix("IMG_5638.jpg"));
+        assert!(!archive_entry_needs_filename_prefix("Minsk IMG_5638.jpg"));
+
+        let entries = vec![
+            crate::archive::ArchiveEntry {
+                name: "DSC_0001.jpg".into(),
+                bytes: Vec::new(),
+            },
+            crate::archive::ArchiveEntry {
+                name: "IMG_0002.jpg".into(),
+                bytes: Vec::new(),
+            },
+        ];
+        assert!(archive_needs_filename_prefix(&entries));
     }
 }
