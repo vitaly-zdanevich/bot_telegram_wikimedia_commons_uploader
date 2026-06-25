@@ -1,0 +1,4 @@
+# Toolforge webservice template for webhook mode.
+type: buildservice
+mount: all
+health-check-path: /healthz

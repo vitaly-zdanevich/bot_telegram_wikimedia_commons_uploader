@@ -4,10 +4,10 @@
 #
 # `image` must reference the image produced by the Toolforge Build Service
 # (`toolforge build start …`); replace NAME with your tool's name. `command` is the
-# binary / Procfile process the build produces. The bot reads its config from envvars
+# Procfile process the build produces. The bot reads its config from envvars
 # (set with `toolforge envvars create …`), including BOT_MODE=polling.
 - name: commons-uploader-bot
-  command: commons-uploader-bot
+  command: bot
   image: tool-NAME/tool-NAME:latest
   continuous: true
   emails: onfailure

@@ -10,3 +10,10 @@
 [[build.env]]
 name = "RUSTFLAGS"
 value = "-C target-cpu=native"
+
+# Toolforge's current default deb-packages buildpack reads this table. Keep Aptfile too
+# for older/deprecated buildpack stacks.
+[com.heroku.buildpacks.deb-packages]
+install = [
+    "unar",
+]

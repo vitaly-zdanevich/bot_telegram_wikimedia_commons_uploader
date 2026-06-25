@@ -175,10 +175,10 @@ fast build with `HEIC=0 ./scripts/build-lambda.sh`.
 
 ### Long-living server (Toolforge / Cloud VPS)
 
-Besides Lambda, the same binary runs as a long-polling server — useful on
-**Wikimedia Toolforge / Cloud VPS**, whose IPs Commons does not block. Set
-`BOT_MODE=polling` (it also auto-selects polling when not running in Lambda) and it calls
-`getUpdates` in a loop instead of serving a webhook. Pair it with a self-hosted
+Besides Lambda, the same binary runs on **Wikimedia Toolforge / Cloud VPS**, whose IPs
+Commons does not block. On Toolforge, set `BOT_MODE=webhook` and run it as a build-service
+webservice at `https://<tool>.toolforge.org/telegram`; for a private VM/systemd service,
+set `BOT_MODE=polling` to call `getUpdates` in a loop instead. Pair either mode with a self-hosted
 [Telegram Bot API server](https://github.com/tdlib/telegram-bot-api) to raise the file
 limit from 20 MB to **~2 GB** (point `TELEGRAM_API_BASE` at it).
 
@@ -204,7 +204,9 @@ via the `SERVICE` env var (default `commons-uploader-bot`).
 | `scripts/build-lambda.sh` | Build the arm64 Lambda zip (HEIC via Docker, or `HEIC=0`) |
 | `scripts/build-lambda-docker.sh` | Build the zip with HEIC inside Docker |
 | `scripts/update-code.sh` | Rebuild and push only the Lambda code |
-| `scripts/set-webhook.sh` | Point Telegram at the Lambda Function URL |
+| `scripts/set-webhook.sh` | Point Telegram at `WEBHOOK_URL`, `TOOLFORGE_TOOL`, or the Lambda Function URL |
+| `scripts/toolforge-webhook-deploy.sh` | Build and start the Toolforge webhook webservice |
+| `scripts/toolforge-deploy.sh` | Build and load the older Toolforge long-polling job |
 | `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) — Lambda |
 | `scripts/server-logs.sh` | Read journald logs (`--since 2h`, `--errors`, `--follow`) — server |
 | `scripts/server-status.sh` | Server health: service state, memory, recent errors, `getMe` |

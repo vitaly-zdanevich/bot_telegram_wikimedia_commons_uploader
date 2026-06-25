@@ -1,10 +1,12 @@
 use lambda_http::{Error, run, service_fn};
-use telegram_wikimedia_commons_uploader_bot::app::{handle_lambda_request, run_polling};
+use telegram_wikimedia_commons_uploader_bot::app::{
+    handle_lambda_request, run_polling, run_webhook_server,
+};
 
-/// Starts the bot in AWS Lambda (webhook) mode, or long-polling server mode.
+/// Starts the bot in AWS Lambda, standalone webhook server, or long-polling mode.
 ///
-/// Lambda is auto-detected via `AWS_LAMBDA_RUNTIME_API`; set `BOT_MODE=polling` to force
-/// the long-living server mode used on Toolforge / Cloud VPS.
+/// Lambda is auto-detected via `AWS_LAMBDA_RUNTIME_API`; set `BOT_MODE=webhook` to run
+/// a standalone HTTP server, or `BOT_MODE=polling` for long polling.
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -12,10 +14,18 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    if use_polling_mode() {
-        return run_polling()
-            .await
-            .map_err(|error| Error::from(format!("{error:#}")));
+    match runtime_mode() {
+        RuntimeMode::Polling => {
+            return run_polling()
+                .await
+                .map_err(|error| Error::from(format!("{error:#}")));
+        }
+        RuntimeMode::WebhookServer => {
+            return run_webhook_server()
+                .await
+                .map_err(|error| Error::from(format!("{error:#}")));
+        }
+        RuntimeMode::Lambda => {}
     }
 
     run(service_fn(|request| async move {
@@ -26,10 +36,26 @@ async fn main() -> Result<(), Error> {
     .await
 }
 
-/// Chooses long-polling (server) mode unless running inside AWS Lambda.
-fn use_polling_mode() -> bool {
-    match std::env::var("BOT_MODE") {
-        Ok(mode) => mode.eq_ignore_ascii_case("polling"),
-        Err(_) => std::env::var("AWS_LAMBDA_RUNTIME_API").is_err(),
+enum RuntimeMode {
+    Lambda,
+    WebhookServer,
+    Polling,
+}
+
+/// Chooses long-polling by default outside AWS Lambda unless `BOT_MODE` is explicit.
+fn runtime_mode() -> RuntimeMode {
+    if let Ok(mode) = std::env::var("BOT_MODE") {
+        return match mode.to_ascii_lowercase().as_str() {
+            "lambda" => RuntimeMode::Lambda,
+            "webhook" | "server" => RuntimeMode::WebhookServer,
+            "polling" => RuntimeMode::Polling,
+            _ => RuntimeMode::Polling,
+        };
+    }
+
+    if std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok() {
+        RuntimeMode::Lambda
+    } else {
+        RuntimeMode::Polling
     }
 }

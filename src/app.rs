@@ -15,7 +15,18 @@ use crate::telegram::{
     InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, escape_html, license_keyboard,
 };
 use anyhow::{Context, Result};
-use lambda_http::{Body, Request, Response};
+use bytes::Bytes;
+use http::{HeaderMap, Method, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request as HyperRequest, Response as HyperResponse};
+use hyper_util::rt::TokioIo;
+use lambda_http::{Body, Request as LambdaRequest, Response as LambdaResponse};
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 /// Telegram handle of the author, shown in `/help`.
 const CONTACT: &str = "@vitaly_zdanevich";
@@ -44,11 +55,90 @@ const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
-pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
+pub async fn handle_lambda_request(request: LambdaRequest) -> Result<LambdaResponse<Body>> {
+    handle_webhook_payload(request.headers(), request.body().as_ref()).await?;
+    ok_response()
+}
+
+/// Runs a standalone HTTP server for Telegram webhooks.
+///
+/// Toolforge's webservice proxy forwards requests to `$PORT` (currently 8000). This mode
+/// accepts Telegram POSTs on `/` and `/telegram`, and exposes `/healthz` for checks.
+pub async fn run_webhook_server() -> Result<()> {
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind HTTP server on {addr}"))?;
+
+    tracing::info!(%addr, "starting Telegram webhook server");
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        tokio::task::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(handle_http_request);
+            if let Err(error) = http1::Builder::new().serve_connection(io, service).await {
+                tracing::warn!(%peer_addr, error = %format!("{error:#}"), "HTTP connection failed");
+            }
+        });
+    }
+}
+
+async fn handle_http_request(
+    request: HyperRequest<Incoming>,
+) -> std::result::Result<HyperResponse<Full<Bytes>>, Infallible> {
+    let response = match (request.method(), request.uri().path()) {
+        (&Method::GET, "/healthz") => text_response(StatusCode::OK, "ok"),
+        (&Method::POST, "/") | (&Method::POST, "/telegram") => {
+            let headers = request.headers().clone();
+            match request.into_body().collect().await {
+                Ok(collected) => {
+                    match handle_webhook_payload(&headers, &collected.to_bytes()).await {
+                        Ok(()) => text_response(StatusCode::OK, "ok"),
+                        Err(error) => {
+                            let status = status_for_webhook_error(&error);
+                            tracing::warn!(status = %status, error = %format!("{error:#}"), "webhook request rejected");
+                            text_response(status, status.canonical_reason().unwrap_or("error"))
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to read webhook request body");
+                    text_response(StatusCode::BAD_REQUEST, "bad request")
+                }
+            }
+        }
+        _ => text_response(StatusCode::NOT_FOUND, "not found"),
+    };
+    Ok(response)
+}
+
+fn text_response(status: StatusCode, text: &str) -> HyperResponse<Full<Bytes>> {
+    HyperResponse::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::copy_from_slice(text.as_bytes())))
+        .expect("valid HTTP response")
+}
+
+fn status_for_webhook_error(error: &anyhow::Error) -> StatusCode {
+    let text = format!("{error:#}");
+    if text.contains("invalid Telegram webhook secret") {
+        StatusCode::UNAUTHORIZED
+    } else if text.contains("invalid Telegram update JSON") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> {
     let config = Config::from_env();
-    verify_telegram_secret(&config, &request)?;
-    let update: Update =
-        serde_json::from_slice(request.body().as_ref()).context("invalid Telegram update JSON")?;
+    verify_telegram_secret(&config, headers)?;
+    let update: Update = serde_json::from_slice(body).context("invalid Telegram update JSON")?;
 
     let bot = Bot::from_config(config);
     if let Some(update_id) = update.update_id {
@@ -62,7 +152,7 @@ pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
         {
             Ok(false) => {
                 tracing::info!(update_id, "skipping duplicate Telegram update");
-                return ok_response();
+                return Ok(());
             }
             Ok(true) => {}
             Err(error) => {
@@ -74,7 +164,7 @@ pub async fn handle_lambda_request(request: Request) -> Result<Response<Body>> {
     if let Err(error) = bot.handle_update(update).await {
         tracing::error!(error = %format!("{error:#}"), "failed to handle Telegram update");
     }
-    ok_response()
+    Ok(())
 }
 
 /// Runs the bot as a long-living server using Telegram long polling.
@@ -108,19 +198,18 @@ pub async fn run_polling() -> Result<()> {
 }
 
 /// Returns the standard Telegram webhook success response.
-fn ok_response() -> Result<Response<Body>> {
-    Ok(Response::builder()
+fn ok_response() -> Result<LambdaResponse<Body>> {
+    Ok(LambdaResponse::builder()
         .status(200)
         .body(Body::Text("ok".into()))?)
 }
 
 /// Verifies the Telegram webhook secret header when configured.
-fn verify_telegram_secret(config: &Config, request: &Request) -> Result<()> {
+fn verify_telegram_secret(config: &Config, headers: &HeaderMap) -> Result<()> {
     let Some(expected) = &config.telegram_webhook_secret else {
         return Ok(());
     };
-    let actual = request
-        .headers()
+    let actual = headers
         .get("x-telegram-bot-api-secret-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
