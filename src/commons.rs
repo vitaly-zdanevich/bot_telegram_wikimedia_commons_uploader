@@ -884,13 +884,14 @@ pub struct DescriptionParams<'a> {
 /// Builds the `{{Information}}` + license + categories wikitext for a file page.
 pub fn build_wikitext(params: &DescriptionParams) -> String {
     let description = if params.description.trim().is_empty() {
-        "Uploaded via Telegram".to_string()
+        String::new()
     } else {
         wikitext_value(params.description)
     };
     let description = match params.lang.map(str::trim).filter(|lang| !lang.is_empty()) {
-        Some(lang) => format!("{{{{{lang}|1={description}}}}}"),
+        Some(lang) if !description.is_empty() => format!("{{{{{lang}|1={description}}}}}"),
         None => description,
+        _ => description,
     };
     let source = match params
         .source
@@ -1140,6 +1141,28 @@ mod tests {
         assert!(wikitext.contains("|source=https://example.com/cat/"));
         assert!(wikitext.contains("|author=John Doe"));
         assert!(!wikitext.contains("{{own}}"));
+    }
+
+    #[test]
+    fn wikitext_keeps_empty_description_empty() {
+        let provenance = UploadProvenance::default();
+        let wikitext = build_wikitext(&DescriptionParams {
+            description: "",
+            author_username: "Example@uploader",
+            author_override: None,
+            source: None,
+            license: License::CcBy40,
+            license_override: None,
+            lang: Some("ru"),
+            categories: &[],
+            date: "2026-06-20",
+            latitude: None,
+            longitude: None,
+            provenance: &provenance,
+        });
+        assert!(wikitext.contains("|description=\n"));
+        assert!(!wikitext.contains("Uploaded via Telegram"));
+        assert!(!wikitext.contains("{{ru|1=}}"));
     }
 
     #[test]
