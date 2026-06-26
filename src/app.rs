@@ -166,11 +166,33 @@ fn spawn_archive_upload(
 enum ArchivePreviewFollowup {
     Confirm {
         count: usize,
+        archive_file_name: Option<String>,
     },
     Prefix {
         count: usize,
         sample_name: Option<String>,
     },
+}
+
+#[cfg(feature = "archive")]
+enum ArchiveConfirmAction {
+    Start,
+    ArchiveNamePrefix { include_category: bool },
+    Cancel,
+}
+
+#[cfg(feature = "archive")]
+fn archive_confirm_action_name(action: &ArchiveConfirmAction) -> &'static str {
+    match action {
+        ArchiveConfirmAction::Start => "start",
+        ArchiveConfirmAction::ArchiveNamePrefix {
+            include_category: false,
+        } => "archive_name_prefix",
+        ArchiveConfirmAction::ArchiveNamePrefix {
+            include_category: true,
+        } => "archive_name_prefix_and_category",
+        ArchiveConfirmAction::Cancel => "cancel",
+    }
 }
 
 #[cfg(feature = "archive")]
@@ -211,10 +233,19 @@ fn spawn_archive_thumbnail_preview(
         }
 
         match followup {
-            ArchivePreviewFollowup::Confirm { count } => {
-                bot.send_archive_confirmation(chat_id, &token, count, None)
-                    .await
-                    .ok();
+            ArchivePreviewFollowup::Confirm {
+                count,
+                archive_file_name,
+            } => {
+                bot.send_archive_confirmation(
+                    chat_id,
+                    &token,
+                    count,
+                    None,
+                    archive_file_name.as_deref(),
+                )
+                .await
+                .ok();
             }
             ArchivePreviewFollowup::Prefix { count, sample_name } => {
                 let profile = bot.store.get_profile(user_id).await;
@@ -885,6 +916,7 @@ impl Bot {
                             &pending.token,
                             pending.count,
                             Some(&profile.filename_prefix),
+                            pending.archive_file_name.as_deref(),
                         )
                         .await;
                 }
@@ -989,11 +1021,41 @@ impl Bot {
 
         #[cfg(feature = "archive")]
         if let Some(token) = data.strip_prefix("arc:ok:") {
-            return self.confirm_archive(chat_id, user_id, token, true).await;
+            return self
+                .confirm_archive(chat_id, user_id, token, ArchiveConfirmAction::Start)
+                .await;
+        }
+        #[cfg(feature = "archive")]
+        if let Some(token) = data.strip_prefix("arc:name:") {
+            return self
+                .confirm_archive(
+                    chat_id,
+                    user_id,
+                    token,
+                    ArchiveConfirmAction::ArchiveNamePrefix {
+                        include_category: false,
+                    },
+                )
+                .await;
+        }
+        #[cfg(feature = "archive")]
+        if let Some(token) = data.strip_prefix("arc:namecat:") {
+            return self
+                .confirm_archive(
+                    chat_id,
+                    user_id,
+                    token,
+                    ArchiveConfirmAction::ArchiveNamePrefix {
+                        include_category: true,
+                    },
+                )
+                .await;
         }
         #[cfg(feature = "archive")]
         if let Some(token) = data.strip_prefix("arc:no:") {
-            return self.confirm_archive(chat_id, user_id, token, false).await;
+            return self
+                .confirm_archive(chat_id, user_id, token, ArchiveConfirmAction::Cancel)
+                .await;
         }
 
         let mut profile = self.store.get_profile(user_id).await;
@@ -1751,6 +1813,7 @@ impl Bot {
             user_id,
             chat_id,
             count = entries.len(),
+            archive_file_name = file_name.as_deref().unwrap_or(""),
             needs_prefix,
             confirm_before_upload = profile.archive_confirm,
             "archive extracted"
@@ -1770,6 +1833,7 @@ impl Bot {
             let pending = PendingArchive {
                 user_id,
                 caption,
+                archive_file_name: file_name.clone(),
                 entries,
                 confirm_before_upload: profile.archive_confirm,
                 created_at: now_ts(),
@@ -1794,6 +1858,7 @@ impl Bot {
                 chat_id,
                 token,
                 count,
+                archive_file_name = file_name.as_deref().unwrap_or(""),
                 needs_prefix,
                 confirm_before_upload = profile.archive_confirm,
                 "archive staged"
@@ -1822,12 +1887,15 @@ impl Bot {
                     chat_id,
                     user_id,
                     token,
-                    ArchivePreviewFollowup::Confirm { count },
+                    ArchivePreviewFollowup::Confirm {
+                        count,
+                        archive_file_name: file_name,
+                    },
                 );
                 return Ok(());
             }
             return self
-                .send_archive_confirmation(chat_id, &token, count, None)
+                .send_archive_confirmation(chat_id, &token, count, None, file_name.as_deref())
                 .await;
         }
 
@@ -1862,20 +1930,10 @@ impl Bot {
         token: &str,
         count: usize,
         prefix: Option<&str>,
+        archive_file_name: Option<&str>,
     ) -> Result<()> {
         let keyboard = InlineKeyboardMarkup {
-            inline_keyboard: vec![vec![
-                InlineKeyboardButton {
-                    text: "✅ Confirm upload".to_string(),
-                    callback_data: Some(format!("arc:ok:{token}")),
-                    url: None,
-                },
-                InlineKeyboardButton {
-                    text: "✖ Cancel".to_string(),
-                    callback_data: Some(format!("arc:no:{token}")),
-                    url: None,
-                },
-            ]],
+            inline_keyboard: archive_confirmation_buttons(token, archive_file_name),
         };
         let image_label = image_count_label(count);
         let text = match prefix {
@@ -1900,7 +1958,7 @@ impl Bot {
         chat_id: i64,
         user_id: i64,
         token: &str,
-        proceed: bool,
+        action: ArchiveConfirmAction,
     ) -> Result<()> {
         let pending = take_pending_archive(token);
         let Some(pending) = pending else {
@@ -1908,7 +1966,7 @@ impl Bot {
                 user_id,
                 chat_id,
                 token,
-                proceed,
+                action = archive_confirm_action_name(&action),
                 "pending archive not found during confirmation"
             );
             return self
@@ -1942,22 +2000,57 @@ impl Bot {
             user_id,
             chat_id,
             token,
-            proceed,
+            action = archive_confirm_action_name(&action),
             count,
             "archive confirmation received"
         );
-        if !proceed {
+        if matches!(action, ArchiveConfirmAction::Cancel) {
             return self
                 .telegram
                 .send_message(chat_id, "✖ Archive upload cancelled.", None)
                 .await;
+        }
+        let mut caption = pending.caption;
+        let mut prefix_message = String::new();
+        if let ArchiveConfirmAction::ArchiveNamePrefix { include_category } = action {
+            let Some(prefix) = archive_name_prefix(pending.archive_file_name.as_deref()) else {
+                return self
+                    .telegram
+                    .send_message(
+                        chat_id,
+                        "This archive does not have a usable filename for a prefix. Send a prefix manually or use Start upload.",
+                        None,
+                    )
+                    .await;
+            };
+
+            let mut profile = self.store.get_profile(user_id).await;
+            profile.filename_prefix = prefix.clone();
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+
+            if include_category
+                && let Some(category) = archive_name_category(pending.archive_file_name.as_deref())
+            {
+                caption = caption_with_archive_category(&caption, &category);
+                prefix_message = format!(
+                    "Using archive filename prefix <code>{}</code> and category <code>{}</code>.\n",
+                    escape_html(&prefix),
+                    escape_html(&category)
+                );
+            } else {
+                prefix_message = format!(
+                    "Using archive filename prefix <code>{}</code>.\n",
+                    escape_html(&prefix)
+                );
+            }
         }
         let image_label = image_count_label(count);
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         self.telegram
             .send_message(
                 chat_id,
-                &format!("Uploading {count} {image_label} to Wikimedia Commons…"),
+                &format!("{prefix_message}Uploading {count} {image_label} to Wikimedia Commons…"),
                 None,
             )
             .await
@@ -1966,7 +2059,7 @@ impl Bot {
             self.config.clone(),
             chat_id,
             user_id,
-            pending.caption,
+            caption,
             pending.entries,
         );
         Ok(())
@@ -2124,6 +2217,7 @@ impl Bot {
 struct PendingArchive {
     user_id: i64,
     caption: String,
+    archive_file_name: Option<String>,
     entries: Vec<crate::archive::ArchiveEntry>,
     confirm_before_upload: bool,
     /// Unix timestamp when staged, for TTL eviction.
@@ -2134,6 +2228,7 @@ struct PendingArchive {
 struct PendingArchiveSummary {
     token: String,
     count: usize,
+    archive_file_name: Option<String>,
     sample_name: Option<String>,
     confirm_before_upload: bool,
     created_at: i64,
@@ -2144,6 +2239,8 @@ struct PendingArchiveSummary {
 struct PendingArchiveManifest {
     user_id: i64,
     caption: String,
+    #[serde(default)]
+    archive_file_name: Option<String>,
     confirm_before_upload: bool,
     created_at: i64,
     entries: Vec<PendingArchiveManifestEntry>,
@@ -2193,6 +2290,7 @@ fn pending_archive_summary_for_user(user_id: i64) -> Option<PendingArchiveSummar
         .map(|(token, pending)| PendingArchiveSummary {
             token: token.clone(),
             count: pending.entries.len(),
+            archive_file_name: pending.archive_file_name.clone(),
             sample_name: pending
                 .entries
                 .iter()
@@ -2271,6 +2369,7 @@ fn persist_pending_archive(token: &str, pending: &PendingArchive) -> Result<()> 
     let manifest = PendingArchiveManifest {
         user_id: pending.user_id,
         caption: pending.caption.clone(),
+        archive_file_name: pending.archive_file_name.clone(),
         confirm_before_upload: pending.confirm_before_upload,
         created_at: pending.created_at,
         entries: manifest_entries,
@@ -2309,6 +2408,7 @@ fn load_pending_archive(token: &str) -> Result<PendingArchive> {
     Ok(PendingArchive {
         user_id: manifest.user_id,
         caption: manifest.caption,
+        archive_file_name: manifest.archive_file_name,
         entries,
         confirm_before_upload: manifest.confirm_before_upload,
         created_at: manifest.created_at,
@@ -2363,6 +2463,7 @@ fn disk_pending_archive_summaries_for_user(user_id: i64, now: i64) -> Vec<Pendin
         summaries.push(PendingArchiveSummary {
             token,
             count: manifest.entries.len(),
+            archive_file_name: manifest.archive_file_name.clone(),
             sample_name: manifest
                 .entries
                 .iter()
@@ -2719,6 +2820,36 @@ fn skip_prefix_keyboard() -> InlineKeyboardMarkup {
     }
 }
 
+#[cfg(feature = "archive")]
+fn archive_confirmation_buttons(
+    token: &str,
+    archive_file_name: Option<&str>,
+) -> Vec<Vec<InlineKeyboardButton>> {
+    let mut rows = vec![vec![InlineKeyboardButton {
+        text: "Start upload".to_string(),
+        callback_data: Some(format!("arc:ok:{token}")),
+        url: None,
+    }]];
+    if archive_name_prefix(archive_file_name).is_some() {
+        rows.push(vec![InlineKeyboardButton {
+            text: "Upload with prefix from archive name".to_string(),
+            callback_data: Some(format!("arc:name:{token}")),
+            url: None,
+        }]);
+        rows.push(vec![InlineKeyboardButton {
+            text: "Upload with prefix and category from archive name".to_string(),
+            callback_data: Some(format!("arc:namecat:{token}")),
+            url: None,
+        }]);
+    }
+    rows.push(vec![InlineKeyboardButton {
+        text: "✖ Cancel".to_string(),
+        callback_data: Some(format!("arc:no:{token}")),
+        url: None,
+    }]);
+    rows
+}
+
 /// Renders a boolean as a human on/off label.
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
@@ -2927,6 +3058,40 @@ fn file_stem(file_name: Option<&str>) -> &str {
         .unwrap_or("")
 }
 
+#[cfg(feature = "archive")]
+fn archive_name_stem(file_name: Option<&str>) -> Option<String> {
+    let stem = file_stem(file_name).trim();
+    if stem.is_empty() {
+        return None;
+    }
+    let stem = stem.split_whitespace().collect::<Vec<_>>().join(" ");
+    if stem.is_empty() { None } else { Some(stem) }
+}
+
+#[cfg(feature = "archive")]
+fn archive_name_prefix(file_name: Option<&str>) -> Option<String> {
+    let mut prefix = archive_name_stem(file_name)?;
+    if !prefix.ends_with('_') {
+        prefix.push('_');
+    }
+    Some(prefix)
+}
+
+#[cfg(feature = "archive")]
+fn archive_name_category(file_name: Option<&str>) -> Option<String> {
+    archive_name_stem(file_name)
+}
+
+#[cfg(feature = "archive")]
+fn caption_with_archive_category(caption: &str, category: &str) -> String {
+    let caption = caption.trim_end();
+    if caption.is_empty() {
+        format!("Categories: {category}")
+    } else {
+        format!("{caption}\nCategories: {category}")
+    }
+}
+
 /// Builds a Commons URL from a canonical `File:`/`Category:` title.
 fn commons_title_url(title: &str) -> String {
     format!(
@@ -2960,8 +3125,10 @@ mod tests {
 #[cfg(all(test, feature = "archive"))]
 mod archive_tests {
     use super::{
-        PENDING_TTL_SECS, archive_entry_needs_filename_prefix, archive_needs_filename_prefix,
-        is_low_memory, parse_mem_available_kb, pending_is_expired, short_id,
+        PENDING_TTL_SECS, PendingArchiveManifest, archive_confirmation_buttons,
+        archive_entry_needs_filename_prefix, archive_name_category, archive_name_prefix,
+        archive_needs_filename_prefix, caption_with_archive_category, is_low_memory,
+        parse_mem_available_kb, pending_is_expired, short_id,
     };
 
     #[test]
@@ -3013,5 +3180,76 @@ mod archive_tests {
             },
         ];
         assert!(archive_needs_filename_prefix(&entries));
+    }
+
+    #[test]
+    fn archive_confirmation_buttons_include_archive_name_actions_between_start_and_cancel() {
+        let rows = archive_confirmation_buttons("abc123", Some("Беларусь 2014.rar"));
+        let labels = rows
+            .iter()
+            .map(|row| row[0].text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "Start upload",
+                "Upload with prefix from archive name",
+                "Upload with prefix and category from archive name",
+                "✖ Cancel",
+            ]
+        );
+        assert_eq!(rows[1][0].callback_data.as_deref(), Some("arc:name:abc123"));
+        assert_eq!(
+            rows[2][0].callback_data.as_deref(),
+            Some("arc:namecat:abc123")
+        );
+    }
+
+    #[test]
+    fn archive_confirmation_buttons_skip_archive_name_actions_without_name() {
+        let rows = archive_confirmation_buttons("abc123", None);
+        let labels = rows
+            .iter()
+            .map(|row| row[0].text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Start upload", "✖ Cancel"]);
+    }
+
+    #[test]
+    fn archive_name_prefix_ends_with_one_underscore() {
+        assert_eq!(
+            archive_name_prefix(Some("Беларусь 2014.rar")).as_deref(),
+            Some("Беларусь 2014_")
+        );
+        assert_eq!(
+            archive_name_prefix(Some("Беларусь_2014_.zip")).as_deref(),
+            Some("Беларусь_2014_")
+        );
+        assert_eq!(archive_name_prefix(Some("  .zip")), None);
+    }
+
+    #[test]
+    fn archive_name_category_uses_archive_stem() {
+        assert_eq!(
+            archive_name_category(Some("Беларусь 2014.rar")).as_deref(),
+            Some("Беларусь 2014")
+        );
+    }
+
+    #[test]
+    fn archive_category_is_added_to_caption_for_one_upload() {
+        let caption = caption_with_archive_category("A caption\nCategories: Existing", "Беларусь");
+        let parsed = crate::commons::parse_caption(&caption);
+        assert_eq!(parsed.description, "A caption");
+        assert_eq!(parsed.categories, vec!["Existing", "Беларусь"]);
+    }
+
+    #[test]
+    fn old_pending_archive_manifest_without_archive_file_name_still_loads() {
+        let manifest: PendingArchiveManifest = serde_json::from_str(
+            r#"{"user_id":1,"caption":"","confirm_before_upload":true,"created_at":1000,"entries":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.archive_file_name, None);
     }
 }
