@@ -781,12 +781,14 @@ fn sanitize_filename_part(input: &str) -> String {
     sanitize_title(&without_emoji)
 }
 
-/// Builds a sanitized Commons filename: `<prefix> <caption text> <original stem>.<ext>`.
+/// Builds a sanitized Commons filename from prefix, caption, and original stem.
 ///
 /// The caption text becomes a descriptive prefix so generic camera names like
 /// `IMG_5638` are acceptable and never collide within an album, while the original stem
-/// keeps each file unique. Newlines collapse to spaces and emoji are dropped. When there
-/// is no usable stem, `unique_token` is appended so files stay unique.
+/// keeps each file unique. A trailing `_` or `-` in the configured prefix is treated as
+/// an explicit separator, so `Belarus_2014_` becomes `Belarus_2014_IMG_5638.jpg`.
+/// Newlines collapse to spaces and emoji are dropped. When there is no usable stem,
+/// `unique_token` is appended so files stay unique.
 pub fn build_filename(
     prefix: &str,
     caption: &str,
@@ -817,8 +819,26 @@ pub fn build_filename(
             parts.push(token);
         }
     }
-    let stem = truncate_bytes(&parts.join(" "), MAX_FILENAME_STEM_BYTES);
+    let stem = truncate_bytes(&join_filename_parts(&parts), MAX_FILENAME_STEM_BYTES);
     format!("{stem}.{}", extension.to_ascii_lowercase())
+}
+
+fn join_filename_parts(parts: &[String]) -> String {
+    let mut result = String::new();
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        if !result.is_empty()
+            && !result.ends_with(' ')
+            && !result.ends_with('_')
+            && !result.ends_with('-')
+        {
+            result.push(' ');
+        }
+        result.push_str(part);
+    }
+    result
 }
 
 /// Truncates a string to at most `max_bytes`, never splitting a UTF-8 char.
@@ -1024,6 +1044,12 @@ mod tests {
     fn filename_uses_caption_prefix_and_original_stem() {
         let name = build_filename("Minsk", "Old town", "IMG_5638", "webp", "AgAD");
         assert_eq!(name, "Minsk Old town IMG_5638.webp");
+    }
+
+    #[test]
+    fn filename_does_not_add_space_after_separator_suffix_prefix() {
+        let name = build_filename("Беларусь_2014_", "", "IMG_3955", "jpg", "AgAD");
+        assert_eq!(name, "Беларусь_2014_IMG_3955.jpg");
     }
 
     #[test]
