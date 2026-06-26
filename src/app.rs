@@ -59,14 +59,16 @@ const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 /// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
 const FILE_SNIFF_BYTES: usize = 512;
+/// How many times an album item without a caption waits for another item's caption.
+const MEDIA_GROUP_CAPTION_WAIT_ATTEMPTS: usize = 10;
+/// Delay between album-caption checks.
+const MEDIA_GROUP_CAPTION_WAIT_MS: u64 = 300;
 
 /// Keeps Telegram's chat action visible while a long operation is running.
-#[cfg(feature = "archive")]
 struct ChatActionGuard {
     stop: std::sync::mpsc::Sender<()>,
 }
 
-#[cfg(feature = "archive")]
 impl ChatActionGuard {
     fn start(telegram: TelegramClient, chat_id: i64, action: &'static str) -> Self {
         let (stop, stopped) = std::sync::mpsc::channel();
@@ -106,7 +108,6 @@ impl ChatActionGuard {
     }
 }
 
-#[cfg(feature = "archive")]
 impl Drop for ChatActionGuard {
     fn drop(&mut self) {
         let _ = self.stop.send(());
@@ -114,7 +115,6 @@ impl Drop for ChatActionGuard {
 }
 
 /// Logs and suppresses failures when sending a best-effort Telegram chat action.
-#[cfg(feature = "archive")]
 async fn send_chat_action_best_effort(telegram: &TelegramClient, chat_id: i64, action: &str) {
     if let Err(error) = telegram.send_chat_action(chat_id, action).await {
         tracing::warn!(
@@ -613,6 +613,7 @@ impl Bot {
             return Ok(());
         };
         let user_id = user.id;
+        self.remember_group_caption(&message).await;
 
         if extract_file(&message).is_some() {
             return self.handle_upload(chat_id, user_id, &message).await;
@@ -1597,31 +1598,9 @@ impl Bot {
             return self.reject_too_large(chat_id).await;
         }
 
-        #[cfg(feature = "archive")]
-        let mut archive_chat_action = if crate::archive::is_archive(file.file_name.as_deref(), &[])
-        {
-            self.telegram.send_chat_action(chat_id, "typing").await.ok();
-            Some(ChatActionGuard::start(
-                self.telegram.clone(),
-                chat_id,
-                "typing",
-            ))
-        } else {
-            None
-        };
+        send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+        let _upload_chat_action = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
 
-        #[cfg(feature = "archive")]
-        if archive_chat_action.is_none() {
-            self.telegram
-                .send_chat_action(chat_id, "upload_document")
-                .await
-                .ok();
-        }
-        #[cfg(not(feature = "archive"))]
-        self.telegram
-            .send_chat_action(chat_id, "upload_document")
-            .await
-            .ok();
         let original = match self
             .telegram
             .resolve_by_file_id(&file.file_id, self.config.max_file_bytes)
@@ -1652,12 +1631,6 @@ impl Bot {
                 }
             };
             if crate::archive::is_archive(file.file_name.as_deref(), &sniff) {
-                if archive_chat_action.is_none() {
-                    self.telegram.send_chat_action(chat_id, "typing").await.ok();
-                    archive_chat_action.get_or_insert_with(|| {
-                        ChatActionGuard::start(self.telegram.clone(), chat_id, "typing")
-                    });
-                }
                 if original.len() > self.config.max_archive_file_bytes {
                     return self.reject_archive_too_large(chat_id).await;
                 }
@@ -1760,9 +1733,24 @@ impl Bot {
     /// Resolves the caption for a message, sharing an album's caption across its photos.
     async fn resolve_caption(&self, message: &Message) -> String {
         if let Some(group_id) = &message.media_group_id {
-            if let Some(caption) = message.caption.as_ref() {
+            if let Some(caption) = message
+                .caption
+                .as_ref()
+                .filter(|caption| !caption.trim().is_empty())
+            {
                 self.store.put_group_caption(group_id, caption).await.ok();
                 return caption.clone();
+            }
+            for _ in 0..MEDIA_GROUP_CAPTION_WAIT_ATTEMPTS {
+                if let Some(caption) = self.store.get_group_caption(group_id).await
+                    && !caption.trim().is_empty()
+                {
+                    return caption;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    MEDIA_GROUP_CAPTION_WAIT_MS,
+                ))
+                .await;
             }
             return self
                 .store
@@ -1771,6 +1759,17 @@ impl Bot {
                 .unwrap_or_default();
         }
         message.caption.clone().unwrap_or_default()
+    }
+
+    /// Stores an album caption before any file download/conversion work starts.
+    async fn remember_group_caption(&self, message: &Message) {
+        let (Some(group_id), Some(caption)) = (&message.media_group_id, &message.caption) else {
+            return;
+        };
+        if caption.trim().is_empty() {
+            return;
+        }
+        self.store.put_group_caption(group_id, caption).await.ok();
     }
 
     /// Sends the post-upload confirmation, honoring the user's link settings.
