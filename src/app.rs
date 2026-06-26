@@ -171,6 +171,7 @@ enum ArchivePreviewFollowup {
     Prefix {
         count: usize,
         sample_name: Option<String>,
+        archive_file_name: Option<String>,
     },
 }
 
@@ -247,12 +248,22 @@ fn spawn_archive_thumbnail_preview(
                 .await
                 .ok();
             }
-            ArchivePreviewFollowup::Prefix { count, sample_name } => {
+            ArchivePreviewFollowup::Prefix {
+                count,
+                sample_name,
+                archive_file_name,
+            } => {
                 let profile = bot.store.get_profile(user_id).await;
                 if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
-                    bot.prompt_archive_prefix(chat_id, count, sample_name.as_deref())
-                        .await
-                        .ok();
+                    bot.prompt_archive_prefix(
+                        chat_id,
+                        count,
+                        sample_name.as_deref(),
+                        Some(&token),
+                        archive_file_name.as_deref(),
+                    )
+                    .await
+                    .ok();
                 }
             }
         }
@@ -615,6 +626,10 @@ impl Bot {
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
         }
+        #[cfg(feature = "archive")]
+        if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+            return self.prompt_current_archive_prefix(chat_id, user_id).await;
+        }
         self.prompt_step(chat_id, profile.onboarding_step).await
     }
 
@@ -668,13 +683,17 @@ impl Bot {
                     .await
             }
             OnboardingStep::AwaitingArchivePrefix => {
-                self.telegram
-                    .send_message(
-                        chat_id,
-                        "Send a <b>filename prefix</b> for the pending archive. A prefix is required because at least one image filename starts with <code>IMG_</code>.",
-                        None,
-                    )
-                    .await
+                #[cfg(feature = "archive")]
+                {
+                    self.prompt_archive_prefix(chat_id, 0, None, None, None)
+                        .await
+                }
+                #[cfg(not(feature = "archive"))]
+                {
+                    self.telegram
+                        .send_message(chat_id, "Archive support is not enabled here.", None)
+                        .await
+                }
             }
             OnboardingStep::Done => {
                 self.telegram
@@ -881,15 +900,7 @@ impl Bot {
             OnboardingStep::AwaitingArchivePrefix => {
                 let pending = pending_archive_summary_for_user(user_id);
                 if text.is_empty() || text.eq_ignore_ascii_case("skip") {
-                    return self
-                        .prompt_archive_prefix(
-                            chat_id,
-                            pending.as_ref().map(|summary| summary.count).unwrap_or(0),
-                            pending
-                                .as_ref()
-                                .and_then(|summary| summary.sample_name.as_deref()),
-                        )
-                        .await;
+                    return self.prompt_current_archive_prefix(chat_id, user_id).await;
                 }
 
                 let Some(pending) = pending else {
@@ -1100,16 +1111,7 @@ impl Bot {
         if data == "onb:skipprefix" {
             #[cfg(feature = "archive")]
             if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
-                let pending = pending_archive_summary_for_user(user_id);
-                return self
-                    .prompt_archive_prefix(
-                        chat_id,
-                        pending.as_ref().map(|summary| summary.count).unwrap_or(0),
-                        pending
-                            .as_ref()
-                            .and_then(|summary| summary.sample_name.as_deref()),
-                    )
-                    .await;
+                return self.prompt_current_archive_prefix(chat_id, user_id).await;
             }
             profile.filename_prefix = String::new();
             profile.onboarding_step = OnboardingStep::Done;
@@ -1506,6 +1508,10 @@ impl Bot {
             } else {
                 profile.onboarding_step
             };
+            #[cfg(feature = "archive")]
+            if step == OnboardingStep::AwaitingArchivePrefix {
+                return self.prompt_current_archive_prefix(chat_id, user_id).await;
+            }
             return self.prompt_step(chat_id, step).await;
         }
         let Some(file) = extract_file(message) else {
@@ -1873,12 +1879,22 @@ impl Bot {
                         chat_id,
                         user_id,
                         token,
-                        ArchivePreviewFollowup::Prefix { count, sample_name },
+                        ArchivePreviewFollowup::Prefix {
+                            count,
+                            sample_name,
+                            archive_file_name: file_name,
+                        },
                     );
                     return Ok(());
                 }
                 return self
-                    .prompt_archive_prefix(chat_id, count, sample_name.as_deref())
+                    .prompt_archive_prefix(
+                        chat_id,
+                        count,
+                        sample_name.as_deref(),
+                        Some(&token),
+                        file_name.as_deref(),
+                    )
                     .await;
             }
             if profile.archive_confirm && persisted {
@@ -1903,12 +1919,50 @@ impl Bot {
             .await
     }
 
+    /// Re-prompts for the current user's staged archive prefix, including any archive-name actions.
+    #[cfg(feature = "archive")]
+    async fn prompt_current_archive_prefix(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        let Some(pending) = pending_archive_summary_for_user(user_id) else {
+            self.clear_archive_prefix_step(user_id).await?;
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "I no longer have the pending archive. Please resend the archive.",
+                    None,
+                )
+                .await;
+        };
+        self.prompt_archive_prefix(
+            chat_id,
+            pending.count,
+            pending.sample_name.as_deref(),
+            Some(&pending.token),
+            pending.archive_file_name.as_deref(),
+        )
+        .await
+    }
+
+    /// Leaves the archive-prefix prompt state if the staged archive flow is being resolved.
+    #[cfg(feature = "archive")]
+    async fn clear_archive_prefix_step(&self, user_id: i64) -> Result<()> {
+        let mut profile = self.store.get_profile(user_id).await;
+        if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+        }
+        Ok(())
+    }
+
     /// Asks for a required filename prefix before continuing an archive upload.
     async fn prompt_archive_prefix(
         &self,
         chat_id: i64,
         count: usize,
         sample_name: Option<&str>,
+        token: Option<&str>,
+        archive_file_name: Option<&str>,
     ) -> Result<()> {
         let sample = sample_name.unwrap_or("IMG_...");
         let image_label = image_count_label(count);
@@ -1920,7 +1974,8 @@ impl Bot {
                 format!(" (for example <code>{}</code>)", escape_html(sample))
             }
         );
-        self.telegram.send_message(chat_id, &text, None).await
+        let keyboard = token.map(|token| archive_prefix_keyboard(token, archive_file_name));
+        self.telegram.send_message(chat_id, &text, keyboard).await
     }
 
     /// Sends the final archive upload confirmation.
@@ -1969,6 +2024,7 @@ impl Bot {
                 action = archive_confirm_action_name(&action),
                 "pending archive not found during confirmation"
             );
+            self.clear_archive_prefix_step(user_id).await?;
             return self
                 .telegram
                 .send_message(
@@ -2005,6 +2061,7 @@ impl Bot {
             "archive confirmation received"
         );
         if matches!(action, ArchiveConfirmAction::Cancel) {
+            self.clear_archive_prefix_step(user_id).await?;
             return self
                 .telegram
                 .send_message(chat_id, "✖ Archive upload cancelled.", None)
@@ -2012,37 +2069,49 @@ impl Bot {
         }
         let mut caption = pending.caption;
         let mut prefix_message = String::new();
-        if let ArchiveConfirmAction::ArchiveNamePrefix { include_category } = action {
-            let Some(prefix) = archive_name_prefix(pending.archive_file_name.as_deref()) else {
-                return self
-                    .telegram
-                    .send_message(
-                        chat_id,
-                        "This archive does not have a usable filename for a prefix. Send a prefix manually or use Start upload.",
-                        None,
-                    )
-                    .await;
-            };
+        match action {
+            ArchiveConfirmAction::ArchiveNamePrefix { include_category } => {
+                let Some(prefix) = archive_name_prefix(pending.archive_file_name.as_deref()) else {
+                    return self
+                        .telegram
+                        .send_message(
+                            chat_id,
+                            "This archive does not have a usable filename for a prefix. Send a prefix manually.",
+                            None,
+                        )
+                        .await;
+                };
 
-            let mut profile = self.store.get_profile(user_id).await;
-            profile.filename_prefix = prefix.clone();
-            touch(&mut profile);
-            self.store.put_profile(user_id, &profile).await?;
+                let mut profile = self.store.get_profile(user_id).await;
+                profile.filename_prefix = prefix.clone();
+                if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
+                    profile.onboarding_step = OnboardingStep::Done;
+                }
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
 
-            if include_category
-                && let Some(category) = archive_name_category(pending.archive_file_name.as_deref())
-            {
-                caption = caption_with_archive_category(&caption, &category);
-                prefix_message = format!(
-                    "Using archive filename prefix <code>{}</code> and category <code>{}</code>.\n",
-                    escape_html(&prefix),
-                    escape_html(&category)
-                );
-            } else {
-                prefix_message = format!(
-                    "Using archive filename prefix <code>{}</code>.\n",
-                    escape_html(&prefix)
-                );
+                if include_category
+                    && let Some(category) =
+                        archive_name_category(pending.archive_file_name.as_deref())
+                {
+                    caption = caption_with_archive_category(&caption, &category);
+                    prefix_message = format!(
+                        "Using archive filename prefix <code>{}</code> and category <code>{}</code>.\n",
+                        escape_html(&prefix),
+                        escape_html(&category)
+                    );
+                } else {
+                    prefix_message = format!(
+                        "Using archive filename prefix <code>{}</code>.\n",
+                        escape_html(&prefix)
+                    );
+                }
+            }
+            ArchiveConfirmAction::Start => {
+                self.clear_archive_prefix_step(user_id).await?;
+            }
+            ArchiveConfirmAction::Cancel => {
+                unreachable!("cancel action is handled before upload starts");
             }
         }
         let image_label = image_count_label(count);
@@ -2821,6 +2890,31 @@ fn skip_prefix_keyboard() -> InlineKeyboardMarkup {
 }
 
 #[cfg(feature = "archive")]
+fn archive_prefix_keyboard(token: &str, archive_file_name: Option<&str>) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    if archive_name_prefix(archive_file_name).is_some() {
+        rows.push(vec![InlineKeyboardButton {
+            text: "Upload with prefix from archive name".to_string(),
+            callback_data: Some(format!("arc:name:{token}")),
+            url: None,
+        }]);
+        rows.push(vec![InlineKeyboardButton {
+            text: "Upload with prefix and category from archive name".to_string(),
+            callback_data: Some(format!("arc:namecat:{token}")),
+            url: None,
+        }]);
+    }
+    rows.push(vec![InlineKeyboardButton {
+        text: "✖ Cancel".to_string(),
+        callback_data: Some(format!("arc:no:{token}")),
+        url: None,
+    }]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+#[cfg(feature = "archive")]
 fn archive_confirmation_buttons(
     token: &str,
     archive_file_name: Option<&str>,
@@ -3127,8 +3221,8 @@ mod archive_tests {
     use super::{
         PENDING_TTL_SECS, PendingArchiveManifest, archive_confirmation_buttons,
         archive_entry_needs_filename_prefix, archive_name_category, archive_name_prefix,
-        archive_needs_filename_prefix, caption_with_archive_category, is_low_memory,
-        parse_mem_available_kb, pending_is_expired, short_id,
+        archive_needs_filename_prefix, archive_prefix_keyboard, caption_with_archive_category,
+        is_low_memory, parse_mem_available_kb, pending_is_expired, short_id,
     };
 
     #[test]
@@ -3213,6 +3307,43 @@ mod archive_tests {
             .map(|row| row[0].text.as_str())
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["Start upload", "✖ Cancel"]);
+    }
+
+    #[test]
+    fn archive_prefix_keyboard_shows_archive_name_actions_and_cancel_without_start() {
+        let keyboard = archive_prefix_keyboard("abc123", Some("Беларусь 2014.rar"));
+        let labels = keyboard
+            .inline_keyboard
+            .iter()
+            .map(|row| row[0].text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "Upload with prefix from archive name",
+                "Upload with prefix and category from archive name",
+                "✖ Cancel",
+            ]
+        );
+        assert_eq!(
+            keyboard.inline_keyboard[0][0].callback_data.as_deref(),
+            Some("arc:name:abc123")
+        );
+        assert_eq!(
+            keyboard.inline_keyboard[1][0].callback_data.as_deref(),
+            Some("arc:namecat:abc123")
+        );
+    }
+
+    #[test]
+    fn archive_prefix_keyboard_without_archive_name_still_allows_cancel() {
+        let keyboard = archive_prefix_keyboard("abc123", None);
+        let labels = keyboard
+            .inline_keyboard
+            .iter()
+            .map(|row| row[0].text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["✖ Cancel"]);
     }
 
     #[test]
