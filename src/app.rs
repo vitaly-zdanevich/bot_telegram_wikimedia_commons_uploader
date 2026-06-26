@@ -132,13 +132,21 @@ fn spawn_archive_upload(
     chat_id: i64,
     user_id: i64,
     caption: String,
+    extra_categories: Vec<String>,
     entries: Vec<crate::archive::ArchiveEntry>,
 ) {
     tokio::spawn(async move {
         let bot = Bot::from_config(config);
         let mut profile = bot.store.get_profile(user_id).await;
         if let Err(error) = bot
-            .upload_entries(chat_id, user_id, &mut profile, &caption, entries)
+            .upload_entries(
+                chat_id,
+                user_id,
+                &mut profile,
+                &caption,
+                &extra_categories,
+                entries,
+            )
             .await
         {
             tracing::error!(
@@ -975,6 +983,7 @@ impl Bot {
                             user_id,
                             &mut profile,
                             &pending_archive.caption,
+                            &[],
                             pending_archive.entries,
                         )
                         .await;
@@ -1391,6 +1400,7 @@ impl Bot {
         &self,
         profile: &Profile,
         caption: &str,
+        extra_categories: &[String],
         original: TelegramFile,
         file_name: Option<&str>,
         mime: Option<&str>,
@@ -1399,7 +1409,11 @@ impl Bot {
         author_username: &str,
     ) -> Result<FileResult> {
         let parsed = parse_caption(caption);
-        let categories = merge_categories(&parsed.categories, &profile.default_categories);
+        let categories = upload_categories(
+            &parsed.categories,
+            extra_categories,
+            &profile.default_categories,
+        );
         let metadata = metadata_from_telegram_file(&original);
 
         // Convert DNG/HEIC/BMP to WebP; pass everything else through if Commons accepts it.
@@ -1658,6 +1672,7 @@ impl Bot {
             .process_one_file(
                 &profile,
                 &caption,
+                &[],
                 original,
                 file.file_name.as_deref(),
                 file.mime.as_deref(),
@@ -1945,7 +1960,7 @@ impl Bot {
                 .await;
         }
 
-        self.upload_entries(chat_id, user_id, profile, &caption, entries)
+        self.upload_entries(chat_id, user_id, profile, &caption, &[], entries)
             .await
     }
 
@@ -2097,7 +2112,8 @@ impl Bot {
                 .send_message(chat_id, "✖ Archive upload cancelled.", None)
                 .await;
         }
-        let mut caption = pending.caption;
+        let caption = pending.caption;
+        let mut extra_categories = Vec::new();
         let mut prefix_message = String::new();
         match action {
             ArchiveConfirmAction::ArchiveNamePrefix { include_category } => {
@@ -2124,7 +2140,7 @@ impl Bot {
                     && let Some(category) =
                         archive_name_category(pending.archive_file_name.as_deref())
                 {
-                    caption = caption_with_archive_category(&caption, &category);
+                    extra_categories.push(category.clone());
                     prefix_message = format!(
                         "Using archive filename prefix <code>{}</code> and category <code>{}</code>.\n",
                         escape_html(&prefix),
@@ -2159,6 +2175,7 @@ impl Bot {
             chat_id,
             user_id,
             caption,
+            extra_categories,
             pending.entries,
         );
         Ok(())
@@ -2171,6 +2188,7 @@ impl Bot {
         user_id: i64,
         profile: &mut Profile,
         caption: &str,
+        extra_categories: &[String],
         entries: Vec<crate::archive::ArchiveEntry>,
     ) -> Result<()> {
         let entry_count = entries.len();
@@ -2212,6 +2230,7 @@ impl Bot {
                 .process_one_file(
                     profile,
                     caption,
+                    extra_categories,
                     TelegramFile::Bytes(entry.bytes),
                     Some(&entry.name),
                     None,
@@ -2783,6 +2802,20 @@ fn merge_categories(caption_categories: &[String], default_categories: &[String]
     merged
 }
 
+fn upload_categories(
+    caption_categories: &[String],
+    extra_categories: &[String],
+    default_categories: &[String],
+) -> Vec<String> {
+    let mut explicit_categories = Vec::new();
+    for category in caption_categories.iter().chain(extra_categories.iter()) {
+        if !category.is_empty() && !explicit_categories.contains(category) {
+            explicit_categories.push(category.clone());
+        }
+    }
+    merge_categories(&explicit_categories, default_categories)
+}
+
 /// Parses a comma-separated category list from a settings command.
 fn parse_category_list(value: &str) -> Vec<String> {
     value
@@ -3203,16 +3236,11 @@ fn archive_name_prefix(file_name: Option<&str>) -> Option<String> {
 
 #[cfg(feature = "archive")]
 fn archive_name_category(file_name: Option<&str>) -> Option<String> {
-    archive_name_stem(file_name)
-}
-
-#[cfg(feature = "archive")]
-fn caption_with_archive_category(caption: &str, category: &str) -> String {
-    let caption = caption.trim_end();
-    if caption.is_empty() {
-        format!("Categories: {category}")
+    let category = crate::commons::sanitize_title(&archive_name_stem(file_name)?);
+    if category.is_empty() {
+        None
     } else {
-        format!("{caption}\nCategories: {category}")
+        Some(category)
     }
 }
 
@@ -3251,8 +3279,8 @@ mod archive_tests {
     use super::{
         PENDING_TTL_SECS, PendingArchiveManifest, archive_confirmation_buttons,
         archive_entry_needs_filename_prefix, archive_name_category, archive_name_prefix,
-        archive_needs_filename_prefix, archive_prefix_keyboard, caption_with_archive_category,
-        is_low_memory, parse_mem_available_kb, pending_is_expired, short_id,
+        archive_needs_filename_prefix, archive_prefix_keyboard, is_low_memory,
+        parse_mem_available_kb, pending_is_expired, short_id, upload_categories,
     };
 
     #[test]
@@ -3398,11 +3426,20 @@ mod archive_tests {
     }
 
     #[test]
-    fn archive_category_is_added_to_caption_for_one_upload() {
-        let caption = caption_with_archive_category("A caption\nCategories: Existing", "Беларусь");
-        let parsed = crate::commons::parse_caption(&caption);
-        assert_eq!(parsed.description, "A caption");
-        assert_eq!(parsed.categories, vec!["Existing", "Беларусь"]);
+    fn archive_name_category_with_commas_stays_single_category() {
+        let category =
+            archive_name_category(Some("2014,_Минск,Боруны,_Гольшаны,_и_еще_что_то.rar")).unwrap();
+        let parsed = crate::commons::parse_caption("A caption\nCategories: Existing, Another");
+        let categories =
+            upload_categories(&parsed.categories, std::slice::from_ref(&category), &[]);
+        assert_eq!(
+            categories,
+            vec![
+                "Existing".to_string(),
+                "Another".to_string(),
+                "2014,_Минск,Боруны,_Гольшаны,_и_еще_что_то".to_string(),
+            ]
+        );
     }
 
     #[test]
