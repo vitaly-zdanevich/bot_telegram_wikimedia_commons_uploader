@@ -13,8 +13,8 @@ const MAX_FILENAME_STEM_BYTES: usize = 200;
 
 /// Client for the Wikimedia Commons Action API.
 ///
-/// Each upload logs in with the user's own bot password over a fresh cookie session,
-/// so the file is attributed to that user's Commons account.
+/// Bot-password uploads use the user's own account; archive uploads can reuse one
+/// cookie session across the batch.
 #[derive(Clone)]
 pub struct CommonsClient {
     api_url: String,
@@ -49,6 +49,11 @@ pub enum UploadAuth {
         /// OAuth access token secret.
         secret: String,
     },
+}
+
+/// A logged-in bot-password Commons session.
+pub struct CommonsBotPasswordSession {
+    client: Client,
 }
 
 /// One upload request.
@@ -150,13 +155,61 @@ impl CommonsClient {
         username: &str,
         password: &str,
     ) -> Result<UploadOutcome> {
-        let client = self.session_client()?;
-        if let Err(error) = self.login(&client, username, password).await {
-            return Ok(UploadOutcome::Failed {
+        match self.login_bot_password_client(username, password).await {
+            Ok(client) => self.upload_logged_in(&client, request).await,
+            Err(error) => Ok(UploadOutcome::Failed {
                 message: format!("{error}"),
-            });
+            }),
         }
-        let csrf_token = self.fetch_token(&client, "csrf").await?;
+    }
+
+    /// Opens one logged-in bot-password session for repeated uploads.
+    pub async fn bot_password_session(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<CommonsBotPasswordSession> {
+        self.login_bot_password_client(username, password)
+            .await
+            .map(|client| CommonsBotPasswordSession { client })
+    }
+
+    async fn login_bot_password_client(&self, username: &str, password: &str) -> Result<Client> {
+        let mut attempt = 1;
+        loop {
+            let client = self.session_client()?;
+            if let Err(error) = self.login(&client, username, password).await {
+                let message = format!("{error}");
+                if attempt == 1 && is_transient_login_failure(&message) {
+                    tracing::warn!(
+                        username,
+                        error = %message,
+                        "Commons bot-password login session expired; retrying once"
+                    );
+                    attempt += 1;
+                    continue;
+                }
+                bail!("{message}");
+            }
+            return Ok(client);
+        }
+    }
+
+    /// Uploads through an already logged-in bot-password session.
+    pub async fn upload_with_bot_password_session(
+        &self,
+        session: &CommonsBotPasswordSession,
+        request: &UploadRequest,
+    ) -> Result<UploadOutcome> {
+        self.upload_logged_in(&session.client, request).await
+    }
+
+    async fn upload_logged_in(
+        &self,
+        client: &Client,
+        request: &UploadRequest,
+    ) -> Result<UploadOutcome> {
+        let csrf_token = self.fetch_token(client, "csrf").await?;
         let response: Value = client
             .post(&self.api_url)
             .multipart(build_upload_form(request, &csrf_token).await?)
@@ -404,8 +457,22 @@ fn login_failure_reason(login: Option<&Value>, fallback: &str) -> String {
     }
 }
 
+fn is_transient_login_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unable to continue login")
+        || lower.contains("session most likely timed out")
+        || lower.contains("session timed out")
+}
+
 /// Builds the user-facing message for a failed bot-password login, including recovery steps.
 fn login_failure_message(reason: &str) -> String {
+    if is_transient_login_failure(reason) {
+        return format!(
+            "❌ Couldn't log in to Commons because Commons expired the login session while \
+             connecting: {reason}.\n\nThis is usually transient. Please retry the upload; if it \
+             repeats, run /start to reconnect your account."
+        );
+    }
     format!(
         "❌ Couldn't log in to Commons: {reason}.\n\nYour bot password may be wrong, expired, or \
          revoked. Create a fresh one at https://commons.wikimedia.org/wiki/Special:BotPasswords \
@@ -1224,6 +1291,16 @@ mod tests {
         assert!(message.contains("WrongPass"));
         assert!(message.contains("/start"));
         assert!(message.contains("Special:BotPasswords"));
+    }
+
+    #[test]
+    fn transient_login_failure_message_says_retry() {
+        let reason = "Unable to continue login. Your session most likely timed out.";
+        let message = super::login_failure_message(reason);
+        assert!(super::is_transient_login_failure(reason));
+        assert!(message.contains("usually transient"));
+        assert!(message.contains("Please retry"));
+        assert!(!message.contains("bot password may be wrong"));
     }
 
     #[test]

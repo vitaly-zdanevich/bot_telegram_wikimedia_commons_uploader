@@ -1,6 +1,6 @@
 use crate::commons::{
-    CommonsClient, DescriptionParams, UploadAuth, UploadData, UploadOutcome, UploadRequest,
-    build_filename, build_wikitext, category_url, parse_caption,
+    CommonsBotPasswordSession, CommonsClient, DescriptionParams, UploadAuth, UploadData,
+    UploadOutcome, UploadRequest, build_filename, build_wikitext, category_url, parse_caption,
 };
 use crate::config::Config;
 use crate::convert;
@@ -1406,6 +1406,7 @@ impl Bot {
         mime: Option<&str>,
         unique_id: &str,
         auth: &UploadAuth,
+        bot_password_session: Option<&CommonsBotPasswordSession>,
         author_username: &str,
     ) -> Result<FileResult> {
         let parsed = parse_caption(caption);
@@ -1504,16 +1505,20 @@ impl Bot {
             provenance: &provenance,
         });
 
-        let outcome = self
-            .commons
-            .upload(&UploadRequest {
-                auth: auth.clone(),
-                filename: filename.clone(),
-                data: upload_data,
-                wikitext,
-                comment: format!("Uploaded via Telegram bot {BOT_USERNAME}"),
-            })
-            .await?;
+        let request = UploadRequest {
+            auth: auth.clone(),
+            filename: filename.clone(),
+            data: upload_data,
+            wikitext,
+            comment: format!("Uploaded via Telegram bot {BOT_USERNAME}"),
+        };
+        let outcome = if let Some(session) = bot_password_session {
+            self.commons
+                .upload_with_bot_password_session(session, &request)
+                .await?
+        } else {
+            self.commons.upload(&request).await?
+        };
 
         Ok(match outcome {
             UploadOutcome::Success { url, .. } => FileResult::Uploaded {
@@ -1678,6 +1683,7 @@ impl Bot {
                 file.mime.as_deref(),
                 &file.file_unique_id,
                 &auth,
+                None,
                 &author_username,
             )
             .await?;
@@ -2201,6 +2207,20 @@ impl Bot {
                     .await;
             }
         };
+        let bot_password_session = match &auth {
+            UploadAuth::BotPassword { username, password } => {
+                match self.commons.bot_password_session(username, password).await {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        return self
+                            .telegram
+                            .send_message(chat_id, &escape_html(&format!("{error}")), None)
+                            .await;
+                    }
+                }
+            }
+            UploadAuth::OAuth { .. } => None,
+        };
 
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         let _typing = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
@@ -2236,6 +2256,7 @@ impl Bot {
                     None,
                     &unique,
                     &auth,
+                    bot_password_session.as_ref(),
                     &author_username,
                 )
                 .await
