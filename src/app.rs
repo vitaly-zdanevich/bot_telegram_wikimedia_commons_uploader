@@ -132,6 +132,7 @@ fn spawn_archive_upload(
     chat_id: i64,
     user_id: i64,
     caption: String,
+    filename_prefix: Option<String>,
     extra_categories: Vec<String>,
     entries: Vec<crate::archive::ArchiveEntry>,
 ) {
@@ -144,6 +145,7 @@ fn spawn_archive_upload(
                 user_id,
                 &mut profile,
                 &caption,
+                filename_prefix.as_deref(),
                 &extra_categories,
                 entries,
             )
@@ -942,29 +944,42 @@ impl Bot {
                 }
 
                 let Some(pending) = pending else {
-                    profile.filename_prefix = text.to_string();
                     profile.onboarding_step = OnboardingStep::Done;
                     touch(&mut profile);
                     self.store.put_profile(user_id, &profile).await?;
-                    let text = format!(
-                        "Filename prefix set to <code>{}</code>, but I no longer have the pending archive. Please resend the archive.",
-                        escape_html(&profile.filename_prefix)
-                    );
-                    return self.telegram.send_message(chat_id, &text, None).await;
+                    return self
+                        .telegram
+                        .send_message(
+                            chat_id,
+                            "I no longer have the pending archive. Please resend the archive.",
+                            None,
+                        )
+                        .await;
                 };
 
-                profile.filename_prefix = text.to_string();
+                let filename_prefix = text.to_string();
                 profile.onboarding_step = OnboardingStep::Done;
                 touch(&mut profile);
                 self.store.put_profile(user_id, &profile).await?;
 
                 if pending.confirm_before_upload {
+                    if let Err(error) =
+                        set_pending_archive_filename_prefix(&pending.token, filename_prefix.clone())
+                    {
+                        tracing::warn!(
+                            user_id,
+                            chat_id,
+                            token = %pending.token,
+                            error = %format!("{error:#}"),
+                            "failed to store pending archive filename prefix"
+                        );
+                    }
                     return self
                         .send_archive_confirmation(
                             chat_id,
                             &pending.token,
                             pending.count,
-                            Some(&profile.filename_prefix),
+                            Some(&filename_prefix),
                             pending.archive_file_name.as_deref(),
                         )
                         .await;
@@ -974,7 +989,7 @@ impl Bot {
                 if let Some(pending_archive) = pending_archive {
                     let text = format!(
                         "Filename prefix set to <code>{}</code>. Uploading archive…",
-                        escape_html(&profile.filename_prefix)
+                        escape_html(&filename_prefix)
                     );
                     self.telegram.send_message(chat_id, &text, None).await.ok();
                     return self
@@ -983,6 +998,7 @@ impl Bot {
                             user_id,
                             &mut profile,
                             &pending_archive.caption,
+                            Some(&filename_prefix),
                             &[],
                             pending_archive.entries,
                         )
@@ -1400,6 +1416,7 @@ impl Bot {
         &self,
         profile: &Profile,
         caption: &str,
+        filename_prefix: Option<&str>,
         extra_categories: &[String],
         original: TelegramFile,
         file_name: Option<&str>,
@@ -1466,10 +1483,17 @@ impl Bot {
 
         // Build the filename: caption text as a descriptive prefix and the original stem
         // for per-file uniqueness (emoji dropped, newlines collapsed by build_filename).
-        let filename = build_filename(
+        let original_stem = file_stem(file_name);
+        let filename_prefix = effective_filename_prefix(
             &profile.filename_prefix,
+            filename_prefix,
             &parsed.description,
-            file_stem(file_name),
+            original_stem,
+        );
+        let filename = build_filename(
+            filename_prefix,
+            &parsed.description,
+            original_stem,
             &extension,
             unique_id,
         );
@@ -1677,6 +1701,7 @@ impl Bot {
             .process_one_file(
                 &profile,
                 &caption,
+                None,
                 &[],
                 original,
                 file.file_name.as_deref(),
@@ -1890,6 +1915,7 @@ impl Bot {
             let pending = PendingArchive {
                 user_id,
                 caption,
+                filename_prefix: None,
                 archive_file_name: file_name.clone(),
                 entries,
                 confirm_before_upload: profile.archive_confirm,
@@ -1966,7 +1992,7 @@ impl Bot {
                 .await;
         }
 
-        self.upload_entries(chat_id, user_id, profile, &caption, &[], entries)
+        self.upload_entries(chat_id, user_id, profile, &caption, None, &[], entries)
             .await
     }
 
@@ -2119,6 +2145,7 @@ impl Bot {
                 .await;
         }
         let caption = pending.caption;
+        let mut filename_prefix = pending.filename_prefix;
         let mut extra_categories = Vec::new();
         let mut prefix_message = String::new();
         match action {
@@ -2133,14 +2160,9 @@ impl Bot {
                         )
                         .await;
                 };
+                self.clear_archive_prefix_step(user_id).await?;
 
-                let mut profile = self.store.get_profile(user_id).await;
-                profile.filename_prefix = prefix.clone();
-                if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
-                    profile.onboarding_step = OnboardingStep::Done;
-                }
-                touch(&mut profile);
-                self.store.put_profile(user_id, &profile).await?;
+                filename_prefix = Some(prefix.clone());
 
                 if include_category
                     && let Some(category) =
@@ -2161,6 +2183,12 @@ impl Bot {
             }
             ArchiveConfirmAction::Start => {
                 self.clear_archive_prefix_step(user_id).await?;
+                if let Some(prefix) = &filename_prefix {
+                    prefix_message = format!(
+                        "Using filename prefix <code>{}</code>.\n",
+                        escape_html(prefix)
+                    );
+                }
             }
             ArchiveConfirmAction::Cancel => {
                 unreachable!("cancel action is handled before upload starts");
@@ -2181,6 +2209,7 @@ impl Bot {
             chat_id,
             user_id,
             caption,
+            filename_prefix,
             extra_categories,
             pending.entries,
         );
@@ -2188,12 +2217,14 @@ impl Bot {
     }
 
     /// Uploads every extracted image, replying with an aggregate summary.
+    #[allow(clippy::too_many_arguments)]
     async fn upload_entries(
         &self,
         chat_id: i64,
         user_id: i64,
         profile: &mut Profile,
         caption: &str,
+        filename_prefix: Option<&str>,
         extra_categories: &[String],
         entries: Vec<crate::archive::ArchiveEntry>,
     ) -> Result<()> {
@@ -2250,6 +2281,7 @@ impl Bot {
                 .process_one_file(
                     profile,
                     caption,
+                    filename_prefix,
                     extra_categories,
                     TelegramFile::Bytes(entry.bytes),
                     Some(&entry.name),
@@ -2356,6 +2388,7 @@ impl Bot {
 struct PendingArchive {
     user_id: i64,
     caption: String,
+    filename_prefix: Option<String>,
     archive_file_name: Option<String>,
     entries: Vec<crate::archive::ArchiveEntry>,
     confirm_before_upload: bool,
@@ -2378,6 +2411,8 @@ struct PendingArchiveSummary {
 struct PendingArchiveManifest {
     user_id: i64,
     caption: String,
+    #[serde(default)]
+    filename_prefix: Option<String>,
     #[serde(default)]
     archive_file_name: Option<String>,
     confirm_before_upload: bool,
@@ -2484,6 +2519,31 @@ fn take_pending_archive(token: &str) -> Option<PendingArchive> {
 }
 
 #[cfg(feature = "archive")]
+fn set_pending_archive_filename_prefix(token: &str, filename_prefix: String) -> Result<()> {
+    let mut map = archive_pending().lock().unwrap();
+    if let Some(pending) = map.get_mut(token) {
+        pending.filename_prefix = Some(filename_prefix.clone());
+    }
+    drop(map);
+
+    let manifest_path = pending_archive_manifest_path(token);
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let mut manifest = read_pending_archive_manifest(token)?;
+    manifest.filename_prefix = Some(filename_prefix);
+    let manifest_bytes =
+        serde_json::to_vec(&manifest).context("failed to serialize pending archive manifest")?;
+    std::fs::write(&manifest_path, manifest_bytes).with_context(|| {
+        format!(
+            "failed to write pending archive manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "archive")]
 fn persist_pending_archive(token: &str, pending: &PendingArchive) -> Result<()> {
     let dir = pending_archive_token_dir(token);
     if dir.exists() {
@@ -2508,6 +2568,7 @@ fn persist_pending_archive(token: &str, pending: &PendingArchive) -> Result<()> 
     let manifest = PendingArchiveManifest {
         user_id: pending.user_id,
         caption: pending.caption.clone(),
+        filename_prefix: pending.filename_prefix.clone(),
         archive_file_name: pending.archive_file_name.clone(),
         confirm_before_upload: pending.confirm_before_upload,
         created_at: pending.created_at,
@@ -2547,6 +2608,7 @@ fn load_pending_archive(token: &str) -> Result<PendingArchive> {
     Ok(PendingArchive {
         user_id: manifest.user_id,
         caption: manifest.caption,
+        filename_prefix: manifest.filename_prefix,
         archive_file_name: manifest.archive_file_name,
         entries,
         confirm_before_upload: manifest.confirm_before_upload,
@@ -3236,6 +3298,21 @@ fn file_stem(file_name: Option<&str>) -> &str {
         .unwrap_or("")
 }
 
+fn effective_filename_prefix<'a>(
+    profile_prefix: &'a str,
+    upload_prefix: Option<&'a str>,
+    caption_description: &str,
+    original_stem: &str,
+) -> &'a str {
+    if let Some(upload_prefix) = upload_prefix {
+        return upload_prefix;
+    }
+    if original_stem.starts_with("IMG_") && !caption_description.trim().is_empty() {
+        return "";
+    }
+    profile_prefix
+}
+
 #[cfg(feature = "archive")]
 fn archive_name_stem(file_name: Option<&str>) -> Option<String> {
     let stem = file_stem(file_name).trim();
@@ -3275,7 +3352,8 @@ fn commons_title_url(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_categories, parse_category_list};
+    use super::{effective_filename_prefix, merge_categories, parse_category_list};
+    use crate::commons::{build_filename, parse_caption};
 
     #[test]
     fn merges_and_deduplicates_categories() {
@@ -3292,6 +3370,33 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
+    }
+
+    #[test]
+    fn img_filename_uses_caption_instead_of_stored_prefix() {
+        let parsed = parse_caption("Храм Вознесения Господня\n📍Ждановичи");
+        let prefix = effective_filename_prefix(
+            "2014,_Минск,Боруны,_Гольшаны,_и_еще_что_то_",
+            None,
+            &parsed.description,
+            "IMG_1910",
+        );
+        let filename = build_filename(prefix, &parsed.description, "IMG_1910", "webp", "x");
+
+        assert_eq!(prefix, "");
+        assert_eq!(filename, "Храм Вознесения Господня Ждановичи IMG_1910.webp");
+    }
+
+    #[test]
+    fn explicit_upload_prefix_wins_for_img_filename() {
+        let prefix = effective_filename_prefix(
+            "Stored default",
+            Some("Archive_"),
+            "Храм Вознесения Господня",
+            "IMG_1910",
+        );
+
+        assert_eq!(prefix, "Archive_");
     }
 }
 
@@ -3469,6 +3574,7 @@ mod archive_tests {
             r#"{"user_id":1,"caption":"","confirm_before_upload":true,"created_at":1000,"entries":[]}"#,
         )
         .unwrap();
+        assert_eq!(manifest.filename_prefix, None);
         assert_eq!(manifest.archive_file_name, None);
     }
 }
