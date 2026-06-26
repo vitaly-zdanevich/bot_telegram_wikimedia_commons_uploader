@@ -299,26 +299,56 @@ async fn send_archive_thumbnail_preview(
                     .with_context(|| format!("failed to read archive preview {}", path.display()));
             }
         };
-        let preview = if resize {
-            convert::make_thumbnail(&bytes, 320).map(|thumb| (thumb, "thumb.jpg".to_string()))
+        if resize {
+            let preview =
+                convert::make_thumbnail(&bytes, 320).map(|thumb| (thumb, "thumb.jpg".to_string()));
+            let Some((photo, file_name)) = preview else {
+                continue;
+            };
+            if let Err(error) = telegram
+                .send_photo(chat_id, photo, &file_name, Some(&entry.name), None)
+                .await
+            {
+                tracing::warn!(
+                    chat_id,
+                    token,
+                    name = %entry.name,
+                    resize,
+                    error = %format!("{error:#}"),
+                    "failed to send archive thumbnail"
+                );
+            }
         } else {
-            Some((bytes, entry.name.clone()))
-        };
-        let Some((photo, file_name)) = preview else {
-            continue;
-        };
-        if let Err(error) = telegram
-            .send_photo(chat_id, photo, &file_name, Some(&entry.name), None)
-            .await
-        {
-            tracing::warn!(
-                chat_id,
-                token,
-                name = %entry.name,
-                resize,
-                error = %format!("{error:#}"),
-                "failed to send archive thumbnail"
-            );
+            match telegram
+                .send_photo(chat_id, bytes.clone(), &entry.name, Some(&entry.name), None)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        chat_id,
+                        token,
+                        name = %entry.name,
+                        error = %format!("{error:#}"),
+                        "failed to send original archive preview; trying resized thumbnail"
+                    );
+                    let Some(thumb) = convert::make_thumbnail(&bytes, 320) else {
+                        continue;
+                    };
+                    if let Err(error) = telegram
+                        .send_photo(chat_id, thumb, "thumb.jpg", Some(&entry.name), None)
+                        .await
+                    {
+                        tracing::warn!(
+                            chat_id,
+                            token,
+                            name = %entry.name,
+                            error = %format!("{error:#}"),
+                            "failed to send resized archive thumbnail fallback"
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(true)

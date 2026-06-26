@@ -118,9 +118,9 @@ toggles control the flow:
 - **Confirm before upload** (on by default) — send thumbnails of all previewable images and
   a **Confirm upload** / **Cancel** button; nothing is uploaded until you confirm. If an
   archive contains a generic `IMG_...` filename, the bot asks for a filename prefix before
-  upload. Archive previews send the original extracted image by default; set
-  `ARCHIVE_THUMBNAIL_RESIZE=true` (Terraform: `archive_thumbnail_resize = true`) to resize
-  previews to small JPEG thumbnails first.
+  upload. Archive previews try the original extracted image by default and fall back to a small
+  JPEG thumbnail if Telegram rejects the original preview; set `ARCHIVE_THUMBNAIL_RESIZE=true`
+  (Terraform: `archive_thumbnail_resize = true`) to resize previews first.
 
 ZIP works out of the box (pure Rust). **RAR** shells out to a system extractor at runtime —
 `unar` (free, in Debian main) preferred, `unrar` as fallback — behind the extra `rar` Cargo
