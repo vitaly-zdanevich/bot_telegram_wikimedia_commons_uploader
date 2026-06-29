@@ -7,7 +7,7 @@ use crate::convert;
 use crate::crypto::Cipher;
 use crate::metadata;
 use crate::models::{
-    CallbackQuery, License, Message, OnboardingStep, Profile, Update, UploadProvenance,
+    CallbackQuery, DngMode, License, Message, OnboardingStep, Profile, Update, UploadProvenance,
 };
 use crate::oauth::{Consumer, OAuthClient, OAuthEndpoints};
 use crate::store::Store;
@@ -1126,6 +1126,10 @@ impl Bot {
             );
             return Ok(());
         };
+        let callback_message_id = callback
+            .message
+            .as_ref()
+            .and_then(|message| message.message_id);
         tracing::info!(
             user_id,
             chat_id,
@@ -1189,8 +1193,14 @@ impl Bot {
             }
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
-            let text = format!("License set to <b>{}</b>.", escape_html(license.label()));
-            return self.telegram.send_message(chat_id, &text, None).await;
+            return self
+                .replace_settings_message(
+                    chat_id,
+                    callback_message_id,
+                    &profile,
+                    settings_keyboard(&profile),
+                )
+                .await;
         }
 
         if data == "onb:oauth" {
@@ -1226,39 +1236,103 @@ impl Bot {
                 .await;
         }
 
-        let (label, value) = match data.as_str() {
+        if data == "set:license" {
+            return self
+                .replace_settings_message(
+                    chat_id,
+                    callback_message_id,
+                    &profile,
+                    settings_license_keyboard(&profile),
+                )
+                .await;
+        }
+
+        if data == "set:main" {
+            return self
+                .replace_settings_message(
+                    chat_id,
+                    callback_message_id,
+                    &profile,
+                    settings_keyboard(&profile),
+                )
+                .await;
+        }
+
+        let changed = match data.as_str() {
             "set:links" => {
                 profile.return_upload_links = !profile.return_upload_links;
-                ("Return upload links", profile.return_upload_links)
+                true
             }
             "set:catlinks" => {
                 profile.return_category_links = !profile.return_category_links;
-                ("Return category links", profile.return_category_links)
+                true
             }
             "set:misscat" => {
                 profile.return_missing_category_links = !profile.return_missing_category_links;
-                (
-                    "Return non-existing category links",
-                    profile.return_missing_category_links,
-                )
+                true
             }
             #[cfg(feature = "archive")]
             "set:arclist" => {
                 profile.return_archive_file_list = !profile.return_archive_file_list;
-                ("Return archive file list", profile.return_archive_file_list)
+                true
             }
             #[cfg(feature = "archive")]
             "set:arcconfirm" => {
                 profile.archive_confirm = !profile.archive_confirm;
-                ("Confirm archive before upload", profile.archive_confirm)
+                true
             }
-            _ => return Ok(()),
+            "set:dng" => {
+                profile.dng_mode = profile.dng_mode.toggled();
+                true
+            }
+            _ => false,
         };
+        if !changed {
+            return Ok(());
+        }
         touch(&mut profile);
         self.store.put_profile(user_id, &profile).await?;
-        let text = format!("{label}: <b>{}</b>", on_off(value));
+        self.replace_settings_message(
+            chat_id,
+            callback_message_id,
+            &profile,
+            settings_keyboard(&profile),
+        )
+        .await
+    }
+
+    /// Replaces a settings message in place; falls back only when Telegram gives no editable id.
+    async fn replace_settings_message(
+        &self,
+        chat_id: i64,
+        message_id: Option<i64>,
+        profile: &Profile,
+        reply_markup: InlineKeyboardMarkup,
+    ) -> Result<()> {
+        if let Some(message_id) = message_id {
+            match self
+                .telegram
+                .edit_message_text(
+                    chat_id,
+                    message_id,
+                    &settings_overview(profile),
+                    Some(reply_markup.clone()),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(
+                        chat_id,
+                        message_id,
+                        error = %format!("{error:#}"),
+                        "failed to edit settings message; sending a fresh settings message"
+                    );
+                }
+            }
+        }
         self.telegram
-            .send_message(chat_id, &text, Some(settings_keyboard(&profile)))
+            .send_message(chat_id, &settings_overview(profile), Some(reply_markup))
             .await
     }
 
@@ -1311,7 +1385,24 @@ impl Bot {
                     self.telegram
                         .send_message(
                             chat_id,
-                            "Unknown license. Use one of: cc-by-4.0, cc-by-sa-4.0, cc-zero.",
+                            "Unknown license. Use one of: cc-by-4.0, cc-by-sa-4.0, cc-zero, PD-Russia-expired, PD-Russia, PD-RusEmpire.",
+                            None,
+                        )
+                        .await
+                }
+            }
+            "dng" => {
+                if let Some(mode) = DngMode::parse(rest) {
+                    profile.dng_mode = mode;
+                    touch(&mut profile);
+                    self.store.put_profile(user_id, &profile).await?;
+                    let text = format!("DNG handling: <b>{}</b>.", escape_html(mode.label()));
+                    self.telegram.send_message(chat_id, &text, None).await
+                } else {
+                    self.telegram
+                        .send_message(
+                            chat_id,
+                            "Unknown DNG mode. Use <code>/settings dng webp</code> or <code>/settings dng extract</code>.",
                             None,
                         )
                         .await
@@ -1402,7 +1493,7 @@ impl Bot {
         let conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). DNG, HEIC and BMP are converted to WebP automatically (HEIC→WebP; DNG is developed from raw, or its embedded full-resolution JPEG is extracted).\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP; /settings can switch DNG to embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -1503,7 +1594,12 @@ impl Bot {
             let original = original.into_bytes()?;
             provenance.original_sha1 = Some(sha1_hex(&original));
             provenance.original_md5 = Some(md5_hex(&original));
-            match convert::convert(&original, format, self.config.webp_quality) {
+            match convert::convert(
+                &original,
+                format,
+                self.config.webp_quality,
+                profile.dng_mode,
+            ) {
                 Ok((bytes, ext)) => (UploadData::Bytes(bytes), ext.to_string()),
                 Err(error) => {
                     return Ok(FileResult::Rejected {
@@ -3027,11 +3123,12 @@ fn settings_overview(profile: &Profile) -> String {
         profile.default_categories.join(", ")
     };
     let mut text = format!(
-        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nReturn upload links: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
+        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
         escape_html(&account),
         escape_html(profile.license.label()),
         escape_html(&prefix),
         escape_html(&categories),
+        escape_html(profile.dng_mode.label()),
         on_off(profile.return_upload_links),
         on_off(profile.return_category_links),
         on_off(profile.return_missing_category_links),
@@ -3045,12 +3142,12 @@ fn settings_overview(profile: &Profile) -> String {
         ));
     }
     text.push_str(
-        "\n\nButtons below toggle options and the license.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>",
+        "\n\nButtons below toggle options; License opens a chooser.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
     );
     text
 }
 
-/// Builds the settings inline keyboard (toggles plus license picker).
+/// Builds the main settings inline keyboard.
 fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
     let mut rows = vec![
         vec![toggle_button(
@@ -3068,6 +3165,7 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             "set:misscat",
             profile.return_missing_category_links,
         )],
+        vec![dng_mode_button(profile.dng_mode)],
     ];
     #[cfg(feature = "archive")]
     {
@@ -3082,7 +3180,7 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             profile.archive_confirm,
         )]);
     }
-    rows.extend(license_keyboard().inline_keyboard);
+    rows.push(vec![settings_license_button(profile.license)]);
     InlineKeyboardMarkup {
         inline_keyboard: rows,
     }
@@ -3094,6 +3192,55 @@ fn toggle_button(label: &str, data: &str, value: bool) -> InlineKeyboardButton {
         text: format!("{label}: {}", on_off(value)),
         callback_data: Some(data.to_string()),
         url: None,
+    }
+}
+
+/// Builds the DNG mode toggle button.
+fn dng_mode_button(mode: DngMode) -> InlineKeyboardButton {
+    InlineKeyboardButton {
+        text: format!("DNG: {}", mode.label()),
+        callback_data: Some("set:dng".to_string()),
+        url: None,
+    }
+}
+
+/// Builds the compact settings entry point for the license submenu.
+fn settings_license_button(license: License) -> InlineKeyboardButton {
+    InlineKeyboardButton {
+        text: format!("License: {}", license.label()),
+        callback_data: Some("set:license".to_string()),
+        url: None,
+    }
+}
+
+/// Builds the settings license submenu.
+fn settings_license_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = License::all()
+        .iter()
+        .map(|license| {
+            let selected = if *license == profile.license {
+                "✓ "
+            } else {
+                ""
+            };
+            vec![InlineKeyboardButton {
+                text: format!("{selected}{}", license.label()),
+                callback_data: Some(format!(
+                    "{}{}",
+                    crate::telegram::LICENSE_CALLBACK_PREFIX,
+                    license.as_key()
+                )),
+                url: None,
+            }]
+        })
+        .collect();
+    rows.push(vec![InlineKeyboardButton {
+        text: "← Back to settings".to_string(),
+        callback_data: Some("set:main".to_string()),
+        url: None,
+    }]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
     }
 }
 
@@ -3467,9 +3614,10 @@ fn commons_title_url(title: &str) -> String {
 mod tests {
     use super::{
         effective_filename_prefix, filename_needs_descriptive_context, merge_categories,
-        parse_category_list,
+        parse_category_list, settings_keyboard, settings_license_keyboard,
     };
     use crate::commons::{build_filename, parse_caption};
+    use crate::models::{License, Profile};
 
     #[test]
     fn merges_and_deduplicates_categories() {
@@ -3529,6 +3677,65 @@ mod tests {
             "IMG_1910"
         ));
         assert!(!filename_needs_descriptive_context("", "", "DSC_1910"));
+    }
+
+    #[test]
+    fn settings_keyboard_uses_single_license_submenu_button() {
+        let profile = Profile {
+            license: License::CcBySa40,
+            ..Profile::default()
+        };
+        let keyboard = settings_keyboard(&profile);
+
+        let license_buttons: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .filter(|button| button.callback_data.as_deref() == Some("set:license"))
+            .collect();
+        assert_eq!(license_buttons.len(), 1);
+        assert_eq!(license_buttons[0].text, "License: CC BY-SA 4.0");
+        assert!(
+            keyboard
+                .inline_keyboard
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|button| !button
+                    .callback_data
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(crate::telegram::LICENSE_CALLBACK_PREFIX))
+        );
+    }
+
+    #[test]
+    fn settings_license_keyboard_lists_licenses_and_back() {
+        let profile = Profile {
+            license: License::Cc0,
+            ..Profile::default()
+        };
+        let keyboard = settings_license_keyboard(&profile);
+        let callbacks: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|button| button.callback_data.as_deref().unwrap_or_default())
+            .collect();
+
+        assert!(callbacks.contains(&"license:cc-by-4.0"));
+        assert!(callbacks.contains(&"license:cc-by-sa-4.0"));
+        assert!(callbacks.contains(&"license:cc-zero"));
+        assert!(callbacks.contains(&"license:PD-Russia-expired"));
+        assert!(callbacks.contains(&"license:PD-Russia"));
+        assert!(callbacks.contains(&"license:PD-RusEmpire"));
+        assert_eq!(callbacks.last(), Some(&"set:main"));
+        assert!(
+            keyboard
+                .inline_keyboard
+                .iter()
+                .flatten()
+                .any(|button| button.text == "✓ CC0 (public domain)")
+        );
     }
 }
 

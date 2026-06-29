@@ -1022,11 +1022,11 @@ fn render_license(override_license: Option<&str>, license: License) -> String {
     {
         Some(value) if value.starts_with("{{") => value.to_string(),
         Some(value) => match License::parse(value) {
-            Some(parsed) => format!("{{{{self|{}}}}}", parsed.as_key()),
+            Some(parsed) => parsed.wikitext(),
             None if value.contains(char::is_whitespace) => value.to_string(),
             None => format!("{{{{{value}}}}}"),
         },
-        None => format!("{{{{self|{}}}}}", license.as_key()),
+        None => license.wikitext(),
     }
 }
 
@@ -1208,6 +1208,28 @@ mod tests {
         assert!(wikitext.contains("|source=https://example.com/cat/"));
         assert!(wikitext.contains("|author=John Doe"));
         assert!(!wikitext.contains("{{own}}"));
+    }
+
+    #[test]
+    fn wikitext_renders_public_domain_license_templates_directly() {
+        let provenance = UploadProvenance::default();
+        let wikitext = build_wikitext(&DescriptionParams {
+            description: "Old photo",
+            author_username: "Example@uploader",
+            author_override: None,
+            source: None,
+            license: License::PdRussiaExpired,
+            license_override: None,
+            lang: None,
+            categories: &[],
+            date: "2026-06-20",
+            latitude: None,
+            longitude: None,
+            provenance: &provenance,
+        });
+
+        assert!(wikitext.contains("{{PD-Russia-expired}}"));
+        assert!(!wikitext.contains("{{self|PD-Russia-expired}}"));
     }
 
     #[test]

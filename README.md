@@ -22,8 +22,8 @@ with DynamoDB for per-user settings. Designed to stay within the AWS free tier.
    page), never your real password. You get a username like `YourName@telegram` and a password.
 2. Send the bot-password **username**, then the **bot password** (the bot deletes your
    message immediately and stores it **AES-256-GCM encrypted**).
-3. Pick a **license** (default **CC BY 4.0**, also CC BY-SA 4.0 or CC0) and an optional
-   **filename prefix**.
+3. Pick a **license** (default **CC BY 4.0**; also CC BY-SA 4.0, CC0,
+   PD-Russia-expired, PD-Russia, or PD-RusEmpire) and an optional **filename prefix**.
 4. Send a photo or file. It is uploaded to Commons with a generated `{{Information}}`
    page, license, categories, geotag, and provenance.
 
@@ -86,7 +86,7 @@ Converted first, because Commons does **not** accept them:
 
 | Input | Converted to | Notes |
 | ----- | ------------ | ----- |
-| DNG (raw) | WebP (lossy) | developed from the raw, or the **embedded full-resolution JPEG** is extracted when the camera is unsupported; original SHA-1/MD5 + filename recorded |
+| DNG (raw) | WebP (lossy) by default, or embedded JPEG | default is raw development to WebP; `/settings dng extract` uploads the DNG's embedded JPEG preview instead; original SHA-1/MD5 + filename recorded |
 | HEIC/HEIF | WebP (lossy) | decoded with libheif; needs the libheif build (see below) |
 | BMP | WebP (lossless) | |
 
@@ -116,7 +116,7 @@ toggles control the flow:
 
 - **Show file list** (off by default) — reply with the names of the images found.
 - **Confirm before upload** (on by default) — send thumbnails of all previewable images and
-  a **Confirm upload** / **Cancel** button; nothing is uploaded until you confirm. If an
+  a **Start upload** / **Cancel** button; nothing is uploaded until you confirm. If an
   archive contains a generic `IMG_...` filename, the bot asks for a filename prefix before
   upload. Archive previews try the original extracted image by default and fall back to a small
   JPEG thumbnail if Telegram rejects the original preview; set `ARCHIVE_THUMBNAIL_RESIZE=true`
@@ -132,9 +132,9 @@ add it to the build `Aptfile`). Archives are disabled on the Lambda build becaus
 
 - `/start` — connect your account / resume setup
 - `/help` — usage, your uploads link, related projects, contact
-- `/settings` — license, filename prefix, default categories, and toggles: return upload links
-  (**on** by default), return category links (**off**), return non-existing category links
-  (**off**).
+- `/settings` — license, filename prefix, default categories, DNG handling, and toggles:
+  return upload links (**on** by default), return category links (**off**), return
+  non-existing category links (**off**).
   On the server build, two more: show an archive's file list (**off**), and require a
   thumbnail + **Confirm** step before uploading an archive (**on**)
 - `/forget` — delete your stored credentials and settings

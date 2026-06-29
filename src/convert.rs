@@ -1,3 +1,4 @@
+use crate::models::DngMode;
 use anyhow::{Context, Result, anyhow, bail};
 
 /// File extensions Wikimedia Commons accepts for upload (lower-case, without dot).
@@ -97,31 +98,38 @@ pub fn classify(file_name: Option<&str>, mime: Option<&str>, bytes: &[u8]) -> So
 
 /// Converts a file into an uploadable form, returning `(bytes, extension)`.
 ///
-/// DNG develops to WebP; if imagepipe can't develop the raw, the embedded full-resolution
-/// JPEG is uploaded **as-is** (extension `jpg`, no re-encode). HEIC and BMP become WebP.
+/// DNG develops to WebP; if imagepipe can't develop the raw, ImageMagick is used as a
+/// second raw decoder. HEIC and BMP become WebP.
 /// Pass-through inputs are rejected.
 pub fn convert(
     bytes: &[u8],
     source: SourceFormat,
     quality: f32,
+    dng_mode: DngMode,
 ) -> Result<(Vec<u8>, &'static str)> {
     match source {
-        SourceFormat::Dng => convert_dng(bytes, quality),
+        SourceFormat::Dng => convert_dng(bytes, quality, dng_mode),
         SourceFormat::Heic => Ok((encode_webp_lossy(&decode_heic(bytes)?, quality)?, "webp")),
         SourceFormat::Bmp => Ok((encode_webp_lossless(&decode_bmp(bytes)?)?, "webp")),
         SourceFormat::PassThrough => bail!("pass-through files must not be converted"),
     }
 }
 
-/// Converts a DNG: develop the raw to WebP, otherwise upload the embedded JPEG as-is.
-fn convert_dng(bytes: &[u8], quality: f32) -> Result<(Vec<u8>, &'static str)> {
-    match develop_raw(bytes) {
-        Ok(image) => Ok((encode_webp_lossy(&image, quality)?, "webp")),
-        Err(develop_error) => match extract_largest_valid_jpeg(bytes) {
+/// Converts a DNG according to the user's mode: raw development to WebP, or embedded JPEG.
+fn convert_dng(bytes: &[u8], quality: f32, dng_mode: DngMode) -> Result<(Vec<u8>, &'static str)> {
+    match dng_mode {
+        DngMode::ConvertToWebp => match develop_raw(bytes) {
+            Ok(image) => Ok((encode_webp_lossy(&image, quality)?, "webp")),
+            Err(develop_error) => match develop_dng_with_imagemagick(bytes, quality) {
+                Ok(webp) => Ok((webp, "webp")),
+                Err(magick_error) => bail!(
+                    "could not decode DNG with imagepipe ({develop_error}); ImageMagick fallback failed ({magick_error})"
+                ),
+            },
+        },
+        DngMode::ExtractEmbeddedJpeg => match extract_largest_valid_jpeg(bytes) {
             Some(jpeg) => Ok((jpeg.to_vec(), "jpg")),
-            None => bail!(
-                "could not decode DNG ({develop_error}); no usable embedded JPEG preview found"
-            ),
+            None => bail!("no usable embedded JPEG preview found in DNG"),
         },
     }
 }
@@ -153,14 +161,64 @@ fn develop_raw(bytes: &[u8]) -> Result<RawRgb> {
     })
 }
 
-/// Returns the bytes of the largest embedded JPEG that decodes cleanly (the full preview).
+/// Develops a DNG through ImageMagick's raw decoder and returns WebP bytes.
+fn develop_dng_with_imagemagick(bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let dir = tempfile::tempdir().context("failed to create temp directory for DNG conversion")?;
+    let input_path = dir.path().join("input.dng");
+    let output_path = dir.path().join("output.webp");
+    let mut input =
+        std::fs::File::create(&input_path).context("failed to create temporary DNG file")?;
+    input
+        .write_all(bytes)
+        .context("failed to write temporary DNG file")?;
+    drop(input);
+
+    let quality = format!("{:.0}", quality.clamp(1.0, 100.0));
+    let mut errors = Vec::new();
+    for program in ["magick", "convert"] {
+        let output = match std::process::Command::new(program)
+            .arg(&input_path)
+            .arg("-auto-orient")
+            .arg("-colorspace")
+            .arg("sRGB")
+            .arg("-quality")
+            .arg(&quality)
+            .arg(&output_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                errors.push(format!("{program}: failed to launch: {error}"));
+                continue;
+            }
+        };
+        if output.status.success() {
+            let webp =
+                std::fs::read(&output_path).context("ImageMagick did not write WebP output")?;
+            if webp.is_empty() {
+                bail!("ImageMagick wrote empty WebP output");
+            }
+            return Ok(webp);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        errors.push(format!(
+            "{program}: exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    bail!("{}", errors.join("; "))
+}
+
+/// Returns the bytes of the largest embedded JPEG that decodes cleanly.
 fn extract_largest_valid_jpeg(bytes: &[u8]) -> Option<&[u8]> {
     jpeg_spans_largest_first(bytes)
         .into_iter()
         .find(|span| image::load_from_memory_with_format(span, image::ImageFormat::Jpeg).is_ok())
 }
 
-/// Returns byte ranges that look like complete JPEG streams (SOI…EOI), largest first.
+/// Returns byte ranges that look like complete JPEG streams (SOI...EOI), largest first.
 fn jpeg_spans_largest_first(bytes: &[u8]) -> Vec<&[u8]> {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;

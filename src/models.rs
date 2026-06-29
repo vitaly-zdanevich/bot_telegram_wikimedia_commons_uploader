@@ -10,12 +10,25 @@ pub enum License {
     CcBySa40,
     /// Creative Commons Zero 1.0 Universal (public domain dedication).
     Cc0,
+    /// Public domain in Russia because copyright expired.
+    PdRussiaExpired,
+    /// Public domain in Russia.
+    PdRussia,
+    /// Public domain in the Russian Empire.
+    PdRusEmpire,
 }
 
 impl License {
     /// Lists every license in the order shown on the picker keyboard.
-    pub fn all() -> [License; 3] {
-        [License::CcBy40, License::CcBySa40, License::Cc0]
+    pub fn all() -> [License; 6] {
+        [
+            License::CcBy40,
+            License::CcBySa40,
+            License::Cc0,
+            License::PdRussiaExpired,
+            License::PdRussia,
+            License::PdRusEmpire,
+        ]
     }
 
     /// Parses a stored value or callback key, accepting a few aliases.
@@ -24,17 +37,24 @@ impl License {
             "cc-by-4.0" | "cc_by_4.0" | "ccby40" | "cc-by" => Some(License::CcBy40),
             "cc-by-sa-4.0" | "cc_by_sa_4.0" | "ccbysa40" | "cc-by-sa" => Some(License::CcBySa40),
             "cc-zero" | "cc0" | "cc0-1.0" | "cc-0" => Some(License::Cc0),
+            "pd-russia-expired" | "pd_russia_expired" => Some(License::PdRussiaExpired),
+            "pd-russia" | "pd_russia" => Some(License::PdRussia),
+            "pd-rusempire" | "pd-rus-empire" | "pd_rusempire" | "pd_rus_empire" => {
+                Some(License::PdRusEmpire)
+            }
             _ => None,
         }
     }
 
-    /// Returns the stable storage/callback key, identical to the Commons
-    /// `{{self|...}}` template name.
+    /// Returns the stable storage/callback key.
     pub fn as_key(self) -> &'static str {
         match self {
             License::CcBy40 => "cc-by-4.0",
             License::CcBySa40 => "cc-by-sa-4.0",
             License::Cc0 => "cc-zero",
+            License::PdRussiaExpired => "PD-Russia-expired",
+            License::PdRussia => "PD-Russia",
+            License::PdRusEmpire => "PD-RusEmpire",
         }
     }
 
@@ -44,6 +64,75 @@ impl License {
             License::CcBy40 => "CC BY 4.0",
             License::CcBySa40 => "CC BY-SA 4.0",
             License::Cc0 => "CC0 (public domain)",
+            License::PdRussiaExpired => "PD-Russia-expired",
+            License::PdRussia => "PD-Russia",
+            License::PdRusEmpire => "PD-RusEmpire",
+        }
+    }
+
+    /// Renders the Commons license template for this configured license.
+    pub fn wikitext(self) -> String {
+        match self {
+            License::CcBy40 | License::CcBySa40 | License::Cc0 => {
+                format!("{{{{self|{}}}}}", self.as_key())
+            }
+            License::PdRussiaExpired | License::PdRussia | License::PdRusEmpire => {
+                format!("{{{{{}}}}}", self.as_key())
+            }
+        }
+    }
+}
+
+/// How incoming DNG raw files are turned into a Commons-accepted upload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DngMode {
+    /// Develop the raw image and upload a WebP.
+    #[default]
+    ConvertToWebp,
+    /// Extract and upload the DNG's embedded JPEG preview.
+    ExtractEmbeddedJpeg,
+}
+
+impl DngMode {
+    /// Parses a stored value or settings command alias.
+    pub fn parse(value: &str) -> Option<DngMode> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "convert" | "webp" | "convert-to-webp" | "convert_to_webp" | "develop" | "raw" => {
+                Some(DngMode::ConvertToWebp)
+            }
+            "extract"
+            | "jpeg"
+            | "jpg"
+            | "embedded"
+            | "embedded-jpeg"
+            | "embedded_jpeg"
+            | "extract-embedded-jpeg"
+            | "extract_embedded_jpeg" => Some(DngMode::ExtractEmbeddedJpeg),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable storage key.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            DngMode::ConvertToWebp => "convert-to-webp",
+            DngMode::ExtractEmbeddedJpeg => "extract-embedded-jpeg",
+        }
+    }
+
+    /// Returns the label shown in settings.
+    pub fn label(self) -> &'static str {
+        match self {
+            DngMode::ConvertToWebp => "convert to WebP",
+            DngMode::ExtractEmbeddedJpeg => "extract embedded JPEG",
+        }
+    }
+
+    /// Returns the other mode for the settings toggle button.
+    pub fn toggled(self) -> DngMode {
+        match self {
+            DngMode::ConvertToWebp => DngMode::ExtractEmbeddedJpeg,
+            DngMode::ExtractEmbeddedJpeg => DngMode::ConvertToWebp,
         }
     }
 }
@@ -134,6 +223,8 @@ pub struct Profile {
     pub return_archive_file_list: bool,
     /// Whether to show archive thumbnails and require a Confirm tap (on by default).
     pub archive_confirm: bool,
+    /// How DNG raw files are uploaded.
+    pub dng_mode: DngMode,
     /// Number of successful uploads (for admin stats).
     pub uploads_count: u64,
     /// Unix timestamp of profile creation.
@@ -162,6 +253,7 @@ impl Default for Profile {
             return_missing_category_links: false,
             return_archive_file_list: false,
             archive_confirm: true,
+            dng_mode: DngMode::default(),
             uploads_count: 0,
             created_at: 0,
             updated_at: 0,
@@ -333,7 +425,7 @@ pub struct Video {
 
 #[cfg(test)]
 mod tests {
-    use super::{License, OnboardingStep, Profile};
+    use super::{DngMode, License, OnboardingStep, Profile};
 
     #[test]
     fn license_parse_round_trips_keys() {
@@ -341,7 +433,14 @@ mod tests {
             assert_eq!(License::parse(license.as_key()), Some(license));
         }
         assert_eq!(License::parse("CC0"), Some(License::Cc0));
+        assert_eq!(
+            License::parse("PD-Russia-expired"),
+            Some(License::PdRussiaExpired)
+        );
+        assert_eq!(License::parse("pd-rus-empire"), Some(License::PdRusEmpire));
         assert_eq!(License::parse("nonsense"), None);
+        assert_eq!(License::CcBy40.wikitext(), "{{self|cc-by-4.0}}");
+        assert_eq!(License::PdRussiaExpired.wikitext(), "{{PD-Russia-expired}}");
     }
 
     #[test]
@@ -358,6 +457,32 @@ mod tests {
             assert_eq!(OnboardingStep::parse(step.as_str()), Some(step));
         }
         assert_eq!(OnboardingStep::parse("bogus"), None);
+    }
+
+    #[test]
+    fn dng_mode_parses_labels_and_toggles() {
+        assert_eq!(
+            DngMode::parse("convert-to-webp"),
+            Some(DngMode::ConvertToWebp)
+        );
+        assert_eq!(
+            DngMode::parse("extract"),
+            Some(DngMode::ExtractEmbeddedJpeg)
+        );
+        assert_eq!(DngMode::parse("bogus"), None);
+        assert_eq!(DngMode::ConvertToWebp.as_key(), "convert-to-webp");
+        assert_eq!(
+            DngMode::ExtractEmbeddedJpeg.label(),
+            "extract embedded JPEG"
+        );
+        assert_eq!(
+            DngMode::ConvertToWebp.toggled(),
+            DngMode::ExtractEmbeddedJpeg
+        );
+        assert_eq!(
+            DngMode::ExtractEmbeddedJpeg.toggled(),
+            DngMode::ConvertToWebp
+        );
     }
 
     #[test]

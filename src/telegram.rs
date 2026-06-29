@@ -118,6 +118,28 @@ impl TelegramClient {
         Ok(())
     }
 
+    /// Edits one HTML-formatted message in place.
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        if let Some(markup) = reply_markup {
+            payload["reply_markup"] = serde_json::to_value(markup)?;
+        }
+        self.post_json("editMessageText", &payload).await?;
+        Ok(())
+    }
+
     /// Deletes a message; used to scrub the user's bot-password message from the chat.
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
         self.post_json(

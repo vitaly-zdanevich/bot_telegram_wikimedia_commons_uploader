@@ -1,6 +1,6 @@
 use crate::aws::AwsJsonClient;
 use crate::config::Config;
-use crate::models::{License, OnboardingStep, Profile};
+use crate::models::{DngMode, License, OnboardingStep, Profile};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde_json::{Value, json};
@@ -347,6 +347,7 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
         "return_missing_category_links": {"BOOL": profile.return_missing_category_links},
         "return_archive_file_list": {"BOOL": profile.return_archive_file_list},
         "archive_confirm": {"BOOL": profile.archive_confirm},
+        "dng_mode": {"S": profile.dng_mode.as_key()},
         "uploads_count": {"N": profile.uploads_count.to_string()},
         "created_at": {"N": profile.created_at.to_string()},
         "updated_at": {"N": profile.updated_at.to_string()},
@@ -404,6 +405,9 @@ fn item_to_profile(item: &Value) -> Profile {
             .unwrap_or(false),
         return_archive_file_list: attr_bool(item, "return_archive_file_list").unwrap_or(false),
         archive_confirm: attr_bool(item, "archive_confirm").unwrap_or(true),
+        dng_mode: attr_string(item, "dng_mode")
+            .and_then(|value| DngMode::parse(&value))
+            .unwrap_or_default(),
         uploads_count: attr_i64(item, "uploads_count").unwrap_or(0).max(0) as u64,
         created_at: attr_i64(item, "created_at").unwrap_or(0),
         updated_at: attr_i64(item, "updated_at").unwrap_or(0),
@@ -463,6 +467,7 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             return_missing_category_links INTEGER NOT NULL DEFAULT 0,
             return_archive_file_list INTEGER NOT NULL DEFAULT 0,
             archive_confirm INTEGER NOT NULL DEFAULT 1,
+            dng_mode TEXT NOT NULL DEFAULT 'convert-to-webp',
             uploads_count INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
@@ -489,6 +494,18 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
 #[cfg(feature = "sqlite")]
 fn run_sqlite_migrations(connection: &mut rusqlite::Connection) -> Result<()> {
     let transaction = connection.transaction()?;
+    let columns = {
+        let mut statement = transaction.prepare("PRAGMA table_info(profiles)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if !columns.iter().any(|column| column == "dng_mode") {
+        transaction.execute(
+            "ALTER TABLE profiles ADD COLUMN dng_mode TEXT NOT NULL DEFAULT 'convert-to-webp'",
+            [],
+        )?;
+    }
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES ('return_upload_links_default_on', strftime('%s', 'now'))",
         [],
@@ -508,7 +525,7 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
@@ -533,6 +550,7 @@ fn sqlite_load_profile(
                 license_override: row.get(15)?,
                 return_archive_file_list: row.get::<_, i64>(16)? != 0,
                 archive_confirm: row.get::<_, i64>(17)? != 0,
+                dng_mode: DngMode::parse(&row.get::<_, String>(20)?).unwrap_or_default(),
             })
         },
     );
@@ -553,7 +571,7 @@ fn sqlite_put_profile(
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -576,6 +594,7 @@ fn sqlite_put_profile(
             profile.archive_confirm as i64,
             profile.oauth_ciphertext,
             profile.oauth_pending_ciphertext,
+            profile.dng_mode.as_key(),
         ],
     )?;
     Ok(())
@@ -650,7 +669,7 @@ mod tests {
         IDEMPOTENCY_RAM, is_conditional_check_failed, item_to_profile, profile_to_item,
         reserve_in_ram,
     };
-    use crate::models::{License, OnboardingStep, Profile};
+    use crate::models::{DngMode, License, OnboardingStep, Profile};
 
     #[test]
     fn profile_round_trips_through_dynamodb_json() {
@@ -672,6 +691,7 @@ mod tests {
             return_missing_category_links: false,
             return_archive_file_list: false,
             archive_confirm: true,
+            dng_mode: DngMode::ExtractEmbeddedJpeg,
             uploads_count: 12,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_500,
@@ -786,6 +806,7 @@ mod tests {
             return_missing_category_links: true,
             return_archive_file_list: true,
             archive_confirm: false,
+            dng_mode: DngMode::ExtractEmbeddedJpeg,
             uploads_count: 5,
             created_at: 1,
             updated_at: 2,
