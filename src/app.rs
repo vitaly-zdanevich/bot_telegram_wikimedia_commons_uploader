@@ -1493,7 +1493,7 @@ impl Bot {
         let conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP; /settings can switch DNG to embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -1602,8 +1602,22 @@ impl Bot {
             ) {
                 Ok((bytes, ext)) => (UploadData::Bytes(bytes), ext.to_string()),
                 Err(error) => {
+                    tracing::warn!(
+                        file_name = ?file_name,
+                        mime = ?mime,
+                        unique_id,
+                        source_format = ?format,
+                        dng_mode = ?profile.dng_mode,
+                        error = %format!("{error:#}"),
+                        "file conversion failed"
+                    );
                     return Ok(FileResult::Rejected {
-                        reason: format!("Couldn't convert this file: {error}"),
+                        reason: conversion_rejection_reason(
+                            format,
+                            profile.dng_mode,
+                            &original,
+                            &error,
+                        ),
                     });
                 }
             }
@@ -1888,7 +1902,7 @@ impl Bot {
             }
             FileResult::Rejected { reason } => {
                 let text = format!(
-                    "❌ {}.\n\nAccepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). DNG, HEIC and BMP are converted automatically.",
+                    "❌ {}.\n\nAccepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). HEIC and BMP are converted automatically. DNG handling is configurable in /settings.",
                     escape_html(&reason)
                 );
                 self.telegram.send_message(chat_id, &text, None).await
@@ -3106,6 +3120,25 @@ fn parse_category_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Converts a low-level conversion failure into a user-facing rejection reason.
+fn conversion_rejection_reason(
+    format: convert::SourceFormat,
+    dng_mode: DngMode,
+    original: &[u8],
+    error: &anyhow::Error,
+) -> String {
+    match (format, dng_mode) {
+        (convert::SourceFormat::Dng, DngMode::ConvertToWebp) => {
+            debug_assert!(!convert::dng_has_embedded_jpeg(original));
+            "This DNG cannot be developed into WebP on this server, and I could not find a usable embedded JPEG preview. Export it to JPEG, TIFF, or WebP first.".to_string()
+        }
+        (convert::SourceFormat::Dng, DngMode::ExtractEmbeddedJpeg) => {
+            "This DNG does not contain a usable embedded JPEG preview. Run /settings dng webp and resend it, or export it to JPEG, TIFF, or WebP first.".to_string()
+        }
+        _ => format!("Couldn't convert this file: {error}"),
+    }
+}
+
 /// Builds the settings overview message.
 fn settings_overview(profile: &Profile) -> String {
     let account = profile
@@ -3613,11 +3646,12 @@ fn commons_title_url(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_filename_prefix, filename_needs_descriptive_context, merge_categories,
-        parse_category_list, settings_keyboard, settings_license_keyboard,
+        conversion_rejection_reason, effective_filename_prefix, filename_needs_descriptive_context,
+        merge_categories, parse_category_list, settings_keyboard, settings_license_keyboard,
     };
     use crate::commons::{build_filename, parse_caption};
-    use crate::models::{License, Profile};
+    use crate::convert::SourceFormat;
+    use crate::models::{DngMode, License, Profile};
 
     #[test]
     fn merges_and_deduplicates_categories() {
@@ -3736,6 +3770,19 @@ mod tests {
                 .flatten()
                 .any(|button| button.text == "✓ CC0 (public domain)")
         );
+    }
+
+    #[test]
+    fn dng_conversion_error_suggests_export_without_preview() {
+        let reason = conversion_rejection_reason(
+            SourceFormat::Dng,
+            DngMode::ConvertToWebp,
+            b"II*\0not-a-jpeg",
+            &anyhow::anyhow!("decoder failed"),
+        );
+
+        assert!(reason.contains("Export it to JPEG, TIFF, or WebP first"));
+        assert!(!reason.contains("decoder failed"));
     }
 }
 

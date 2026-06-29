@@ -123,7 +123,7 @@ impl DngMode {
     /// Returns the label shown in settings.
     pub fn label(self) -> &'static str {
         match self {
-            DngMode::ConvertToWebp => "convert to WebP",
+            DngMode::ConvertToWebp => "convert to WebP, fallback JPEG",
             DngMode::ExtractEmbeddedJpeg => "extract embedded JPEG",
         }
     }
@@ -471,6 +471,10 @@ mod tests {
         );
         assert_eq!(DngMode::parse("bogus"), None);
         assert_eq!(DngMode::ConvertToWebp.as_key(), "convert-to-webp");
+        assert_eq!(
+            DngMode::ConvertToWebp.label(),
+            "convert to WebP, fallback JPEG"
+        );
         assert_eq!(
             DngMode::ExtractEmbeddedJpeg.label(),
             "extract embedded JPEG"

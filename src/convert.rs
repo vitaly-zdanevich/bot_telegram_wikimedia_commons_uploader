@@ -98,8 +98,8 @@ pub fn classify(file_name: Option<&str>, mime: Option<&str>, bytes: &[u8]) -> So
 
 /// Converts a file into an uploadable form, returning `(bytes, extension)`.
 ///
-/// DNG develops to WebP; if imagepipe can't develop the raw, ImageMagick is used as a
-/// second raw decoder. HEIC and BMP become WebP.
+/// DNG develops to WebP; if raw decoding fails, a valid embedded JPEG preview is uploaded.
+/// HEIC and BMP become WebP.
 /// Pass-through inputs are rejected.
 pub fn convert(
     bytes: &[u8],
@@ -115,16 +115,23 @@ pub fn convert(
     }
 }
 
-/// Converts a DNG according to the user's mode: raw development to WebP, or embedded JPEG.
+/// Converts a DNG according to the user's mode:
+/// raw development to WebP with JPEG fallback, or embedded JPEG directly.
 fn convert_dng(bytes: &[u8], quality: f32, dng_mode: DngMode) -> Result<(Vec<u8>, &'static str)> {
     match dng_mode {
         DngMode::ConvertToWebp => match develop_raw(bytes) {
             Ok(image) => Ok((encode_webp_lossy(&image, quality)?, "webp")),
-            Err(develop_error) => match develop_dng_with_imagemagick(bytes, quality) {
-                Ok(webp) => Ok((webp, "webp")),
-                Err(magick_error) => bail!(
-                    "could not decode DNG with imagepipe ({develop_error}); ImageMagick fallback failed ({magick_error})"
-                ),
+            Err(develop_error) => match develop_dng_with_libraw(bytes) {
+                Ok(image) => Ok((encode_webp_lossy(&image, quality)?, "webp")),
+                Err(libraw_error) => match develop_dng_with_imagemagick(bytes, quality) {
+                    Ok(webp) => Ok((webp, "webp")),
+                    Err(magick_error) => match extract_largest_valid_jpeg(bytes) {
+                        Some(jpeg) => Ok((jpeg.to_vec(), "jpg")),
+                        None => bail!(
+                            "could not decode DNG with imagepipe ({develop_error}); LibRaw fallback failed ({libraw_error}); ImageMagick fallback failed ({magick_error}); no usable embedded JPEG preview found"
+                        ),
+                    },
+                },
             },
         },
         DngMode::ExtractEmbeddedJpeg => match extract_largest_valid_jpeg(bytes) {
@@ -132,6 +139,11 @@ fn convert_dng(bytes: &[u8], quality: f32, dng_mode: DngMode) -> Result<(Vec<u8>
             None => bail!("no usable embedded JPEG preview found in DNG"),
         },
     }
+}
+
+/// Returns true when a DNG-like byte stream contains a decodable embedded JPEG preview.
+pub fn dng_has_embedded_jpeg(bytes: &[u8]) -> bool {
+    extract_largest_valid_jpeg(bytes).is_some()
 }
 
 /// Returns the upload extension for a pass-through file.
@@ -158,6 +170,43 @@ fn develop_raw(bytes: &[u8]) -> Result<RawRgb> {
         width: decoded.width as u32,
         height: decoded.height as u32,
         data: decoded.data,
+    })
+}
+
+/// Develops a DNG through LibRaw's `dcraw_emu` compatibility CLI.
+fn develop_dng_with_libraw(bytes: &[u8]) -> Result<RawRgb> {
+    use std::io::Write;
+    let mut file =
+        tempfile::NamedTempFile::new().context("failed to create temp file for LibRaw")?;
+    file.write_all(bytes)
+        .context("failed to buffer DNG for LibRaw")?;
+    file.flush().ok();
+
+    let output = std::process::Command::new("dcraw_emu")
+        .arg("-w")
+        .arg("-q")
+        .arg("3")
+        .arg("-o")
+        .arg("1")
+        .arg("-c")
+        .arg(file.path())
+        .output()
+        .context("dcraw_emu failed to launch")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("dcraw_emu exited with {}: {}", output.status, stderr.trim());
+    }
+    if output.stdout.is_empty() {
+        bail!("dcraw_emu wrote empty image output");
+    }
+    let decoded = image::load_from_memory_with_format(&output.stdout, image::ImageFormat::Pnm)
+        .or_else(|_| image::load_from_memory(&output.stdout))
+        .map_err(|error| anyhow!("failed to decode dcraw_emu output: {error}"))?
+        .to_rgb8();
+    Ok(RawRgb {
+        width: decoded.width(),
+        height: decoded.height(),
+        data: decoded.into_raw(),
     })
 }
 
@@ -369,9 +418,10 @@ fn is_heic_magic(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceFormat, classify, file_extension, is_commons_accepted, is_heic_magic, mime_extension,
-        passthrough_extension,
+        SourceFormat, classify, convert, dng_has_embedded_jpeg, file_extension,
+        is_commons_accepted, is_heic_magic, mime_extension, passthrough_extension,
     };
+    use crate::models::DngMode;
 
     #[test]
     fn classifies_dng() {
@@ -476,5 +526,34 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert!(spans[0].len() > spans[1].len());
         assert_eq!(&spans[0][0..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn detects_valid_embedded_dng_jpeg_preview() {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let mut dng_like = b"II*\0".to_vec();
+        dng_like.extend_from_slice(jpeg.get_ref());
+
+        assert!(dng_has_embedded_jpeg(&dng_like));
+        assert!(!dng_has_embedded_jpeg(b"II*\0not-a-jpeg"));
+    }
+
+    #[test]
+    fn convert_to_webp_falls_back_to_embedded_dng_jpeg_preview() {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 255])))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let mut dng_like = b"II*\0".to_vec();
+        dng_like.extend_from_slice(jpeg.get_ref());
+
+        let (bytes, extension) =
+            convert(&dng_like, SourceFormat::Dng, 80.0, DngMode::ConvertToWebp).unwrap();
+
+        assert_eq!(extension, "jpg");
+        assert_eq!(bytes, *jpeg.get_ref());
     }
 }

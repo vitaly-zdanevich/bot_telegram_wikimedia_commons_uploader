@@ -86,7 +86,7 @@ Converted first, because Commons does **not** accept them:
 
 | Input | Converted to | Notes |
 | ----- | ------------ | ----- |
-| DNG (raw) | WebP (lossy) by default, or embedded JPEG | default is raw development to WebP; `/settings dng extract` uploads the DNG's embedded JPEG preview instead; original SHA-1/MD5 + filename recorded |
+| DNG (raw) | WebP (lossy) by default, or embedded JPEG | default is raw development to WebP with embedded-JPEG fallback; `/settings dng extract` uploads the DNG's embedded JPEG preview directly; original SHA-1/MD5 + filename recorded |
 | HEIC/HEIF | WebP (lossy) | decoded with libheif; needs the libheif build (see below) |
 | BMP | WebP (lossless) | |
 

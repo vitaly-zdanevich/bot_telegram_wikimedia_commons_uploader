@@ -4,6 +4,9 @@
 # Free RAR/zip extractor used by the `rar` Cargo feature.
 unar
 
+# LibRaw command-line decoder used as a DNG raw-development fallback.
+libraw-bin
+
 # Used by the Toolforge wrapper to register the local Bot API webhook on startup.
 curl
 
