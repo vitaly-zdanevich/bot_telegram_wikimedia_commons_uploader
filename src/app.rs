@@ -25,12 +25,14 @@ use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::TokioIo;
 use lambda_http::{Body, Request as LambdaRequest, Response as LambdaResponse};
+use once_cell::sync::Lazy;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 #[cfg(feature = "archive")]
 use std::path::PathBuf;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 /// Telegram handle of the author, shown in `/help`.
 const CONTACT: &str = "@vitaly_zdanevich";
@@ -63,6 +65,10 @@ const FILE_SNIFF_BYTES: usize = 512;
 const MEDIA_GROUP_CAPTION_WAIT_ATTEMPTS: usize = 10;
 /// Delay between album-caption checks.
 const MEDIA_GROUP_CAPTION_WAIT_MS: u64 = 300;
+/// Delay before uploading an album item after acknowledging its webhook update.
+const MEDIA_GROUP_UPLOAD_DELAY_MS: u64 = 5_000;
+/// Keeps deferred album uploads from starting all at once.
+static MEDIA_GROUP_UPLOADS: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(1));
 
 /// Keeps Telegram's chat action visible while a long operation is running.
 struct ChatActionGuard {
@@ -124,6 +130,42 @@ async fn send_chat_action_best_effort(telegram: &TelegramClient, chat_id: i64, a
             "failed to send Telegram chat action"
         );
     }
+}
+
+/// Returns true when webhook/polling updates can acknowledge album items before uploading them.
+fn defer_media_group_uploads() -> bool {
+    std::env::var("AWS_LAMBDA_RUNTIME_API").is_err()
+}
+
+/// Uploads one album item after a short delay, giving Telegram time to deliver the captioned item.
+fn spawn_media_group_upload(config: Config, chat_id: i64, user_id: i64, message: Message) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            MEDIA_GROUP_UPLOAD_DELAY_MS,
+        ))
+        .await;
+        let Ok(_permit) = MEDIA_GROUP_UPLOADS.acquire().await else {
+            tracing::warn!(user_id, chat_id, "media-group upload semaphore was closed");
+            return;
+        };
+        let bot = Bot::from_config(config);
+        if let Err(error) = bot.handle_upload(chat_id, user_id, &message).await {
+            tracing::error!(
+                user_id,
+                chat_id,
+                error = %format!("{error:#}"),
+                "media-group upload task failed"
+            );
+            bot.telegram
+                .send_message(
+                    chat_id,
+                    &format!("❌ Upload failed: {}", escape_html(&format!("{error}"))),
+                    None,
+                )
+                .await
+                .ok();
+        }
+    });
 }
 
 #[cfg(feature = "archive")]
@@ -616,6 +658,11 @@ impl Bot {
         self.remember_group_caption(&message).await;
 
         if extract_file(&message).is_some() {
+            if message.media_group_id.is_some() && defer_media_group_uploads() {
+                send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+                spawn_media_group_upload(self.config.clone(), chat_id, user_id, message);
+                return Ok(());
+            }
             return self.handle_upload(chat_id, user_id, &message).await;
         }
 
@@ -1491,6 +1538,14 @@ impl Bot {
             &parsed.description,
             original_stem,
         );
+        if filename_needs_descriptive_context(filename_prefix, &parsed.description, original_stem) {
+            return Ok(FileResult::Rejected {
+                reason: format!(
+                    "{} is a generic camera filename that needs a caption or filename prefix",
+                    original_stem
+                ),
+            });
+        }
         let filename = build_filename(
             filename_prefix,
             &parsed.description,
@@ -1598,6 +1653,10 @@ impl Bot {
             return self.reject_too_large(chat_id).await;
         }
 
+        // Resolve the description and categories before any upload work so album items can reuse
+        // the captioned item after the deferred media-group delay.
+        let caption = self.resolve_caption(message).await;
+
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         let _upload_chat_action = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
 
@@ -1654,6 +1713,24 @@ impl Bot {
             }
         }
 
+        let parsed_caption = parse_caption(&caption);
+        let original_stem = file_stem(file.file_name.as_deref());
+        let filename_prefix = effective_filename_prefix(
+            &profile.filename_prefix,
+            None,
+            &parsed_caption.description,
+            original_stem,
+        );
+        if filename_needs_descriptive_context(
+            filename_prefix,
+            &parsed_caption.description,
+            original_stem,
+        ) {
+            return self
+                .reject_generic_img_filename(chat_id, message, original_stem)
+                .await;
+        }
+
         let (auth, author_username) = match self.resolve_auth(&profile) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1663,8 +1740,6 @@ impl Bot {
                     .await;
             }
         };
-        // Resolve the description and categories, sharing an album's caption across photos.
-        let caption = self.resolve_caption(message).await;
 
         self.telegram
             .send_chat_action(chat_id, "upload_document")
@@ -1770,6 +1845,34 @@ impl Bot {
             return;
         }
         self.store.put_group_caption(group_id, caption).await.ok();
+    }
+
+    /// Tells the user that a generic camera filename needs a caption or configured prefix.
+    async fn reject_generic_img_filename(
+        &self,
+        chat_id: i64,
+        message: &Message,
+        original_stem: &str,
+    ) -> Result<()> {
+        if let Some(group_id) = &message.media_group_id
+            && !self
+                .store
+                .reserve_idempotency(&format!("GENERIC_IMG_NUDGE#{chat_id}#{group_id}"), 300)
+                .await
+                .unwrap_or(true)
+        {
+            return Ok(());
+        }
+        let sample = if original_stem.trim().is_empty() {
+            "IMG_..."
+        } else {
+            original_stem
+        };
+        let text = format!(
+            "❌ <code>{}</code> is a generic camera filename that Commons rejects. Send the album again with a caption, or set a filename prefix in /settings.",
+            escape_html(sample)
+        );
+        self.telegram.send_message(chat_id, &text, None).await
     }
 
     /// Sends the post-upload confirmation, honoring the user's link settings.
@@ -3312,6 +3415,17 @@ fn effective_filename_prefix<'a>(
     profile_prefix
 }
 
+/// Returns true when Commons would reject an `IMG_...` filename for lacking descriptive context.
+fn filename_needs_descriptive_context(
+    filename_prefix: &str,
+    caption_description: &str,
+    original_stem: &str,
+) -> bool {
+    original_stem.starts_with("IMG_")
+        && filename_prefix.trim().is_empty()
+        && caption_description.trim().is_empty()
+}
+
 #[cfg(feature = "archive")]
 fn archive_name_stem(file_name: Option<&str>) -> Option<String> {
     let stem = file_stem(file_name).trim();
@@ -3351,7 +3465,10 @@ fn commons_title_url(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_filename_prefix, merge_categories, parse_category_list};
+    use super::{
+        effective_filename_prefix, filename_needs_descriptive_context, merge_categories,
+        parse_category_list,
+    };
     use crate::commons::{build_filename, parse_caption};
 
     #[test]
@@ -3396,6 +3513,22 @@ mod tests {
         );
 
         assert_eq!(prefix, "Archive_");
+    }
+
+    #[test]
+    fn bare_img_filename_needs_description_or_prefix() {
+        assert!(filename_needs_descriptive_context("", "", "IMG_1910"));
+        assert!(!filename_needs_descriptive_context(
+            "",
+            "Храм Вознесения Господня",
+            "IMG_1910"
+        ));
+        assert!(!filename_needs_descriptive_context(
+            "Belarus_2014_",
+            "",
+            "IMG_1910"
+        ));
+        assert!(!filename_needs_descriptive_context("", "", "DSC_1910"));
     }
 }
 
