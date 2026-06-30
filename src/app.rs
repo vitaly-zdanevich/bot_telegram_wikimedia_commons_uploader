@@ -61,6 +61,8 @@ const RELATED_CLI: &str =
 const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 /// How long an in-flight webhook update can block duplicate delivery attempts.
 const UPDATE_IN_PROGRESS_SECONDS: i64 = 10 * 60;
+/// Error marker used to make duplicate in-flight webhooks retryable by Telegram.
+const UPDATE_ALREADY_IN_PROGRESS_ERROR: &str = "telegram update is already being processed";
 /// Message shown once onboarding is complete.
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 /// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
@@ -496,6 +498,8 @@ fn status_for_webhook_error(error: &anyhow::Error) -> StatusCode {
         StatusCode::UNAUTHORIZED
     } else if text.contains("invalid Telegram update JSON") {
         StatusCode::BAD_REQUEST
+    } else if text.contains(UPDATE_ALREADY_IN_PROGRESS_ERROR) {
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -530,7 +534,7 @@ async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> 
         {
             Ok(false) => {
                 tracing::info!(update_id, "Telegram update is already being processed");
-                return Ok(());
+                anyhow::bail!("{UPDATE_ALREADY_IN_PROGRESS_ERROR}: {update_id}");
             }
             Ok(true) => {
                 in_progress_key = Some(busy);
@@ -5105,15 +5109,25 @@ fn commons_title_url(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FfmpegPlan, FfmpegPlanKind, MediaProbe, MediaStreamInfo, caption_without_link,
-        conversion_rejection_reason, effective_filename_prefix, ffmpeg_plan_for_probe,
-        filename_needs_descriptive_context, first_external_url, merge_categories,
-        parse_category_list, settings_keyboard, settings_license_keyboard,
-        settings_prefix_keyboard,
+        FfmpegPlan, FfmpegPlanKind, MediaProbe, MediaStreamInfo, UPDATE_ALREADY_IN_PROGRESS_ERROR,
+        caption_without_link, conversion_rejection_reason, effective_filename_prefix,
+        ffmpeg_plan_for_probe, filename_needs_descriptive_context, first_external_url,
+        merge_categories, parse_category_list, settings_keyboard, settings_license_keyboard,
+        settings_prefix_keyboard, status_for_webhook_error,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
     use crate::models::{DngMode, License, Profile};
+    use http::StatusCode;
+
+    #[test]
+    fn in_progress_webhook_errors_are_retryable() {
+        let error = anyhow::anyhow!("{UPDATE_ALREADY_IN_PROGRESS_ERROR}: 123");
+        assert_eq!(
+            status_for_webhook_error(&error),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     #[test]
     fn merges_and_deduplicates_categories() {
