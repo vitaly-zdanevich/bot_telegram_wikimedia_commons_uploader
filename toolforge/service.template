@@ -1,5 +1,6 @@
 # Toolforge webservice template for webhook mode.
 type: buildservice
+cpu: 3
 mem: 6Gi
 mount: all
 health-check-path: /healthz
