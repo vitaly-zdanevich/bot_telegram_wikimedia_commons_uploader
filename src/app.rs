@@ -2908,16 +2908,29 @@ impl Bot {
     ) -> Result<()> {
         // Evict expired or memory-pressuring staged archives before unpacking another.
         prune_pending(original.len());
-        let entries = match crate::archive::extract_images_with_limit(
-            &original,
-            file_name.as_deref(),
-            self.config.max_archive_file_bytes,
-        ) {
-            Ok(entries) => entries,
-            Err(error) => {
+        let archive_limit = self.config.max_archive_file_bytes;
+        let extraction_file_name = file_name.clone();
+        let entries = match tokio::task::spawn_blocking(move || {
+            crate::archive::extract_images_with_limit(
+                &original,
+                extraction_file_name.as_deref(),
+                archive_limit,
+            )
+        })
+        .await
+        {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(error)) => {
                 let text = format!(
                     "❌ Couldn't read the archive: {}",
                     escape_html(&format!("{error}"))
+                );
+                return self.telegram.send_message(chat_id, &text, None).await;
+            }
+            Err(error) => {
+                let text = format!(
+                    "❌ Couldn't read the archive: {}",
+                    escape_html(&format!("archive extraction task failed: {error}"))
                 );
                 return self.telegram.send_message(chat_id, &text, None).await;
             }
