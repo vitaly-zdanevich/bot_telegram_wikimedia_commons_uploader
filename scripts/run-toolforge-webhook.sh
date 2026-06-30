@@ -11,6 +11,14 @@ BOT_API_LOG="${TELEGRAM_BOT_API_LOG:-$TOOL_DATA_DIR/telegram-bot-api.log}"
 export TOOL_DATA_DIR
 export RUST_LOG="${RUST_LOG:-telegram_wikimedia_commons_uploader_bot=info}"
 
+TMPDIR_ROOT="${TMPDIR_ROOT:-$TOOL_DATA_DIR/tmp}"
+TMPDIR="${TMPDIR:-$TMPDIR_ROOT/${HOSTNAME:-webservice}}"
+mkdir -p "$TMPDIR_ROOT" "$TMPDIR"
+if [[ "${TOOLFORGE_CLEAN_OLD_TMPDIRS:-1}" == 1 ]]; then
+  find "$TMPDIR_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf -- {} +
+fi
+export TMPDIR
+
 APT_LAYER="${APT_LAYER:-/layers/fagiani_apt/apt}"
 if [[ -d "$APT_LAYER" ]]; then
   export PATH="$APT_LAYER/usr/bin:${PATH:-}"
