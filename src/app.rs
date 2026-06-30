@@ -67,6 +67,12 @@ const UPDATE_ALREADY_IN_PROGRESS_ERROR: &str = "telegram update is already being
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 /// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
 const FILE_SNIFF_BYTES: usize = 512;
+/// Telegram `sendPhoto` rejects uploaded photos larger than 10 MiB.
+#[cfg(feature = "archive")]
+const TELEGRAM_PHOTO_PREVIEW_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// Archive preview size where a visible progress message is useful before thumbnails.
+#[cfg(feature = "archive")]
+const ARCHIVE_PREVIEW_PROGRESS_MIN_IMAGES: usize = 10;
 /// How many times an album item without a caption waits for another item's caption.
 const MEDIA_GROUP_CAPTION_WAIT_ATTEMPTS: usize = 10;
 /// Delay between album-caption checks.
@@ -244,6 +250,14 @@ enum ArchivePreviewFollowup {
 }
 
 #[cfg(feature = "archive")]
+fn archive_preview_followup_count(followup: &ArchivePreviewFollowup) -> usize {
+    match followup {
+        ArchivePreviewFollowup::Confirm { count, .. }
+        | ArchivePreviewFollowup::Prefix { count, .. } => *count,
+    }
+}
+
+#[cfg(feature = "archive")]
 enum ArchiveConfirmAction {
     Start,
     ArchiveNamePrefix { include_category: bool },
@@ -276,6 +290,20 @@ fn spawn_archive_thumbnail_preview(
         let resize = config.archive_thumbnail_resize;
         let bot = Bot::from_config(config);
         let _typing = ChatActionGuard::start(bot.telegram.clone(), chat_id, "typing");
+        let count = archive_preview_followup_count(&followup);
+        if count >= ARCHIVE_PREVIEW_PROGRESS_MIN_IMAGES {
+            let image_label = image_count_label(count);
+            bot.telegram
+                .send_message(
+                    chat_id,
+                    &format!(
+                        "Preparing previews for <b>{count}</b> {image_label}. Upload buttons will appear after the previews."
+                    ),
+                    None,
+                )
+                .await
+                .ok();
+        }
         tracing::info!(
             user_id,
             chat_id,
@@ -367,7 +395,17 @@ async fn send_archive_thumbnail_preview(
                     .with_context(|| format!("failed to read archive preview {}", path.display()));
             }
         };
-        if resize {
+        if !should_send_original_archive_preview(resize, bytes.len()) {
+            if !resize {
+                tracing::info!(
+                    chat_id,
+                    token,
+                    name = %entry.name,
+                    bytes = bytes.len(),
+                    max_bytes = TELEGRAM_PHOTO_PREVIEW_MAX_BYTES,
+                    "sending resized archive preview because original exceeds Telegram photo limit"
+                );
+            }
             let preview =
                 convert::make_thumbnail(&bytes, 320).map(|thumb| (thumb, "thumb.jpg".to_string()));
             let Some((photo, file_name)) = preview else {
@@ -420,6 +458,11 @@ async fn send_archive_thumbnail_preview(
         }
     }
     Ok(true)
+}
+
+#[cfg(feature = "archive")]
+fn should_send_original_archive_preview(resize: bool, bytes_len: usize) -> bool {
+    !resize && bytes_len <= TELEGRAM_PHOTO_PREVIEW_MAX_BYTES
 }
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
@@ -5386,10 +5429,11 @@ mod tests {
 #[cfg(all(test, feature = "archive"))]
 mod archive_tests {
     use super::{
-        PENDING_TTL_SECS, PendingArchiveManifest, archive_confirmation_buttons,
-        archive_entry_needs_filename_prefix, archive_name_category, archive_name_prefix,
-        archive_needs_filename_prefix, archive_prefix_keyboard, is_low_memory,
-        parse_mem_available_kb, pending_is_expired, short_id, upload_categories,
+        PENDING_TTL_SECS, PendingArchiveManifest, TELEGRAM_PHOTO_PREVIEW_MAX_BYTES,
+        archive_confirmation_buttons, archive_entry_needs_filename_prefix, archive_name_category,
+        archive_name_prefix, archive_needs_filename_prefix, archive_prefix_keyboard, is_low_memory,
+        parse_mem_available_kb, pending_is_expired, short_id, should_send_original_archive_preview,
+        upload_categories,
     };
 
     #[test]
@@ -5423,6 +5467,20 @@ mod archive_tests {
         assert!(!pending_is_expired(1000, 1000));
         assert!(!pending_is_expired(1000, 1000 + PENDING_TTL_SECS - 1));
         assert!(pending_is_expired(1000, 1000 + PENDING_TTL_SECS));
+    }
+
+    #[test]
+    fn original_archive_preview_is_skipped_when_telegram_would_reject_it() {
+        assert!(should_send_original_archive_preview(
+            false,
+            TELEGRAM_PHOTO_PREVIEW_MAX_BYTES
+        ));
+        assert!(!should_send_original_archive_preview(
+            false,
+            TELEGRAM_PHOTO_PREVIEW_MAX_BYTES + 1
+        ));
+        assert!(!should_send_original_archive_preview(false, usize::MAX));
+        assert!(!should_send_original_archive_preview(true, 1));
     }
 
     #[test]
