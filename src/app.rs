@@ -1803,6 +1803,17 @@ impl Bot {
         self.telegram.send_message(chat_id, &text, None).await
     }
 
+    /// Adds successful uploads to the latest profile without overwriting newer settings.
+    async fn record_successful_uploads(&self, user_id: i64, uploaded: u64) -> Result<()> {
+        if uploaded == 0 {
+            return Ok(());
+        }
+        let mut profile = self.store.get_profile(user_id).await;
+        profile.uploads_count = profile.uploads_count.saturating_add(uploaded);
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await
+    }
+
     /// Resolves how to authenticate uploads for a profile, plus the author username.
     ///
     /// Prefers a stored OAuth token; falls back to the bot-password credentials.
@@ -2189,9 +2200,7 @@ impl Bot {
                 url,
                 categories,
             } => {
-                profile.uploads_count = profile.uploads_count.saturating_add(1);
-                touch(&mut profile);
-                self.store.put_profile(user_id, &profile).await.ok();
+                self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(
                     chat_id,
                     &filename,
@@ -2351,9 +2360,7 @@ impl Bot {
                 url,
                 categories,
             } => {
-                profile.uploads_count = profile.uploads_count.saturating_add(1);
-                touch(&mut profile);
-                self.store.put_profile(user_id, &profile).await.ok();
+                self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(chat_id, &filename, &url, &categories, &profile, false)
                     .await
             }
@@ -3415,7 +3422,6 @@ impl Bot {
             {
                 Ok(FileResult::Uploaded { filename, url, .. }) => {
                     uploaded += 1;
-                    profile.uploads_count = profile.uploads_count.saturating_add(1);
                     if profile.return_upload_links {
                         let text = format!(
                             "✅ Uploaded {member_index}/{entry_count}: <a href=\"{url}\">{}</a>",
@@ -3474,8 +3480,9 @@ impl Bot {
                 }
             }
         }
-        touch(profile);
-        self.store.put_profile(user_id, profile).await.ok();
+        self.record_successful_uploads(user_id, uploaded.into())
+            .await
+            .ok();
 
         let mut text = format!("📦 Archive done — ✅ {uploaded} uploaded");
         if duplicate > 0 {
