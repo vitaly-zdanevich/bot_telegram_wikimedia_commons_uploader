@@ -102,6 +102,8 @@ On the Toolforge/server build, the bot also accepts a pasted or forwarded **HTTP
 instead of an attached Telegram file:
 
 - Direct file links: images, audio, PDFs, videos, ZIP/RAR archives, and other supported files.
+- DropMeFiles share pages (`dropmefiles.com/<id>`); links still being uploaded are rejected
+  until DropMeFiles marks them ready.
 - Media pages resolved by `yt-dlp`: YouTube (`youtube.com`, `youtu.be`), VK video
   (`vk.com`, `vkvideo.ru`), Rutube, and Apple Podcasts episodes.
 

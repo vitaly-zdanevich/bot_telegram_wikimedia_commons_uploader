@@ -1810,7 +1810,7 @@ impl Bot {
         let conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let mut text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -2420,6 +2420,11 @@ impl Bot {
 
         let linked = if needs_ytdlp(url) {
             self.download_with_ytdlp(url).await?
+        } else if is_dropmefiles_url(url) {
+            let download_url = self.resolve_dropmefiles_download_url(url).await?;
+            let mut linked = self.download_direct_url(&download_url).await?;
+            linked.source_url = url.as_str().to_string();
+            linked
         } else {
             self.download_direct_url(url).await?
         };
@@ -2431,6 +2436,27 @@ impl Bot {
             }
         }
         self.ensure_linked_file_commons_compatible(linked).await
+    }
+
+    /// Resolves a DropMeFiles sharing page into the hidden direct download URL.
+    async fn resolve_dropmefiles_download_url(&self, url: &Url) -> Result<Url> {
+        let client = reqwest::Client::builder()
+            .user_agent(&self.config.user_agent)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .context("failed to build DropMeFiles HTTP client")?;
+        let page = client
+            .get(url.clone())
+            .send()
+            .await
+            .context("failed to request DropMeFiles page")?
+            .error_for_status()
+            .context("DropMeFiles page returned an error status")?
+            .text()
+            .await
+            .context("failed to read DropMeFiles page")?;
+        dropmefiles_download_url_from_page(url, &page)
     }
 
     /// Downloads a direct file URL to the configured temp directory, streaming chunks without
@@ -4885,22 +4911,45 @@ fn needs_ytdlp(url: &Url) -> bool {
     is_youtube_url(url) || is_vk_url(url) || is_rutube_url(url) || is_apple_podcasts_url(url)
 }
 
+/// Returns true for YouTube URLs handled through yt-dlp.
 fn is_youtube_url(url: &Url) -> bool {
     host_matches(url, &["youtube.com", "youtu.be"])
 }
 
+/// Returns true for VK and VK Video URLs handled through yt-dlp.
 fn is_vk_url(url: &Url) -> bool {
     host_matches(url, &["vk.com", "vkvideo.ru"])
 }
 
+/// Returns true for Rutube URLs handled through yt-dlp.
 fn is_rutube_url(url: &Url) -> bool {
     host_matches(url, &["rutube.ru"])
 }
 
+/// Returns true for Apple Podcasts episode URLs handled through yt-dlp.
 fn is_apple_podcasts_url(url: &Url) -> bool {
     host_matches(url, &["podcasts.apple.com"])
 }
 
+/// Returns true for a DropMeFiles short sharing page that needs site-specific resolving.
+fn is_dropmefiles_url(url: &Url) -> bool {
+    host_matches(url, &["dropmefiles.com"]) && dropmefiles_upload_id(url).is_some()
+}
+
+/// Extracts the alphanumeric DropMeFiles upload id from `https://dropmefiles.com/<id>`.
+fn dropmefiles_upload_id(url: &Url) -> Option<String> {
+    let mut segments = url.path_segments()?;
+    let id = segments.next()?.trim();
+    if id.is_empty()
+        || segments.next().is_some()
+        || !id.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Returns true when the URL host is exactly one of `domains` or one of their subdomains.
 fn host_matches(url: &Url, domains: &[&str]) -> bool {
     let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
         return false;
@@ -4908,6 +4957,160 @@ fn host_matches(url: &Url, domains: &[&str]) -> bool {
     domains
         .iter()
         .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Extracts the direct download URL from a DropMeFiles sharing page.
+fn dropmefiles_download_url_from_page(page_url: &Url, html: &str) -> Result<Url> {
+    if html.contains("id=\"passwordForm\"") || html.contains("id='passwordForm'") {
+        bail!("password-protected DropMeFiles links are not supported");
+    }
+
+    let upload_id = js_string_var(html, "UPLOADID")
+        .or_else(|| dropmefiles_upload_id(page_url))
+        .context("DropMeFiles page did not expose an upload id")?;
+    let status = js_i64_var(html, "USTATUS");
+    let files = js_i64_var(html, "UFILES");
+    if status.is_some_and(|status| status > 0) || files == Some(0) {
+        bail!("DropMeFiles upload is still in progress. Please retry after it finishes uploading");
+    }
+
+    if let Some(href) = html_attr_value(html, "data-href") {
+        return resolve_dropmefiles_download_url(page_url, &href);
+    }
+
+    let dserver = js_string_var(html, "DSERVERURL")
+        .or_else(|| js_string_var(html, "SERVERURL"))
+        .context("DropMeFiles page did not expose a download server")?;
+    if files == Some(1)
+        && let Some(file_id) = dropmefiles_file_ids(html).into_iter().next()
+    {
+        let base = Url::parse(&dserver).context("DropMeFiles download server URL is invalid")?;
+        return base
+            .join(&format!("/dl/{upload_id}/{file_id}"))
+            .context("DropMeFiles direct download URL is invalid");
+    }
+
+    bail!("DropMeFiles page did not expose a download URL");
+}
+
+/// Converts a raw DropMeFiles download attribute into an absolute URL.
+fn resolve_dropmefiles_download_url(page_url: &Url, raw: &str) -> Result<Url> {
+    let value = html_unescape_attr(raw).trim().to_string();
+    if value.is_empty() || value.starts_with("javascript:") {
+        bail!("DropMeFiles page did not expose a download URL");
+    }
+    if value.starts_with("//") {
+        return Url::parse(&format!("{}:{value}", page_url.scheme()))
+            .context("DropMeFiles protocol-relative download URL is invalid");
+    }
+    Url::parse(&value)
+        .or_else(|_| page_url.join(&value))
+        .context("DropMeFiles download URL is invalid")
+}
+
+/// Reads a single-quoted or double-quoted JavaScript variable from legacy inline page scripts.
+fn js_string_var(html: &str, name: &str) -> Option<String> {
+    let var = js_var_value(html, name)?;
+    let mut chars = var.chars();
+    let quote = chars.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            value.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return Some(value);
+        } else {
+            value.push(ch);
+        }
+    }
+    None
+}
+
+/// Reads an integer JavaScript variable from legacy inline page scripts.
+fn js_i64_var(html: &str, name: &str) -> Option<i64> {
+    let var = js_var_value(html, name)?.trim_start();
+    let value = var
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect::<String>();
+    if value.is_empty() {
+        None
+    } else {
+        value.parse().ok()
+    }
+}
+
+/// Returns the text immediately after `var <name> =` in a page script.
+fn js_var_value<'a>(html: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("var {name}");
+    let after_marker = html
+        .find(&marker)
+        .map(|index| &html[index + marker.len()..])?;
+    let after_equals = after_marker.split_once('=')?.1;
+    Some(after_equals.trim_start())
+}
+
+/// Extracts a quoted HTML attribute value from a tag or page fragment.
+fn html_attr_value(html: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=");
+    let mut rest = html;
+    while let Some(index) = rest.find(&pattern) {
+        let after = &rest[index + pattern.len()..];
+        let mut chars = after.chars();
+        let quote = chars.next()?;
+        if quote == '\'' || quote == '"' {
+            let value = chars.take_while(|ch| *ch != quote).collect::<String>();
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+        rest = &after[quote.len_utf8()..];
+    }
+    None
+}
+
+/// Finds DropMeFiles per-file ids from completed single-file download pages.
+fn dropmefiles_file_ids(html: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = html;
+    while let Some(class_index) = rest.find("fileDownload") {
+        let before = &rest[..class_index];
+        let tag_start = before.rfind('<').unwrap_or(0);
+        let after = &rest[class_index..];
+        let tag_end = after
+            .find('>')
+            .map(|index| class_index + index)
+            .unwrap_or(rest.len());
+        let tag = &rest[tag_start..tag_end];
+        if let Some(id) = html_attr_value(tag, "id")
+            && !id.is_empty()
+            && id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            ids.push(id);
+        }
+        rest = &rest[class_index + "fileDownload".len()..];
+    }
+    ids
+}
+
+/// Decodes the small subset of HTML entities used inside DropMeFiles attributes.
+fn html_unescape_attr(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 /// Extracts a filename from HTTP headers or the URL path.
@@ -5302,10 +5505,12 @@ mod tests {
         FfmpegPlanKind, ForwardedTextContext, MediaProbe, MediaStreamInfo,
         UPDATE_ALREADY_IN_PROGRESS_ERROR, caption_without_link, commons_max_file_size_message,
         conversion_rejection_reason, direct_link_looks_like_commons_file,
+        dropmefiles_download_url_from_page, dropmefiles_file_ids, dropmefiles_upload_id,
         effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
-        filename_needs_descriptive_context, first_external_url, merge_categories, now_ts,
-        parse_category_list, settings_keyboard, settings_license_keyboard,
-        settings_prefix_keyboard, status_for_webhook_error, take_forwarded_text_context,
+        filename_needs_descriptive_context, first_external_url, is_dropmefiles_url,
+        merge_categories, now_ts, parse_category_list, settings_keyboard,
+        settings_license_keyboard, settings_prefix_keyboard, status_for_webhook_error,
+        take_forwarded_text_context,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -5352,6 +5557,76 @@ mod tests {
         assert_eq!(
             caption_without_link("Archive: https://example.org/a.rar", &direct),
             "Archive:"
+        );
+    }
+
+    #[test]
+    fn detects_dropmefiles_share_links() {
+        let url = url::Url::parse("https://dropmefiles.com/iJAKb").unwrap();
+        assert!(is_dropmefiles_url(&url));
+        assert_eq!(dropmefiles_upload_id(&url).as_deref(), Some("iJAKb"));
+
+        let root = url::Url::parse("https://dropmefiles.com/").unwrap();
+        assert!(!is_dropmefiles_url(&root));
+    }
+
+    #[test]
+    fn resolves_dropmefiles_ready_download_href() {
+        let page_url = url::Url::parse("https://dropmefiles.com/abc12").unwrap();
+        let html = r#"
+            <script>
+            var DSERVERURL = 'https://drop5.dropmefile.com';
+            var UPLOADID = 'abc12';
+            var USTATUS = 0;
+            var UFILES = 2;
+            </script>
+            <a class="download_btn start_dl_btn" data-href="https://drop5.dropmefile.com/dl/abc12?x=1&amp;y=2">download</a>
+        "#;
+
+        let resolved = dropmefiles_download_url_from_page(&page_url, html).unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            "https://drop5.dropmefile.com/dl/abc12?x=1&y=2"
+        );
+    }
+
+    #[test]
+    fn resolves_dropmefiles_single_file_fallback() {
+        let page_url = url::Url::parse("https://dropmefiles.com/abc12").unwrap();
+        let html = r#"
+            <script>
+            var DSERVERURL = 'https://drop5.dropmefile.com';
+            var UPLOADID = 'abc12';
+            var USTATUS = 0;
+            var UFILES = 1;
+            </script>
+            <li class="fileDownload" id="file_7" data-fsize="100"></li>
+        "#;
+
+        assert_eq!(dropmefiles_file_ids(html), vec!["file_7"]);
+        let resolved = dropmefiles_download_url_from_page(&page_url, html).unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            "https://drop5.dropmefile.com/dl/abc12/file_7"
+        );
+    }
+
+    #[test]
+    fn rejects_dropmefiles_upload_still_in_progress() {
+        let page_url = url::Url::parse("https://dropmefiles.com/iJAKb").unwrap();
+        let html = r#"
+            <script>
+            var UPLOADID = 'iJAKb';
+            var USTATUS = 2;
+            var UFILES = 0;
+            </script>
+        "#;
+
+        let error = dropmefiles_download_url_from_page(&page_url, html).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DropMeFiles upload is still in progress")
         );
     }
 
