@@ -26,6 +26,7 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::TokioIo;
 use lambda_http::{Body, Request as LambdaRequest, Response as LambdaResponse};
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::io::Write;
@@ -33,7 +34,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use url::Url;
 
 /// Telegram handle of the author, shown in `/help`.
@@ -81,6 +82,11 @@ const MEDIA_GROUP_CAPTION_WAIT_MS: u64 = 300;
 const MEDIA_GROUP_UPLOAD_DELAY_MS: u64 = 5_000;
 /// Keeps deferred album uploads from starting all at once.
 static MEDIA_GROUP_UPLOADS: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(1));
+/// How long a forwarded text-only message can be reused as the next upload caption.
+const FORWARDED_TEXT_CONTEXT_TTL_SECONDS: i64 = 2 * 60;
+/// Recently forwarded text-only messages keyed by `(chat_id, user_id)`.
+static FORWARDED_TEXT_CONTEXTS: Lazy<RwLock<HashMap<(i64, i64), ForwardedTextContext>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 /// Maximum time spent downloading a direct URL.
 const DIRECT_URL_DOWNLOAD_TIMEOUT_SECS: u64 = 20 * 60;
 /// Maximum time spent downloading with yt-dlp.
@@ -100,6 +106,12 @@ const YTDLP_AUDIO_FORMAT_SELECTOR: &str = "bestaudio/best";
 /// Keeps Telegram's chat action visible while a long operation is running.
 struct ChatActionGuard {
     stop: std::sync::mpsc::Sender<()>,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardedTextContext {
+    text: String,
+    expires_at: i64,
 }
 
 impl ChatActionGuard {
@@ -873,6 +885,14 @@ impl Bot {
             return self
                 .handle_link_upload(chat_id, user_id, &message, url)
                 .await;
+        }
+        if message.is_forwarded() {
+            let profile = self.store.get_profile(user_id).await;
+            if profile.is_ready()
+                && remember_forwarded_text_context(chat_id, user_id, &message, &trimmed).await
+            {
+                return Ok(());
+            }
         }
         self.handle_onboarding_text(chat_id, user_id, &message, &trimmed)
             .await
@@ -2080,7 +2100,7 @@ impl Bot {
 
         // Resolve the description and categories before any upload work so album items can reuse
         // the captioned item after the deferred media-group delay.
-        let caption = self.resolve_caption(message).await;
+        let caption = self.resolve_caption(chat_id, user_id, message).await;
 
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         let _upload_chat_action = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
@@ -2821,7 +2841,7 @@ impl Bot {
     }
 
     /// Resolves the caption for a message, sharing an album's caption across its photos.
-    async fn resolve_caption(&self, message: &Message) -> String {
+    async fn resolve_caption(&self, chat_id: i64, user_id: i64, message: &Message) -> String {
         if let Some(group_id) = &message.media_group_id {
             if let Some(caption) = message
                 .caption
@@ -2842,13 +2862,30 @@ impl Bot {
                 ))
                 .await;
             }
-            return self
+            let caption = self
                 .store
                 .get_group_caption(group_id)
                 .await
                 .unwrap_or_default();
+            if !caption.trim().is_empty() {
+                return caption;
+            }
+            if let Some(caption) = take_forwarded_text_context(chat_id, user_id).await {
+                self.store.put_group_caption(group_id, &caption).await.ok();
+                return caption;
+            }
+            return String::new();
         }
-        message.caption.clone().unwrap_or_default()
+        if let Some(caption) = message
+            .caption
+            .clone()
+            .filter(|caption| !caption.trim().is_empty())
+        {
+            return caption;
+        }
+        take_forwarded_text_context(chat_id, user_id)
+            .await
+            .unwrap_or_default()
     }
 
     /// Stores an album caption before any file download/conversion work starts.
@@ -4498,6 +4535,46 @@ fn touch(profile: &mut Profile) {
     profile.updated_at = now;
 }
 
+/// Remembers a forwarded text-only message as context for the next uncaptained upload.
+async fn remember_forwarded_text_context(
+    chat_id: i64,
+    user_id: i64,
+    message: &Message,
+    text: &str,
+) -> bool {
+    let text = text.trim();
+    if !message.is_forwarded() || text.is_empty() {
+        return false;
+    }
+    let now = now_ts();
+    let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
+    contexts.retain(|_, context| context.expires_at >= now);
+    contexts.insert(
+        (chat_id, user_id),
+        ForwardedTextContext {
+            text: text.to_string(),
+            expires_at: now + FORWARDED_TEXT_CONTEXT_TTL_SECONDS,
+        },
+    );
+    tracing::info!(
+        user_id,
+        chat_id,
+        "remembered forwarded text for next upload"
+    );
+    true
+}
+
+/// Consumes recent forwarded text for the next uncaptained upload in the same chat.
+async fn take_forwarded_text_context(chat_id: i64, user_id: i64) -> Option<String> {
+    let now = now_ts();
+    let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
+    contexts.retain(|_, context| context.expires_at >= now);
+    contexts
+        .remove(&(chat_id, user_id))
+        .filter(|context| context.expires_at >= now)
+        .map(|context| context.text)
+}
+
 /// Returns the current unix timestamp in seconds.
 fn now_ts() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -5221,13 +5298,14 @@ fn commons_title_url(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FfmpegPlan, FfmpegPlanKind, MediaProbe,
-        MediaStreamInfo, UPDATE_ALREADY_IN_PROGRESS_ERROR, caption_without_link,
-        commons_max_file_size_message, conversion_rejection_reason,
-        direct_link_looks_like_commons_file, effective_filename_prefix,
-        ensure_commons_file_size_limit, ffmpeg_plan_for_probe, filename_needs_descriptive_context,
-        first_external_url, merge_categories, parse_category_list, settings_keyboard,
-        settings_license_keyboard, settings_prefix_keyboard, status_for_webhook_error,
+        COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FORWARDED_TEXT_CONTEXTS, FfmpegPlan,
+        FfmpegPlanKind, ForwardedTextContext, MediaProbe, MediaStreamInfo,
+        UPDATE_ALREADY_IN_PROGRESS_ERROR, caption_without_link, commons_max_file_size_message,
+        conversion_rejection_reason, direct_link_looks_like_commons_file,
+        effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
+        filename_needs_descriptive_context, first_external_url, merge_categories, now_ts,
+        parse_category_list, settings_keyboard, settings_license_keyboard,
+        settings_prefix_keyboard, status_for_webhook_error, take_forwarded_text_context,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -5275,6 +5353,42 @@ mod tests {
             caption_without_link("Archive: https://example.org/a.rar", &direct),
             "Archive:"
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_text_context_is_consumed_once() {
+        let chat_id = -9_001_001;
+        let user_id = 9_001_001;
+        FORWARDED_TEXT_CONTEXTS.write().await.insert(
+            (chat_id, user_id),
+            ForwardedTextContext {
+                text: "Храм Вознесения Господня\nCategories: Churches".into(),
+                expires_at: now_ts() + 60,
+            },
+        );
+
+        assert_eq!(
+            take_forwarded_text_context(chat_id, user_id)
+                .await
+                .as_deref(),
+            Some("Храм Вознесения Господня\nCategories: Churches")
+        );
+        assert_eq!(take_forwarded_text_context(chat_id, user_id).await, None);
+    }
+
+    #[tokio::test]
+    async fn expired_forwarded_text_context_is_ignored() {
+        let chat_id = -9_001_002;
+        let user_id = 9_001_002;
+        FORWARDED_TEXT_CONTEXTS.write().await.insert(
+            (chat_id, user_id),
+            ForwardedTextContext {
+                text: "Too old".into(),
+                expires_at: now_ts() - 1,
+            },
+        );
+
+        assert_eq!(take_forwarded_text_context(chat_id, user_id).await, None);
     }
 
     #[test]
