@@ -87,6 +87,11 @@ const DIRECT_URL_DOWNLOAD_TIMEOUT_SECS: u64 = 20 * 60;
 const YTDLP_DOWNLOAD_TIMEOUT_SECS: u64 = 45 * 60;
 /// Maximum time spent transcoding unsupported linked media.
 const FFMPEG_TRANSCODE_TIMEOUT_SECS: u64 = 60 * 60;
+/// Maximum single-file upload size currently documented by Wikimedia Commons.
+const COMMONS_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Documentation for Wikimedia Commons' maximum upload size.
+const COMMONS_MAX_FILE_SIZE_DOC: &str =
+    "https://commons.wikimedia.org/wiki/Commons:Maximum_file_size";
 /// yt-dlp video selector: prefer AV1+Opus, but still download a file if a site has no AV1.
 const YTDLP_VIDEO_FORMAT_SELECTOR: &str = "bestvideo[ext=webm][vcodec^=av01]+bestaudio[ext=webm][acodec=opus]/bestvideo[vcodec^=av01]+bestaudio[acodec=opus]/bestvideo+bestaudio/best";
 /// yt-dlp audio selector for podcast-style links.
@@ -2401,7 +2406,8 @@ impl Bot {
         self.ensure_linked_file_commons_compatible(linked).await
     }
 
-    /// Downloads a direct file URL to `/tmp`, streaming chunks without buffering it all in RAM.
+    /// Downloads a direct file URL to the configured temp directory, streaming chunks without
+    /// buffering it all in RAM.
     async fn download_direct_url(&self, url: &Url) -> Result<LinkedFile> {
         let client = reqwest::Client::builder()
             .user_agent(&self.config.user_agent)
@@ -2418,21 +2424,26 @@ impl Bot {
             .context("failed to request linked file")?
             .error_for_status()
             .context("linked file returned an error status")?;
-        let max_bytes = self.max_external_download_bytes();
-        if let Some(length) = response.content_length()
-            && length > max_bytes
-        {
-            bail!(
-                "linked file is {}, larger than the configured {} limit",
-                format_size_limit(length),
-                format_size_limit(max_bytes)
-            );
-        }
-
         let headers = response.headers().clone();
         let file_name =
             filename_from_headers_or_url(&headers, url).unwrap_or_else(|| "linked-file".into());
         let mime = content_type(&headers);
+        let max_bytes = self.max_external_download_bytes();
+        let is_direct_supported_file =
+            direct_link_looks_like_commons_file(Some(&file_name), mime.as_deref());
+        if let Some(length) = response.content_length() {
+            if is_direct_supported_file {
+                ensure_commons_file_size_limit(length)?;
+            }
+            if length > max_bytes {
+                bail!(
+                    "linked file is {}, larger than the configured {} limit",
+                    format_size_limit(length),
+                    format_size_limit(max_bytes)
+                );
+            }
+        }
+
         let path = temp_link_path(&file_name)?;
         let mut file = std::fs::File::create(&path)
             .with_context(|| format!("failed to create temp file {}", path.display()))?;
@@ -2443,6 +2454,11 @@ impl Bot {
             .context("failed while reading linked file")?
         {
             written = written.saturating_add(chunk.len() as u64);
+            if is_direct_supported_file && written > COMMONS_MAX_FILE_BYTES {
+                drop(file);
+                std::fs::remove_file(&path).ok();
+                bail!("{}", commons_max_file_size_message(Some(written)));
+            }
             if written > max_bytes {
                 drop(file);
                 std::fs::remove_file(&path).ok();
@@ -4554,6 +4570,39 @@ fn format_size_limit(bytes: u64) -> String {
     }
 }
 
+fn commons_max_file_size_message(size: Option<u64>) -> String {
+    match size {
+        Some(size) => format!(
+            "linked file is {}, but Wikimedia Commons supports files only up to {}. See {}",
+            format_size_limit(size),
+            format_size_limit(COMMONS_MAX_FILE_BYTES),
+            COMMONS_MAX_FILE_SIZE_DOC
+        ),
+        None => format!(
+            "Wikimedia Commons supports files only up to {}. See {}",
+            format_size_limit(COMMONS_MAX_FILE_BYTES),
+            COMMONS_MAX_FILE_SIZE_DOC
+        ),
+    }
+}
+
+fn ensure_commons_file_size_limit(size: u64) -> Result<()> {
+    if size > COMMONS_MAX_FILE_BYTES {
+        bail!("{}", commons_max_file_size_message(Some(size)));
+    }
+    Ok(())
+}
+
+fn direct_link_looks_like_commons_file(file_name: Option<&str>, mime: Option<&str>) -> bool {
+    file_name
+        .and_then(file_extension_for_name)
+        .as_deref()
+        .is_some_and(convert::is_commons_accepted)
+        || mime
+            .and_then(accepted_extension_for_mime)
+            .is_some_and(|extension| convert::is_commons_accepted(&extension))
+}
+
 /// Returns the filename stem (without extension), if a filename is present.
 fn file_stem(file_name: Option<&str>) -> &str {
     file_name
@@ -5165,11 +5214,13 @@ fn commons_title_url(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FfmpegPlan, FfmpegPlanKind, MediaProbe, MediaStreamInfo, UPDATE_ALREADY_IN_PROGRESS_ERROR,
-        caption_without_link, conversion_rejection_reason, effective_filename_prefix,
-        ffmpeg_plan_for_probe, filename_needs_descriptive_context, first_external_url,
-        merge_categories, parse_category_list, settings_keyboard, settings_license_keyboard,
-        settings_prefix_keyboard, status_for_webhook_error,
+        COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FfmpegPlan, FfmpegPlanKind, MediaProbe,
+        MediaStreamInfo, UPDATE_ALREADY_IN_PROGRESS_ERROR, caption_without_link,
+        commons_max_file_size_message, conversion_rejection_reason,
+        direct_link_looks_like_commons_file, effective_filename_prefix,
+        ensure_commons_file_size_limit, ffmpeg_plan_for_probe, filename_needs_descriptive_context,
+        first_external_url, merge_categories, parse_category_list, settings_keyboard,
+        settings_license_keyboard, settings_prefix_keyboard, status_for_webhook_error,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -5217,6 +5268,48 @@ mod tests {
             caption_without_link("Archive: https://example.org/a.rar", &direct),
             "Archive:"
         );
+    }
+
+    #[test]
+    fn commons_size_limit_message_links_to_docs() {
+        let error = ensure_commons_file_size_limit(COMMONS_MAX_FILE_BYTES + 1)
+            .expect_err("file above Commons max must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("Wikimedia Commons supports files only up to"));
+        assert!(message.contains("5.0 GB (5120 MB)"));
+        assert!(message.contains(COMMONS_MAX_FILE_SIZE_DOC));
+        assert!(ensure_commons_file_size_limit(COMMONS_MAX_FILE_BYTES).is_ok());
+        assert_eq!(
+            commons_max_file_size_message(None),
+            format!(
+                "Wikimedia Commons supports files only up to 5.0 GB (5120 MB). See {COMMONS_MAX_FILE_SIZE_DOC}"
+            )
+        );
+    }
+
+    #[test]
+    fn commons_size_limit_applies_only_to_supported_direct_files() {
+        assert!(direct_link_looks_like_commons_file(
+            Some("video.webm"),
+            None
+        ));
+        assert!(direct_link_looks_like_commons_file(
+            Some("download"),
+            Some("image/jpeg")
+        ));
+        assert!(!direct_link_looks_like_commons_file(
+            Some("archive.zip"),
+            None
+        ));
+        assert!(!direct_link_looks_like_commons_file(
+            Some("archive.rar"),
+            None
+        ));
+        assert!(!direct_link_looks_like_commons_file(
+            Some("video.mp4"),
+            Some("video/mp4")
+        ));
+        assert!(!direct_link_looks_like_commons_file(None, None));
     }
 
     #[test]
