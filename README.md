@@ -14,6 +14,9 @@ that uploads images and media you send straight to **Wikimedia Commons, under yo
 account**. Written in Rust, it runs on AWS Lambda (arm64) behind a Telegram webhook,
 with DynamoDB for per-user settings. Designed to stay within the AWS free tier.
 
+Metadata and tracking links: [Wikidata item Q140382791](https://www.wikidata.org/wiki/Q140382791)
+and [Commons uploads category](https://commons.wikimedia.org/wiki/Category:Uploaded_with_Telegram_bot_@wikimedia_commons_uploader_bot_by_Vitaly_Zdanevich).
+
 ## How it works (for users)
 
 1. Send `/start`. The bot asks you to create a **scoped Bot Password** at
@@ -92,6 +95,32 @@ Converted first, because Commons does **not** accept them:
 
 > AVIF is **not** accepted by Commons (still a wishlist item), which is why DNG/HEIC/BMP
 > are converted to WebP rather than AVIF.
+
+### External links
+
+On the Toolforge/server build, the bot also accepts a pasted or forwarded **HTTP(S) link**
+instead of an attached Telegram file:
+
+- Direct file links: images, audio, PDFs, videos, ZIP/RAR archives, and other supported files.
+- Media pages resolved by `yt-dlp`: YouTube (`youtube.com`, `youtu.be`), VK video
+  (`vk.com`, `vkvideo.ru`), Rutube, and Apple Podcasts episodes.
+
+The original URL is written as the upload `Source:` unless the caption already contains a
+`Source:` directive. Linked ZIP/RAR archives are extracted like uploaded archives.
+
+Unsupported linked audio/video is inspected with `ffprobe` and handled with the cheapest
+Commons-compatible path:
+
+- Already accepted files pass through unchanged, including **MP3** and audio **OGG**.
+- Ogg files containing video are uploaded/remuxed as **OGV**.
+- MP4/MKV/etc. with Commons-compatible streams are remuxed/extracted without re-encoding
+  (for example AV1+Opus video to WebM, or Opus audio from MP4 to OGG).
+- Unsupported audio is converted to **OGG/Opus**.
+- Unsupported video is converted to **WebM AV1/Opus** (AV1, not VP9).
+
+`yt-dlp` can use a Netscape-format cookies file. On Toolforge the default path is
+`/data/project/bot-telegram-commons-uploader/ytdlp-cookies.txt`; override it with
+`YTDLP_COOKIES_PATH`. Normal code deploys do not touch this file.
 
 **File size:** the Telegram cloud Bot API only lets bots
 [**download files up to 20 MB**](https://core.telegram.org/bots/api#getfile), so larger
@@ -216,6 +245,8 @@ via the `SERVICE` env var (default `commons-uploader-bot`).
 | `scripts/update-code.sh` | Rebuild and push only the Lambda code |
 | `scripts/set-webhook.sh` | Point Telegram at `WEBHOOK_URL`, `TOOLFORGE_TOOL`, or the Lambda Function URL |
 | `scripts/toolforge-webhook-deploy.sh` | Build and start the Toolforge webhook webservice |
+| `scripts/toolforge-code-deploy.sh` | Toolforge code-only deploy; leaves the yt-dlp cookies file unchanged |
+| `scripts/toolforge-upload-ytdlp-cookies.sh` | Upload a local yt-dlp cookies file to Toolforge persistent storage |
 | `scripts/toolforge-deploy.sh` | Build and load the older Toolforge long-polling job |
 | `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) — Lambda |
 | `scripts/toolforge-logs.sh` | Read Toolforge webservice logs (`--tail 200`, `--since 2h`, `--errors`, `--follow`) |

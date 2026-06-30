@@ -272,6 +272,60 @@ impl Store {
         }
     }
 
+    /// Returns true when an idempotency key is still retained.
+    pub async fn has_idempotency(&self, key: &str) -> Result<bool> {
+        let now = now();
+        match &self.backend {
+            Backend::Memory => has_in_ram(key, now).await,
+            Backend::Dynamo { table, aws } => {
+                let response = aws
+                    .post_json(
+                        "dynamodb",
+                        "DynamoDB_20120810.GetItem",
+                        json!({
+                            "TableName": table,
+                            "Key": {
+                                "pk": {"S": key},
+                                "sk": {"S": "IDEMPOTENCY"},
+                            },
+                            "ProjectionExpression": "expires_at",
+                        }),
+                    )
+                    .await?;
+                let expires_at = response
+                    .get("Item")
+                    .and_then(|item| attr_i64(item, "expires_at"));
+                Ok(expires_at.is_some_and(|expires_at| expires_at >= now))
+            }
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(connection) => sqlite_has_idempotency(connection, key, now),
+        }
+    }
+
+    /// Removes an idempotency key, used when an in-flight webhook attempt fails.
+    pub async fn forget_idempotency(&self, key: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Memory => forget_in_ram(key).await,
+            Backend::Dynamo { table, aws } => {
+                aws.post_json(
+                    "dynamodb",
+                    "DynamoDB_20120810.DeleteItem",
+                    json!({
+                        "TableName": table,
+                        "Key": {
+                            "pk": {"S": key},
+                            "sk": {"S": "IDEMPOTENCY"},
+                        },
+                    }),
+                )
+                .await?;
+                Ok(())
+            }
+            #[cfg(feature = "sqlite")]
+            Backend::Sqlite(connection) => sqlite_forget_idempotency(connection, key),
+        }
+    }
+
     /// Totals onboarded profiles and uploads (admin `/stat`).
     pub async fn aggregate_stats(&self) -> Result<UploadStats> {
         match &self.backend {
@@ -326,6 +380,19 @@ async fn reserve_in_ram(key: &str, now: i64, expires_at: i64) -> Result<bool> {
     }
     seen.insert(key.to_string(), expires_at);
     Ok(true)
+}
+
+/// Checks a key in the warm-process RAM idempotency cache.
+async fn has_in_ram(key: &str, now: i64) -> Result<bool> {
+    let mut seen = IDEMPOTENCY_RAM.write().await;
+    seen.retain(|_, expiry| *expiry >= now);
+    Ok(seen.get(key).is_some_and(|expiry| *expiry >= now))
+}
+
+/// Removes a key from the warm-process RAM idempotency cache.
+async fn forget_in_ram(key: &str) -> Result<()> {
+    IDEMPOTENCY_RAM.write().await.remove(key);
+    Ok(())
 }
 
 /// Returns true for DynamoDB conditional-write failures.
@@ -646,6 +713,40 @@ fn sqlite_reserve(
     }
 }
 
+/// Checks a retained idempotency key in SQLite.
+#[cfg(feature = "sqlite")]
+fn sqlite_has_idempotency(
+    connection: &std::sync::Mutex<rusqlite::Connection>,
+    key: &str,
+    now: i64,
+) -> Result<bool> {
+    let connection = connection.lock().expect("sqlite mutex poisoned");
+    connection.execute(
+        "DELETE FROM idempotency WHERE expires_at < ?1",
+        rusqlite::params![now],
+    )?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM idempotency WHERE key = ?1 AND expires_at >= ?2",
+        rusqlite::params![key, now],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Removes one idempotency key from SQLite.
+#[cfg(feature = "sqlite")]
+fn sqlite_forget_idempotency(
+    connection: &std::sync::Mutex<rusqlite::Connection>,
+    key: &str,
+) -> Result<()> {
+    let connection = connection.lock().expect("sqlite mutex poisoned");
+    connection.execute(
+        "DELETE FROM idempotency WHERE key = ?1",
+        rusqlite::params![key],
+    )?;
+    Ok(())
+}
+
 /// Totals profiles and uploads from SQLite.
 #[cfg(feature = "sqlite")]
 fn sqlite_aggregate_stats(
@@ -814,7 +915,10 @@ mod tests {
         super::sqlite_put_profile(&connection, 7, &profile).unwrap();
         assert_eq!(super::sqlite_load_profile(&connection, 7).unwrap(), profile);
         assert!(super::sqlite_reserve(&connection, "k", 100, 200).unwrap());
+        assert!(super::sqlite_has_idempotency(&connection, "k", 101).unwrap());
         assert!(!super::sqlite_reserve(&connection, "k", 101, 201).unwrap());
+        super::sqlite_forget_idempotency(&connection, "k").unwrap();
+        assert!(!super::sqlite_has_idempotency(&connection, "k", 102).unwrap());
         let stats = super::sqlite_aggregate_stats(&connection).unwrap();
         assert_eq!(stats.users, 1);
         assert_eq!(stats.uploads, 5);

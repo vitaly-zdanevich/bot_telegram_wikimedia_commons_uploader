@@ -16,5 +16,8 @@ value = "-C target-cpu=native"
 [com.heroku.buildpacks.deb-packages]
 install = [
     "unar",
+    "libraw-bin",
+    "yt-dlp",
+    "ffmpeg",
     "curl",
 ]

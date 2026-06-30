@@ -151,6 +151,8 @@ pub enum OnboardingStep {
     AwaitingLicense,
     /// Waiting for the filename prefix.
     AwaitingPrefix,
+    /// Waiting for a filename prefix requested from `/settings`.
+    AwaitingSettingsPrefix,
     /// Waiting for a filename prefix required by a staged archive with generic names.
     AwaitingArchivePrefix,
     /// Onboarding complete; ready to upload.
@@ -166,6 +168,7 @@ impl OnboardingStep {
             "awaiting_oauth_verifier" => Some(OnboardingStep::AwaitingOAuthVerifier),
             "awaiting_license" => Some(OnboardingStep::AwaitingLicense),
             "awaiting_prefix" => Some(OnboardingStep::AwaitingPrefix),
+            "awaiting_settings_prefix" => Some(OnboardingStep::AwaitingSettingsPrefix),
             "awaiting_archive_prefix" => Some(OnboardingStep::AwaitingArchivePrefix),
             "done" => Some(OnboardingStep::Done),
             _ => None,
@@ -180,6 +183,7 @@ impl OnboardingStep {
             OnboardingStep::AwaitingOAuthVerifier => "awaiting_oauth_verifier",
             OnboardingStep::AwaitingLicense => "awaiting_license",
             OnboardingStep::AwaitingPrefix => "awaiting_prefix",
+            OnboardingStep::AwaitingSettingsPrefix => "awaiting_settings_prefix",
             OnboardingStep::AwaitingArchivePrefix => "awaiting_archive_prefix",
             OnboardingStep::Done => "done",
         }
@@ -305,6 +309,16 @@ pub struct Message {
     pub chat: Chat,
     /// Sender.
     pub from: Option<User>,
+    /// Forward attribution from current Telegram Bot API payloads.
+    pub forward_origin: Option<serde_json::Value>,
+    /// Forwarded-from user when Telegram exposes the original sender.
+    pub forward_from: Option<User>,
+    /// Forwarded-from display name when the original sender hides their account.
+    pub forward_sender_name: Option<String>,
+    /// Forwarded-from chat/channel for channel or group-origin messages.
+    pub forward_from_chat: Option<Chat>,
+    /// Forward timestamp from older Telegram Bot API payloads.
+    pub forward_date: Option<i64>,
     /// Plain text body (commands, onboarding answers).
     pub text: Option<String>,
     /// Caption attached to a photo or document.
@@ -321,6 +335,17 @@ pub struct Message {
     pub voice: Option<Voice>,
     /// Video attachment (e.g. WebM).
     pub video: Option<Video>,
+}
+
+impl Message {
+    /// Returns true when Telegram marked this message as forwarded.
+    pub fn is_forwarded(&self) -> bool {
+        self.forward_origin.is_some()
+            || self.forward_from.is_some()
+            || self.forward_sender_name.is_some()
+            || self.forward_from_chat.is_some()
+            || self.forward_date.is_some()
+    }
 }
 
 /// Telegram chat subset.
@@ -425,7 +450,7 @@ pub struct Video {
 
 #[cfg(test)]
 mod tests {
-    use super::{DngMode, License, OnboardingStep, Profile};
+    use super::{Chat, DngMode, License, Message, OnboardingStep, Profile};
 
     #[test]
     fn license_parse_round_trips_keys() {
@@ -451,6 +476,7 @@ mod tests {
             OnboardingStep::AwaitingOAuthVerifier,
             OnboardingStep::AwaitingLicense,
             OnboardingStep::AwaitingPrefix,
+            OnboardingStep::AwaitingSettingsPrefix,
             OnboardingStep::AwaitingArchivePrefix,
             OnboardingStep::Done,
         ] {
@@ -499,5 +525,34 @@ mod tests {
         profile.commons_username = Some("Example@uploader".into());
         profile.credential_ciphertext = Some("ciphertext".into());
         assert!(profile.is_ready());
+    }
+
+    #[test]
+    fn detects_forwarded_messages() {
+        let normal = Message {
+            message_id: Some(1),
+            chat: Chat { id: 1 },
+            from: None,
+            forward_origin: None,
+            forward_from: None,
+            forward_sender_name: None,
+            forward_from_chat: None,
+            forward_date: None,
+            text: Some("hello".into()),
+            caption: None,
+            media_group_id: None,
+            document: None,
+            photo: None,
+            audio: None,
+            voice: None,
+            video: None,
+        };
+        assert!(!normal.is_forwarded());
+
+        let forwarded = Message {
+            forward_sender_name: Some("Hidden sender".into()),
+            ..normal
+        };
+        assert!(forwarded.is_forwarded());
     }
 }

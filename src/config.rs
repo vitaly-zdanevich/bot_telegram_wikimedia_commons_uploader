@@ -20,6 +20,17 @@ const DEFAULT_PROJECT_NAME: &str = "telegram-wikimedia-commons-uploader-bot";
 const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 /// Whether archive previews are resized to small JPEG thumbnails before sending.
 const DEFAULT_ARCHIVE_THUMBNAIL_RESIZE: bool = false;
+/// Default yt-dlp command name.
+const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
+/// Default ffmpeg command name.
+const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
+/// Default ffprobe command name.
+const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
+/// Default location for a persistent Toolforge yt-dlp cookie file.
+const DEFAULT_TOOLFORGE_YTDLP_COOKIES_PATH: &str =
+    "/data/project/bot-telegram-commons-uploader/ytdlp-cookies.txt";
+/// Default location for Lambda-style packaged cookies, kept for compatibility.
+const DEFAULT_PACKAGED_YTDLP_COOKIES_PATH: &str = "/var/task/etc/ytdlp-cookies.txt";
 
 /// Runtime configuration loaded from environment variables.
 #[derive(Clone, Debug)]
@@ -64,6 +75,14 @@ pub struct Config {
     pub oauth_consumer_key: Option<String>,
     /// OAuth 1.0a consumer secret.
     pub oauth_consumer_secret: Option<String>,
+    /// yt-dlp executable used for YouTube/VK/RuTube/Apple Podcasts links.
+    pub ytdlp_path: String,
+    /// Optional Netscape cookies file passed to yt-dlp.
+    pub ytdlp_cookies_path: Option<String>,
+    /// ffmpeg executable used to transcode unsupported linked media to Commons formats.
+    pub ffmpeg_path: String,
+    /// ffprobe executable used to inspect linked media streams before transcoding.
+    pub ffprobe_path: String,
 }
 
 impl Config {
@@ -104,6 +123,19 @@ impl Config {
         let archive_thumbnail_resize = lookup("ARCHIVE_THUMBNAIL_RESIZE")
             .and_then(|value| parse_bool(&value))
             .unwrap_or(DEFAULT_ARCHIVE_THUMBNAIL_RESIZE);
+        let tool_data_cookies_path = lookup("TOOL_DATA_DIR")
+            .filter(|value| !value.trim().is_empty())
+            .map(|dir| format!("{}/ytdlp-cookies.txt", dir.trim_end_matches('/')))
+            .or_else(|| {
+                lookup("TOOLFORGE_TOOL")
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|tool| format!("/data/project/{tool}/ytdlp-cookies.txt"))
+            });
+        let ytdlp_cookies_path = lookup("YTDLP_COOKIES_PATH")
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| tool_data_cookies_path.and_then(|path| existing_file(&path)))
+            .or_else(|| existing_file(DEFAULT_TOOLFORGE_YTDLP_COOKIES_PATH))
+            .or_else(|| existing_file(DEFAULT_PACKAGED_YTDLP_COOKIES_PATH));
         let github_url = lookup("GITHUB_URL").unwrap_or_else(|| DEFAULT_GITHUB_URL.into());
         let user_agent = lookup("COMMONS_USER_AGENT").unwrap_or_else(|| {
             format!(
@@ -141,6 +173,16 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             oauth_consumer_secret: lookup("OAUTH_CONSUMER_SECRET")
                 .filter(|value| !value.trim().is_empty()),
+            ytdlp_path: lookup("YTDLP_PATH")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_YTDLP_PATH.into()),
+            ytdlp_cookies_path,
+            ffmpeg_path: lookup("FFMPEG_PATH")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_FFMPEG_PATH.into()),
+            ffprobe_path: lookup("FFPROBE_PATH")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_FFPROBE_PATH.into()),
         }
     }
 
@@ -148,6 +190,13 @@ impl Config {
     pub fn is_admin(&self, user_id: i64) -> bool {
         self.admin_user_ids.contains(&user_id)
     }
+}
+
+/// Returns a path only when it already exists.
+fn existing_file(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .is_file()
+        .then(|| path.to_string())
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -169,8 +218,9 @@ fn parse_admin_ids(value: &str) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_ARCHIVE_THUMBNAIL_RESIZE, DEFAULT_MAX_ARCHIVE_FILE_MB,
-        DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_WEBP_QUALITY, parse_admin_ids,
+        Config, DEFAULT_ARCHIVE_THUMBNAIL_RESIZE, DEFAULT_FFMPEG_PATH, DEFAULT_FFPROBE_PATH,
+        DEFAULT_MAX_ARCHIVE_FILE_MB, DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_WEBP_QUALITY,
+        DEFAULT_YTDLP_PATH, parse_admin_ids,
     };
     use crate::models::License;
     use std::collections::HashMap;
@@ -215,6 +265,9 @@ mod tests {
             config.commons_api_url,
             "https://commons.wikimedia.org/w/api.php"
         );
+        assert_eq!(config.ytdlp_path, DEFAULT_YTDLP_PATH);
+        assert_eq!(config.ffmpeg_path, DEFAULT_FFMPEG_PATH);
+        assert_eq!(config.ffprobe_path, DEFAULT_FFPROBE_PATH);
     }
 
     #[test]
@@ -232,6 +285,10 @@ mod tests {
             ("MAX_CONVERSION_FILE_MB", "128"),
             ("MAX_ARCHIVE_FILE_MB", "2048"),
             ("ARCHIVE_THUMBNAIL_RESIZE", "false"),
+            ("YTDLP_PATH", "/opt/bin/yt-dlp"),
+            ("YTDLP_COOKIES_PATH", "/cookies/youtube.txt"),
+            ("FFMPEG_PATH", "/opt/bin/ffmpeg"),
+            ("FFPROBE_PATH", "/opt/bin/ffprobe"),
         ]);
 
         assert_eq!(config.telegram_bot_token.as_deref(), Some("token"));
@@ -246,6 +303,13 @@ mod tests {
         assert_eq!(config.max_conversion_file_bytes, 128 * 1024 * 1024);
         assert_eq!(config.max_archive_file_bytes, 2048 * 1024 * 1024);
         assert!(!config.archive_thumbnail_resize);
+        assert_eq!(config.ytdlp_path, "/opt/bin/yt-dlp");
+        assert_eq!(
+            config.ytdlp_cookies_path.as_deref(),
+            Some("/cookies/youtube.txt")
+        );
+        assert_eq!(config.ffmpeg_path, "/opt/bin/ffmpeg");
+        assert_eq!(config.ffprobe_path, "/opt/bin/ffprobe");
         assert!(config.is_admin(42));
         assert!(!config.is_admin(1));
     }

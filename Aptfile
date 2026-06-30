@@ -7,6 +7,11 @@ unar
 # LibRaw command-line decoder used as a DNG raw-development fallback.
 libraw-bin
 
+# External media links are resolved with yt-dlp; ffmpeg remuxes supported streams
+# or converts unsupported audio/video to Commons-friendly OGG/Opus or WebM AV1/Opus.
+yt-dlp
+ffmpeg
+
 # Used by the Toolforge wrapper to register the local Bot API webhook on startup.
 curl
 

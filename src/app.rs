@@ -15,7 +15,7 @@ use crate::telegram::{
     InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramFile, escape_html,
     license_keyboard,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -27,12 +27,14 @@ use hyper_util::rt::TokioIo;
 use lambda_http::{Body, Request as LambdaRequest, Response as LambdaResponse};
 use once_cell::sync::Lazy;
 use std::convert::Infallible;
+use std::ffi::OsString;
+use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
-#[cfg(feature = "archive")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::sync::Semaphore;
+use url::Url;
 
 /// Telegram handle of the author, shown in `/help`.
 const CONTACT: &str = "@vitaly_zdanevich";
@@ -57,6 +59,8 @@ const RELATED_CLI: &str =
     "https://gitlab.com/vitaly_zdanevich_wikimedia/pwb_wrapper_for_simpler_uploading_to_commons";
 /// How long a processed Telegram update id is remembered (suppresses webhook retries).
 const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
+/// How long an in-flight webhook update can block duplicate delivery attempts.
+const UPDATE_IN_PROGRESS_SECONDS: i64 = 10 * 60;
 /// Message shown once onboarding is complete.
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 /// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
@@ -69,6 +73,16 @@ const MEDIA_GROUP_CAPTION_WAIT_MS: u64 = 300;
 const MEDIA_GROUP_UPLOAD_DELAY_MS: u64 = 5_000;
 /// Keeps deferred album uploads from starting all at once.
 static MEDIA_GROUP_UPLOADS: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(1));
+/// Maximum time spent downloading a direct URL.
+const DIRECT_URL_DOWNLOAD_TIMEOUT_SECS: u64 = 20 * 60;
+/// Maximum time spent downloading with yt-dlp.
+const YTDLP_DOWNLOAD_TIMEOUT_SECS: u64 = 45 * 60;
+/// Maximum time spent transcoding unsupported linked media.
+const FFMPEG_TRANSCODE_TIMEOUT_SECS: u64 = 60 * 60;
+/// yt-dlp video selector: prefer AV1+Opus, but still download a file if a site has no AV1.
+const YTDLP_VIDEO_FORMAT_SELECTOR: &str = "bestvideo[ext=webm][vcodec^=av01]+bestaudio[ext=webm][acodec=opus]/bestvideo[vcodec^=av01]+bestaudio[acodec=opus]/bestvideo+bestaudio/best";
+/// yt-dlp audio selector for podcast-style links.
+const YTDLP_AUDIO_FORMAT_SELECTOR: &str = "bestaudio/best";
 
 /// Keeps Telegram's chat action visible while a long operation is running.
 struct ChatActionGuard {
@@ -493,28 +507,62 @@ async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> 
     let update: Update = serde_json::from_slice(body).context("invalid Telegram update JSON")?;
 
     let bot = Bot::from_config(config);
+    let mut in_progress_key = None;
+    let mut done_key = None;
     if let Some(update_id) = update.update_id {
+        let done = format!("TELEGRAM_UPDATE_DONE#{update_id}");
+        match bot.store.has_idempotency(&done).await {
+            Ok(true) => {
+                tracing::info!(update_id, "skipping already processed Telegram update");
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "processed-update check failed");
+            }
+        }
+
+        let busy = format!("TELEGRAM_UPDATE_BUSY#{update_id}");
         match bot
             .store
-            .reserve_idempotency(
-                &format!("TELEGRAM_UPDATE#{update_id}"),
-                UPDATE_IDEMPOTENCY_SECONDS,
-            )
+            .reserve_idempotency(&busy, UPDATE_IN_PROGRESS_SECONDS)
             .await
         {
             Ok(false) => {
-                tracing::info!(update_id, "skipping duplicate Telegram update");
+                tracing::info!(update_id, "Telegram update is already being processed");
                 return Ok(());
             }
-            Ok(true) => {}
+            Ok(true) => {
+                in_progress_key = Some(busy);
+                done_key = Some(done);
+            }
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "idempotency reservation failed");
+                tracing::warn!(error = %format!("{error:#}"), "in-progress update reservation failed");
             }
         }
     }
 
-    if let Err(error) = bot.handle_update(update).await {
-        tracing::error!(error = %format!("{error:#}"), "failed to handle Telegram update");
+    let result = bot.handle_update(update).await;
+    if let Some(key) = in_progress_key.as_deref()
+        && let Err(error) = bot.store.forget_idempotency(key).await
+    {
+        tracing::warn!(error = %format!("{error:#}"), "failed to clear in-progress update marker");
+    }
+    match result {
+        Ok(()) => {
+            if let Some(key) = done_key.as_deref()
+                && let Err(error) = bot
+                    .store
+                    .reserve_idempotency(key, UPDATE_IDEMPOTENCY_SECONDS)
+                    .await
+            {
+                tracing::warn!(error = %format!("{error:#}"), "processed-update reservation failed");
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "failed to handle Telegram update");
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -587,6 +635,104 @@ struct FileRef {
     mime: Option<String>,
     file_size: Option<u64>,
     compressed_photo: bool,
+}
+
+/// File resolved from an external URL.
+struct LinkedFile {
+    file: TelegramFile,
+    file_name: Option<String>,
+    mime: Option<String>,
+    source_url: String,
+    unique_id: String,
+    cleanup_paths: Vec<PathBuf>,
+}
+
+/// Removes temporary files when an upload/download path exits.
+#[derive(Default)]
+struct TempPathCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl TempPathCleanup {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+}
+
+impl Drop for TempPathCleanup {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "failed to remove temporary file"
+                );
+            }
+        }
+    }
+}
+
+/// First external URL found in a text message.
+#[derive(Clone, Debug)]
+struct LinkCandidate {
+    url: Url,
+    token: String,
+}
+
+/// Minimal media stream metadata read from ffprobe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MediaProbe {
+    streams: Vec<MediaStreamInfo>,
+}
+
+impl MediaProbe {
+    fn first_video_codec(&self) -> Option<&str> {
+        self.streams
+            .iter()
+            .find(|stream| stream.kind == "video")
+            .and_then(|stream| stream.codec.as_deref())
+    }
+
+    fn first_audio_codec(&self) -> Option<&str> {
+        self.streams
+            .iter()
+            .find(|stream| stream.kind == "audio")
+            .and_then(|stream| stream.codec.as_deref())
+    }
+
+    fn has_video(&self) -> bool {
+        self.first_video_codec().is_some()
+    }
+}
+
+/// One ffprobe stream reduced to the fields needed for Commons format decisions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MediaStreamInfo {
+    kind: String,
+    codec: Option<String>,
+}
+
+/// What ffmpeg should do to make a linked media file acceptable to Commons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FfmpegPlan {
+    kind: FfmpegPlanKind,
+    extension: &'static str,
+    mime: &'static str,
+}
+
+/// Supported ffmpeg operations, from lossless remux/extract through AV1 conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FfmpegPlanKind {
+    RemuxWebm,
+    RemuxOgv,
+    ExtractOggAudio,
+    ExtractMp3,
+    ExtractFlac,
+    TranscodeAudioOpus,
+    CopyVideoTranscodeAudioWebm,
+    TranscodeVideoAv1CopyAudio,
+    TranscodeVideoAv1Opus,
 }
 
 /// Structured outcome of running one file through the convert + upload pipeline.
@@ -666,10 +812,15 @@ impl Bot {
             return self.handle_upload(chat_id, user_id, &message).await;
         }
 
-        let text = message.text.clone().unwrap_or_default();
+        let text = message_text_for_links(&message).unwrap_or_default();
         let trimmed = text.trim().to_string();
         if trimmed.starts_with('/') {
             return self.handle_command(chat_id, user_id, &trimmed).await;
+        }
+        if let Some(url) = first_external_url(&trimmed) {
+            return self
+                .handle_link_upload(chat_id, user_id, &message, url)
+                .await;
         }
         self.handle_onboarding_text(chat_id, user_id, &message, &trimmed)
             .await
@@ -767,6 +918,15 @@ impl Bot {
                         chat_id,
                         "Send a <b>filename prefix</b> for your uploads, or tap Skip for none.",
                         Some(skip_prefix_keyboard()),
+                    )
+                    .await
+            }
+            OnboardingStep::AwaitingSettingsPrefix => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        "Send the new <b>filename prefix</b> as a message, or /cancel.",
+                        None,
                     )
                     .await
             }
@@ -982,6 +1142,27 @@ impl Bot {
                 self.store.put_profile(user_id, &profile).await?;
                 self.telegram
                     .send_message(chat_id, ONBOARDING_DONE_MSG, None)
+                    .await
+            }
+            OnboardingStep::AwaitingSettingsPrefix => {
+                let prefix = if text.eq_ignore_ascii_case("skip")
+                    || text.eq_ignore_ascii_case("clear")
+                    || text.eq_ignore_ascii_case("clean")
+                {
+                    String::new()
+                } else {
+                    text.to_string()
+                };
+                profile.filename_prefix = prefix;
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        &settings_overview(&profile),
+                        Some(settings_keyboard(&profile)),
+                    )
                     .await
             }
             #[cfg(feature = "archive")]
@@ -1247,7 +1428,54 @@ impl Bot {
                 .await;
         }
 
+        if data == "set:prefix" {
+            return self
+                .replace_message_text_or_send(
+                    chat_id,
+                    callback_message_id,
+                    &settings_overview(&profile),
+                    Some(settings_prefix_keyboard(&profile)),
+                )
+                .await;
+        }
+
+        if data == "set:prefix:set" {
+            profile.onboarding_step = OnboardingStep::AwaitingSettingsPrefix;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .replace_message_text_or_send(
+                    chat_id,
+                    callback_message_id,
+                    &settings_prefix_prompt(&profile),
+                    Some(settings_prefix_input_keyboard(&profile)),
+                )
+                .await;
+        }
+
+        if data == "set:prefix:clear" {
+            profile.filename_prefix.clear();
+            if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+                profile.onboarding_step = OnboardingStep::Done;
+            }
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .replace_settings_message(
+                    chat_id,
+                    callback_message_id,
+                    &profile,
+                    settings_keyboard(&profile),
+                )
+                .await;
+        }
+
         if data == "set:main" {
+            if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+            }
             return self
                 .replace_settings_message(
                     chat_id,
@@ -1301,23 +1529,18 @@ impl Bot {
         .await
     }
 
-    /// Replaces a settings message in place; falls back only when Telegram gives no editable id.
-    async fn replace_settings_message(
+    /// Replaces a bot message in place; falls back only when Telegram gives no editable id.
+    async fn replace_message_text_or_send(
         &self,
         chat_id: i64,
         message_id: Option<i64>,
-        profile: &Profile,
-        reply_markup: InlineKeyboardMarkup,
+        text: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> Result<()> {
         if let Some(message_id) = message_id {
             match self
                 .telegram
-                .edit_message_text(
-                    chat_id,
-                    message_id,
-                    &settings_overview(profile),
-                    Some(reply_markup.clone()),
-                )
+                .edit_message_text(chat_id, message_id, text, reply_markup.clone())
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -1326,14 +1549,31 @@ impl Bot {
                         chat_id,
                         message_id,
                         error = %format!("{error:#}"),
-                        "failed to edit settings message; sending a fresh settings message"
+                        "failed to edit Telegram message; sending a fresh message"
                     );
                 }
             }
         }
         self.telegram
-            .send_message(chat_id, &settings_overview(profile), Some(reply_markup))
+            .send_message(chat_id, text, reply_markup)
             .await
+    }
+
+    /// Replaces a settings message in place; falls back only when Telegram gives no editable id.
+    async fn replace_settings_message(
+        &self,
+        chat_id: i64,
+        message_id: Option<i64>,
+        profile: &Profile,
+        reply_markup: InlineKeyboardMarkup,
+    ) -> Result<()> {
+        self.replace_message_text_or_send(
+            chat_id,
+            message_id,
+            &settings_overview(profile),
+            Some(reply_markup),
+        )
+        .await
     }
 
     /// Shows or updates settings.
@@ -1451,6 +1691,11 @@ impl Bot {
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
         }
+        if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+        }
         self.telegram
             .send_message(chat_id, "Cancelled. Use /start or /settings.", None)
             .await
@@ -1492,14 +1737,17 @@ impl Bot {
         let max_upload_size = format_size_limit(self.config.max_file_bytes);
         let conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
-        let text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<b>70 years after the author's death</b> (<b>50</b> in Belarus), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}{uploads_line}",
+        let mut text = format!(
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
-        let text = format!(
-            "{text}\n\n📦 <b>Archives</b>: send a <b>.zip</b> (or .rar) and I upload the images inside under one caption/categories. In /settings you can show the archive's file list and require a thumbnail + <b>Confirm</b> step before uploading."
-        );
+        {
+            text.push_str(
+                "\n\n📦 <b>Archives</b>: send a <b>.zip</b> (or .rar) and I upload the images inside under one caption/categories. In /settings you can show the archive's file list and require a thumbnail + <b>Confirm</b> step before uploading.",
+            );
+        }
+        text.push_str(&uploads_line);
         self.telegram.send_message(chat_id, &text, None).await
     }
 
@@ -1561,11 +1809,13 @@ impl Bot {
         file_name: Option<&str>,
         mime: Option<&str>,
         unique_id: &str,
+        source_url: Option<&str>,
         auth: &UploadAuth,
         bot_password_session: Option<&CommonsBotPasswordSession>,
         author_username: &str,
     ) -> Result<FileResult> {
         let parsed = parse_caption(caption);
+        let source = parsed.source.as_deref().or(source_url);
         let categories = upload_categories(
             &parsed.categories,
             extra_categories,
@@ -1684,7 +1934,7 @@ impl Bot {
                 .author
                 .as_deref()
                 .or(profile.default_author.as_deref()),
-            source: parsed.source.as_deref(),
+            source,
             license: profile.license,
             license_override: profile.license_override.as_deref(),
             lang: profile.default_lang.as_deref(),
@@ -1738,6 +1988,8 @@ impl Bot {
             }
             let text = if profile.onboarding_step == OnboardingStep::AwaitingArchivePrefix {
                 "Send a filename prefix for the pending archive first 👇"
+            } else if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+                "Send the new filename prefix first 👇"
             } else {
                 "Let's finish connecting your Commons account first 👇"
             };
@@ -1818,7 +2070,14 @@ impl Bot {
                     }
                 };
                 return self
-                    .handle_archive(chat_id, user_id, &mut profile, message, original)
+                    .handle_archive(
+                        chat_id,
+                        user_id,
+                        &mut profile,
+                        caption.clone(),
+                        file.file_name.clone(),
+                        original,
+                    )
                     .await;
             }
         }
@@ -1865,6 +2124,7 @@ impl Bot {
                 file.file_name.as_deref(),
                 file.mime.as_deref(),
                 &file.file_unique_id,
+                None,
                 &auth,
                 None,
                 &author_username,
@@ -1913,6 +2173,581 @@ impl Bot {
                     .await
             }
         }
+    }
+
+    /// Downloads an external link and uploads the resulting file or extracted archive members.
+    async fn handle_link_upload(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        message: &Message,
+        link: LinkCandidate,
+    ) -> Result<()> {
+        let mut profile = self.store.get_profile(user_id).await;
+        if !profile.is_ready() {
+            let text = if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+                "Send the new filename prefix first 👇"
+            } else {
+                "Let's finish connecting your Commons account first 👇"
+            };
+            self.telegram.send_message(chat_id, text, None).await.ok();
+            let step = if profile.onboarding_step == OnboardingStep::Done {
+                OnboardingStep::AwaitingUsername
+            } else {
+                profile.onboarding_step
+            };
+            return self.prompt_step(chat_id, step).await;
+        }
+
+        send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+        let _typing = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
+        let caption_source = message_text_for_links(message).unwrap_or_default();
+        let caption = caption_without_link(&caption_source, &link);
+        let linked = match self.resolve_linked_file(&link.url).await {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    url = %link.url,
+                    error = %format!("{error:#}"),
+                    "failed to resolve linked file"
+                );
+                let text = format!(
+                    "❌ Couldn't download that link: {}",
+                    escape_html(&format!("{error}"))
+                );
+                return self.telegram.send_message(chat_id, &text, None).await;
+            }
+        };
+        let _cleanup = TempPathCleanup::new(linked.cleanup_paths.clone());
+
+        #[cfg(feature = "archive")]
+        {
+            let sniff = linked.file.read_prefix(FILE_SNIFF_BYTES)?;
+            if crate::archive::is_archive(linked.file_name.as_deref(), &sniff) {
+                if linked.file.len() > self.config.max_archive_file_bytes {
+                    return self.reject_archive_too_large(chat_id).await;
+                }
+                let caption = caption_with_source(&caption, &linked.source_url);
+                let original = linked.file.into_bytes()?;
+                return self
+                    .handle_archive(
+                        chat_id,
+                        user_id,
+                        &mut profile,
+                        caption,
+                        linked.file_name,
+                        original,
+                    )
+                    .await;
+            }
+        }
+
+        let parsed_caption = parse_caption(&caption);
+        let original_stem = file_stem(linked.file_name.as_deref());
+        let filename_prefix = effective_filename_prefix(
+            &profile.filename_prefix,
+            None,
+            &parsed_caption.description,
+            original_stem,
+        );
+        if filename_needs_descriptive_context(
+            filename_prefix,
+            &parsed_caption.description,
+            original_stem,
+        ) {
+            return self
+                .reject_generic_img_filename(chat_id, message, original_stem)
+                .await;
+        }
+
+        let (auth, author_username) = match self.resolve_auth(&profile) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return self
+                    .telegram
+                    .send_message(chat_id, &escape_html(&format!("{error}")), None)
+                    .await;
+            }
+        };
+
+        self.telegram
+            .send_chat_action(chat_id, "upload_document")
+            .await
+            .ok();
+        let result = self
+            .process_one_file(
+                &profile,
+                &caption,
+                None,
+                &[],
+                linked.file,
+                linked.file_name.as_deref(),
+                linked.mime.as_deref(),
+                &linked.unique_id,
+                Some(&linked.source_url),
+                &auth,
+                None,
+                &author_username,
+            )
+            .await?;
+
+        match result {
+            FileResult::Uploaded {
+                filename,
+                url,
+                categories,
+            } => {
+                profile.uploads_count = profile.uploads_count.saturating_add(1);
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await.ok();
+                self.send_success(chat_id, &filename, &url, &categories, &profile, false)
+                    .await
+            }
+            FileResult::Duplicate { titles } => {
+                let links = titles
+                    .iter()
+                    .map(|title| format!("• {}", commons_title_url(title)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text =
+                    format!("⚠️ This exact file already exists on Commons:\n{links}\n\nSkipped.");
+                self.telegram.send_message(chat_id, &text, None).await
+            }
+            FileResult::Rejected { reason } => {
+                let text = format!(
+                    "❌ {}.\n\nAccepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). HEIC and BMP are converted automatically. DNG handling is configurable in /settings.",
+                    escape_html(&reason)
+                );
+                self.telegram.send_message(chat_id, &text, None).await
+            }
+            FileResult::Failed { message } => {
+                self.telegram
+                    .send_message(chat_id, &escape_html(&message), None)
+                    .await
+            }
+        }
+    }
+
+    /// Resolves an HTTP(S) link into a local file ready for the normal upload pipeline.
+    async fn resolve_linked_file(&self, url: &Url) -> Result<LinkedFile> {
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("only http and https links are supported");
+        }
+        if is_blocked_url_host(url) {
+            bail!("links to local or private hosts are not supported");
+        }
+
+        let linked = if needs_ytdlp(url) {
+            self.download_with_ytdlp(url).await?
+        } else {
+            self.download_direct_url(url).await?
+        };
+        #[cfg(feature = "archive")]
+        {
+            let sniff = linked.file.read_prefix(FILE_SNIFF_BYTES)?;
+            if crate::archive::is_archive(linked.file_name.as_deref(), &sniff) {
+                return Ok(linked);
+            }
+        }
+        self.ensure_linked_file_commons_compatible(linked).await
+    }
+
+    /// Downloads a direct file URL to `/tmp`, streaming chunks without buffering it all in RAM.
+    async fn download_direct_url(&self, url: &Url) -> Result<LinkedFile> {
+        let client = reqwest::Client::builder()
+            .user_agent(&self.config.user_agent)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(std::time::Duration::from_secs(
+                DIRECT_URL_DOWNLOAD_TIMEOUT_SECS,
+            ))
+            .build()
+            .context("failed to build linked-file HTTP client")?;
+        let mut response = client
+            .get(url.clone())
+            .send()
+            .await
+            .context("failed to request linked file")?
+            .error_for_status()
+            .context("linked file returned an error status")?;
+        let max_bytes = self.max_external_download_bytes();
+        if let Some(length) = response.content_length()
+            && length > max_bytes
+        {
+            bail!(
+                "linked file is {}, larger than the configured {} limit",
+                format_size_limit(length),
+                format_size_limit(max_bytes)
+            );
+        }
+
+        let headers = response.headers().clone();
+        let file_name =
+            filename_from_headers_or_url(&headers, url).unwrap_or_else(|| "linked-file".into());
+        let mime = content_type(&headers);
+        let path = temp_link_path(&file_name)?;
+        let mut file = std::fs::File::create(&path)
+            .with_context(|| format!("failed to create temp file {}", path.display()))?;
+        let mut written = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("failed while reading linked file")?
+        {
+            written = written.saturating_add(chunk.len() as u64);
+            if written > max_bytes {
+                drop(file);
+                std::fs::remove_file(&path).ok();
+                bail!(
+                    "linked file is larger than the configured {} limit",
+                    format_size_limit(max_bytes)
+                );
+            }
+            file.write_all(&chunk)
+                .with_context(|| format!("failed to write temp file {}", path.display()))?;
+        }
+        file.flush()
+            .with_context(|| format!("failed to flush temp file {}", path.display()))?;
+        drop(file);
+        let size = std::fs::metadata(&path)
+            .with_context(|| format!("failed to stat temp file {}", path.display()))?
+            .len();
+        if size == 0 {
+            std::fs::remove_file(&path).ok();
+            bail!("linked file is empty");
+        }
+        let unique_id = short_id_path(&path)?;
+        Ok(LinkedFile {
+            file: TelegramFile::LocalPath {
+                path: path.clone(),
+                size,
+            },
+            file_name: Some(file_name),
+            mime,
+            source_url: url.as_str().to_string(),
+            unique_id,
+            cleanup_paths: vec![path],
+        })
+    }
+
+    /// Uses yt-dlp for websites where the URL is a page, not the media file itself.
+    async fn download_with_ytdlp(&self, url: &Url) -> Result<LinkedFile> {
+        let dir = tempfile::tempdir().context("failed to create yt-dlp temp directory")?;
+        let output_template = dir.path().join("%(title).180B-%(id)s.%(ext)s");
+        let mut command = Command::new(&self.config.ytdlp_path);
+        command
+            .arg("--no-playlist")
+            .arg("--no-progress")
+            .arg("--max-filesize")
+            .arg(self.max_external_download_bytes().to_string())
+            .arg("-o")
+            .arg(&output_template);
+
+        if is_apple_podcasts_url(url) {
+            command.arg("-f").arg(YTDLP_AUDIO_FORMAT_SELECTOR);
+        } else {
+            command.arg("-f").arg(YTDLP_VIDEO_FORMAT_SELECTOR);
+        }
+        if let Some(cookies) = self.prepare_ytdlp_cookies_file()? {
+            command.arg("--cookies").arg(cookies);
+        }
+        command.arg(url.as_str());
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(YTDLP_DOWNLOAD_TIMEOUT_SECS),
+            command.output(),
+        )
+        .await
+        .context("yt-dlp timed out")?
+        .context("failed to launch yt-dlp")?;
+        if !output.status.success() {
+            bail!(
+                "yt-dlp exited with {}: {}",
+                output.status,
+                command_stderr(&output.stderr)
+            );
+        }
+
+        let downloaded = find_downloaded_file(dir.path())
+            .with_context(|| format!("yt-dlp did not create a media file for {url}"))?;
+        let file_name = downloaded
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(sanitize_download_filename)
+            .unwrap_or_else(|| "linked-media".into());
+        let target = temp_link_path(&file_name)?;
+        match std::fs::rename(&downloaded, &target) {
+            Ok(()) => {}
+            Err(rename_error) => {
+                std::fs::copy(&downloaded, &target).with_context(|| {
+                    format!(
+                        "failed to move yt-dlp output {} to {} after rename failed ({rename_error})",
+                        downloaded.display(),
+                        target.display()
+                    )
+                })?;
+                std::fs::remove_file(&downloaded).ok();
+            }
+        }
+        let size = std::fs::metadata(&target)
+            .with_context(|| format!("failed to stat yt-dlp output {}", target.display()))?
+            .len();
+        if size == 0 {
+            std::fs::remove_file(&target).ok();
+            bail!("yt-dlp downloaded an empty file");
+        }
+        let unique_id = short_id_path(&target)?;
+        Ok(LinkedFile {
+            file: TelegramFile::LocalPath {
+                path: target.clone(),
+                size,
+            },
+            mime: file_extension_for_name(&file_name).and_then(mime_for_extension),
+            file_name: Some(file_name),
+            source_url: url.as_str().to_string(),
+            unique_id,
+            cleanup_paths: vec![target],
+        })
+    }
+
+    /// Converts/remuxes linked media only when Commons would reject the downloaded file.
+    async fn ensure_linked_file_commons_compatible(
+        &self,
+        mut linked: LinkedFile,
+    ) -> Result<LinkedFile> {
+        let name_extension = linked
+            .file_name
+            .as_deref()
+            .and_then(file_extension_for_name);
+        let extension = if name_extension
+            .as_deref()
+            .is_some_and(convert::is_commons_accepted)
+        {
+            name_extension.unwrap()
+        } else if let Some(mime_extension) =
+            linked.mime.as_deref().and_then(accepted_extension_for_mime)
+        {
+            let current_name = linked.file_name.as_deref().unwrap_or("linked-file");
+            linked.file_name = Some(filename_with_extension(current_name, &mime_extension));
+            mime_extension
+        } else {
+            name_extension.unwrap_or_default()
+        };
+        let path = linked
+            .file
+            .as_path()
+            .context("linked downloads must be stored on disk")?
+            .to_path_buf();
+
+        if convert::is_commons_accepted(&extension) {
+            if matches!(extension.as_str(), "ogg" | "oga") {
+                match self.probe_media(&path).await {
+                    Ok(probe) if probe.has_video() => {
+                        let plan = FfmpegPlan {
+                            kind: FfmpegPlanKind::RemuxOgv,
+                            extension: "ogv",
+                            mime: "video/ogg",
+                        };
+                        return self.run_ffmpeg_plan(&path, linked, plan).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %format!("{error:#}"),
+                            "failed to inspect accepted Ogg file; uploading as-is"
+                        );
+                    }
+                }
+            }
+            if linked.file.len() > self.config.max_file_bytes {
+                bail!(
+                    "linked file is {}, larger than the configured {} upload limit",
+                    format_size_limit(linked.file.len()),
+                    format_size_limit(self.config.max_file_bytes)
+                );
+            }
+            return Ok(linked);
+        }
+
+        if linked.file.len() > self.config.max_conversion_file_bytes {
+            bail!(
+                "linked file needs conversion and is {}, larger than the configured {} conversion limit",
+                format_size_limit(linked.file.len()),
+                format_size_limit(self.config.max_conversion_file_bytes)
+            );
+        }
+        let probe = self.probe_media(&path).await?;
+        let plan = ffmpeg_plan_for_probe(&probe).with_context(|| {
+            format!(
+                "Commons does not accept .{} files, and ffprobe did not find convertible audio/video streams",
+                if extension.is_empty() { "bin" } else { &extension }
+            )
+        })?;
+        let converted = self.run_ffmpeg_plan(&path, linked, plan).await?;
+        if converted.file.len() > self.config.max_file_bytes {
+            bail!(
+                "converted file is {}, larger than the configured {} upload limit",
+                format_size_limit(converted.file.len()),
+                format_size_limit(self.config.max_file_bytes)
+            );
+        }
+        Ok(converted)
+    }
+
+    /// Reads stream codec metadata with ffprobe.
+    async fn probe_media(&self, path: &Path) -> Result<MediaProbe> {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Command::new(&self.config.ffprobe_path)
+                .arg("-v")
+                .arg("error")
+                .arg("-show_entries")
+                .arg("stream=codec_type,codec_name")
+                .arg("-of")
+                .arg("json")
+                .arg(path)
+                .output(),
+        )
+        .await
+        .context("ffprobe timed out")?
+        .context("failed to launch ffprobe")?;
+        if !output.status.success() {
+            bail!(
+                "ffprobe exited with {}: {}",
+                output.status,
+                command_stderr(&output.stderr)
+            );
+        }
+
+        #[derive(serde::Deserialize)]
+        struct FfprobeOutput {
+            #[serde(default)]
+            streams: Vec<FfprobeStream>,
+        }
+        #[derive(serde::Deserialize)]
+        struct FfprobeStream {
+            codec_type: Option<String>,
+            codec_name: Option<String>,
+        }
+
+        let parsed: FfprobeOutput =
+            serde_json::from_slice(&output.stdout).context("ffprobe returned invalid JSON")?;
+        Ok(MediaProbe {
+            streams: parsed
+                .streams
+                .into_iter()
+                .filter_map(|stream| {
+                    Some(MediaStreamInfo {
+                        kind: stream.codec_type?,
+                        codec: stream.codec_name.map(|codec| codec.to_ascii_lowercase()),
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    /// Runs the selected ffmpeg plan and returns a new disk-backed linked file.
+    async fn run_ffmpeg_plan(
+        &self,
+        input: &Path,
+        linked: LinkedFile,
+        plan: FfmpegPlan,
+    ) -> Result<LinkedFile> {
+        let source_name = linked.file_name.as_deref().unwrap_or("linked-media");
+        let output_name = filename_with_extension(source_name, plan.extension);
+        let output_path = temp_link_path(&output_name)?;
+
+        match plan.kind {
+            FfmpegPlanKind::TranscodeVideoAv1CopyAudio | FfmpegPlanKind::TranscodeVideoAv1Opus => {
+                let svt_args = ffmpeg_args_for_plan(input, &output_path, plan, Some("libsvtav1"));
+                if let Err(svt_error) = self.run_ffmpeg_args(svt_args).await {
+                    std::fs::remove_file(&output_path).ok();
+                    tracing::warn!(
+                        error = %format!("{svt_error:#}"),
+                        "ffmpeg libsvtav1 conversion failed; retrying with libaom-av1"
+                    );
+                    let aom_args =
+                        ffmpeg_args_for_plan(input, &output_path, plan, Some("libaom-av1"));
+                    self.run_ffmpeg_args(aom_args).await.with_context(|| {
+                        format!(
+                            "libsvtav1 failed first ({svt_error:#}); libaom-av1 fallback failed"
+                        )
+                    })?;
+                }
+            }
+            _ => {
+                let args = ffmpeg_args_for_plan(input, &output_path, plan, None);
+                self.run_ffmpeg_args(args).await?;
+            }
+        }
+
+        let size = std::fs::metadata(&output_path)
+            .with_context(|| format!("ffmpeg did not write {}", output_path.display()))?
+            .len();
+        if size == 0 {
+            std::fs::remove_file(&output_path).ok();
+            bail!("ffmpeg wrote an empty output file");
+        }
+
+        let mut cleanup_paths = linked.cleanup_paths;
+        cleanup_paths.push(output_path.clone());
+        let unique_id = short_id_path(&output_path)?;
+        Ok(LinkedFile {
+            file: TelegramFile::LocalPath {
+                path: output_path,
+                size,
+            },
+            file_name: Some(output_name),
+            mime: Some(plan.mime.to_string()),
+            source_url: linked.source_url,
+            unique_id,
+            cleanup_paths,
+        })
+    }
+
+    /// Runs ffmpeg with a bounded timeout and returns stderr on failure.
+    async fn run_ffmpeg_args(&self, args: Vec<OsString>) -> Result<()> {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(FFMPEG_TRANSCODE_TIMEOUT_SECS),
+            Command::new(&self.config.ffmpeg_path).args(args).output(),
+        )
+        .await
+        .context("ffmpeg timed out")?
+        .context("failed to launch ffmpeg")?;
+        if !output.status.success() {
+            bail!(
+                "ffmpeg exited with {}: {}",
+                output.status,
+                command_stderr(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    /// Largest external file this bot is willing to download before deciding what to do.
+    fn max_external_download_bytes(&self) -> u64 {
+        self.config
+            .max_file_bytes
+            .max(self.config.max_archive_file_bytes)
+            .max(self.config.max_conversion_file_bytes)
+    }
+
+    /// Returns the configured yt-dlp cookie file when it exists.
+    fn prepare_ytdlp_cookies_file(&self) -> Result<Option<PathBuf>> {
+        let Some(path) = &self.config.ytdlp_cookies_path else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "configured yt-dlp cookies file does not exist"
+        );
+        Ok(None)
     }
 
     /// Resolves the caption for a message, sharing an album's caption across its photos.
@@ -2063,13 +2898,10 @@ impl Bot {
         chat_id: i64,
         user_id: i64,
         profile: &mut Profile,
-        message: &Message,
+        caption: String,
+        file_name: Option<String>,
         original: Vec<u8>,
     ) -> Result<()> {
-        let file_name = message
-            .document
-            .as_ref()
-            .and_then(|document| document.file_name.clone());
         // Evict expired or memory-pressuring staged archives before unpacking another.
         prune_pending(original.len());
         let entries = match crate::archive::extract_images_with_limit(
@@ -2101,7 +2933,6 @@ impl Bot {
             self.telegram.send_message(chat_id, &text, None).await.ok();
         }
 
-        let caption = self.resolve_caption(message).await;
         let needs_prefix = archive_needs_filename_prefix(&entries);
         tracing::info!(
             user_id,
@@ -2126,7 +2957,7 @@ impl Bot {
             };
             let pending = PendingArchive {
                 user_id,
-                caption,
+                caption: caption.clone(),
                 filename_prefix: None,
                 archive_file_name: file_name.clone(),
                 entries,
@@ -2499,6 +3330,7 @@ impl Bot {
                     Some(&entry.name),
                     None,
                     &unique,
+                    None,
                     &auth,
                     bot_password_session.as_ref(),
                     &author_username,
@@ -3175,7 +4007,7 @@ fn settings_overview(profile: &Profile) -> String {
         ));
     }
     text.push_str(
-        "\n\nButtons below toggle options; License opens a chooser.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
+        "\n\nButtons below toggle options; Filename prefix and License open submenus.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
     );
     text
 }
@@ -3198,6 +4030,7 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             "set:misscat",
             profile.return_missing_category_links,
         )],
+        vec![settings_prefix_button(profile)],
         vec![dng_mode_button(profile.dng_mode)],
     ];
     #[cfg(feature = "archive")]
@@ -3216,6 +4049,94 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
     rows.push(vec![settings_license_button(profile.license)]);
     InlineKeyboardMarkup {
         inline_keyboard: rows,
+    }
+}
+
+/// Builds the settings entry point for filename-prefix actions.
+fn settings_prefix_button(profile: &Profile) -> InlineKeyboardButton {
+    let value = if profile.filename_prefix.is_empty() {
+        "(none)".to_string()
+    } else {
+        compact_button_value(&profile.filename_prefix)
+    };
+    InlineKeyboardButton {
+        text: format!("Filename prefix: {value}"),
+        callback_data: Some("set:prefix".to_string()),
+        url: None,
+    }
+}
+
+/// Builds the filename-prefix submenu.
+fn settings_prefix_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    let mut rows = vec![vec![InlineKeyboardButton {
+        text: "Set filename prefix".to_string(),
+        callback_data: Some("set:prefix:set".to_string()),
+        url: None,
+    }]];
+    let clear_label = if profile.filename_prefix.is_empty() {
+        "Clear filename prefix (already none)"
+    } else {
+        "Clear filename prefix"
+    };
+    rows.push(vec![InlineKeyboardButton {
+        text: clear_label.to_string(),
+        callback_data: Some("set:prefix:clear".to_string()),
+        url: None,
+    }]);
+    rows.push(vec![InlineKeyboardButton {
+        text: "← Back to settings".to_string(),
+        callback_data: Some("set:main".to_string()),
+        url: None,
+    }]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+/// Text shown while waiting for a `/settings` filename-prefix value.
+fn settings_prefix_prompt(profile: &Profile) -> String {
+    let current = if profile.filename_prefix.is_empty() {
+        "(none)".to_string()
+    } else {
+        profile.filename_prefix.clone()
+    };
+    format!(
+        "Send the new <b>filename prefix</b> as a message.\n\nCurrent prefix: <code>{}</code>\n\nSend <code>clear</code> to remove it.",
+        escape_html(&current)
+    )
+}
+
+/// Keyboard shown while the next text message will become the filename prefix.
+fn settings_prefix_input_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![InlineKeyboardButton {
+                text: if profile.filename_prefix.is_empty() {
+                    "Clear filename prefix (already none)".to_string()
+                } else {
+                    "Clear filename prefix".to_string()
+                },
+                callback_data: Some("set:prefix:clear".to_string()),
+                url: None,
+            }],
+            vec![InlineKeyboardButton {
+                text: "← Back to settings".to_string(),
+                callback_data: Some("set:main".to_string()),
+                url: None,
+            }],
+        ],
+    }
+}
+
+/// Keeps long setting values readable inside Telegram inline buttons.
+fn compact_button_value(value: &str) -> String {
+    const MAX_CHARS: usize = 28;
+    let mut chars = value.chars();
+    let compact: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
     }
 }
 
@@ -3635,6 +4556,544 @@ fn archive_name_category(file_name: Option<&str>) -> Option<String> {
     }
 }
 
+/// Returns message text that may contain a link, including forwarded caption-style text.
+fn message_text_for_links(message: &Message) -> Option<String> {
+    message
+        .text
+        .clone()
+        .or_else(|| message.caption.clone())
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Finds the first external URL in a Telegram text/caption.
+fn first_external_url(text: &str) -> Option<LinkCandidate> {
+    text.split_whitespace().find_map(|raw| {
+        let token = trim_url_token(raw);
+        if token.is_empty() {
+            return None;
+        }
+        let parsed = parse_url_token(token)?;
+        if matches!(parsed.scheme(), "http" | "https") {
+            Some(LinkCandidate {
+                url: parsed,
+                token: raw.to_string(),
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// Parses a token as an URL, accepting common link forms without an explicit scheme.
+fn parse_url_token(token: &str) -> Option<Url> {
+    Url::parse(token).ok().or_else(|| {
+        let lower = token.to_ascii_lowercase();
+        if known_link_host_token(&lower) || looks_like_bare_url(&lower) {
+            Url::parse(&format!("https://{token}")).ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// Removes punctuation Telegram users commonly place around pasted URLs.
+fn trim_url_token(token: &str) -> &str {
+    token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '<' | '>' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        })
+        .trim_end_matches(['.', '!', '?'])
+}
+
+/// True when a token starts with a media site host the bot explicitly supports.
+fn known_link_host_token(lower: &str) -> bool {
+    const HOSTS: &[&str] = &[
+        "youtube.com/",
+        "www.youtube.com/",
+        "m.youtube.com/",
+        "youtu.be/",
+        "vk.com/",
+        "m.vk.com/",
+        "vkvideo.ru/",
+        "www.vkvideo.ru/",
+        "rutube.ru/",
+        "www.rutube.ru/",
+        "podcasts.apple.com/",
+    ];
+    HOSTS.iter().any(|host| lower.starts_with(host))
+}
+
+/// Conservative fallback for bare direct links such as `example.org/file.zip`.
+fn looks_like_bare_url(lower: &str) -> bool {
+    lower.contains('/')
+        && lower
+            .split('/')
+            .next()
+            .is_some_and(|host| host.contains('.') && !host.contains('@'))
+}
+
+/// Removes the detected URL from the message text so the remaining text becomes the caption.
+fn caption_without_link(text: &str, link: &LinkCandidate) -> String {
+    let caption = text.replacen(&link.token, "", 1);
+    caption
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Adds a source directive for linked archives unless the user already supplied one.
+#[cfg(feature = "archive")]
+fn caption_with_source(caption: &str, source_url: &str) -> String {
+    if parse_caption(caption).source.is_some() {
+        return caption.to_string();
+    }
+    let trimmed = caption.trim();
+    if trimmed.is_empty() {
+        format!("Source: {source_url}")
+    } else {
+        format!("{trimmed}\nSource: {source_url}")
+    }
+}
+
+/// Blocks obvious SSRF targets for direct link downloads.
+fn is_blocked_url_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let host = host.trim_matches(&['[', ']'][..]).to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "localhost.localdomain") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+                    || ip.octets()[0] == 0
+            }
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local()
+            }
+        };
+    }
+    false
+}
+
+/// Returns true when yt-dlp should resolve a page URL to media files.
+fn needs_ytdlp(url: &Url) -> bool {
+    is_youtube_url(url) || is_vk_url(url) || is_rutube_url(url) || is_apple_podcasts_url(url)
+}
+
+fn is_youtube_url(url: &Url) -> bool {
+    host_matches(url, &["youtube.com", "youtu.be"])
+}
+
+fn is_vk_url(url: &Url) -> bool {
+    host_matches(url, &["vk.com", "vkvideo.ru"])
+}
+
+fn is_rutube_url(url: &Url) -> bool {
+    host_matches(url, &["rutube.ru"])
+}
+
+fn is_apple_podcasts_url(url: &Url) -> bool {
+    host_matches(url, &["podcasts.apple.com"])
+}
+
+fn host_matches(url: &Url, domains: &[&str]) -> bool {
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    domains
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Extracts a filename from HTTP headers or the URL path.
+fn filename_from_headers_or_url(headers: &HeaderMap, url: &Url) -> Option<String> {
+    headers
+        .get(http::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(content_disposition_filename)
+        .or_else(|| filename_from_url(url))
+        .map(|name| sanitize_download_filename(&name))
+}
+
+/// Parses the simple `filename=` forms commonly returned in Content-Disposition.
+fn content_disposition_filename(value: &str) -> Option<String> {
+    for part in value.split(';').map(str::trim) {
+        if let Some(rest) = part.strip_prefix("filename*=") {
+            let rest = rest.trim_matches('"');
+            let encoded = rest
+                .split_once("''")
+                .map(|(_, encoded)| encoded)
+                .unwrap_or(rest);
+            if let Ok(decoded) = urlencoding::decode(encoded) {
+                let decoded = decoded.trim();
+                if !decoded.is_empty() {
+                    return Some(decoded.to_string());
+                }
+            }
+        }
+        if let Some(rest) = part.strip_prefix("filename=") {
+            let name = rest.trim_matches('"').trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Uses the URL path's final segment as a fallback filename.
+fn filename_from_url(url: &Url) -> Option<String> {
+    let segment = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
+    if segment.is_empty() {
+        return None;
+    }
+    urlencoding::decode(segment)
+        .ok()
+        .map(|name| name.to_string())
+        .filter(|name| !name.trim().is_empty())
+}
+
+/// Returns the HTTP content type without parameters.
+fn content_type(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Sanitizes a remote filename for local temp storage while preserving Unicode.
+fn sanitize_download_filename(name: &str) -> String {
+    let basename = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .trim_matches('.');
+    let mut safe = basename
+        .chars()
+        .map(|ch| {
+            if ch.is_control()
+                || matches!(
+                    ch,
+                    '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    while safe.contains("__") {
+        safe = safe.replace("__", "_");
+    }
+    let safe = safe.trim_matches('_').trim();
+    let safe = if safe.is_empty() {
+        "linked-media"
+    } else {
+        safe
+    };
+    let mut chars = safe.chars();
+    let shortened = chars.by_ref().take(180).collect::<String>();
+    if chars.next().is_some() {
+        shortened
+    } else {
+        safe.to_string()
+    }
+}
+
+/// Returns a lower-case filename extension, without a leading dot.
+fn file_extension_for_name(name: &str) -> Option<String> {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| {
+            !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        })
+}
+
+/// Maps extensions to MIME types used when re-entering the upload pipeline.
+fn mime_for_extension(extension: String) -> Option<String> {
+    let mime = match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "djvu" => "image/vnd.djvu",
+        "ogg" | "oga" => "audio/ogg",
+        "opus" => "audio/opus",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "mpg" | "mpeg" => "video/mpeg",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Maps a trusted HTTP content type to an accepted Commons extension.
+fn accepted_extension_for_mime(mime: &str) -> Option<String> {
+    let extension = convert::passthrough_extension(None, Some(mime));
+    if extension != "bin" && convert::is_commons_accepted(&extension) {
+        Some(extension)
+    } else {
+        None
+    }
+}
+
+/// Replaces a filename extension while preserving the stem.
+fn filename_with_extension(file_name: &str, extension: &str) -> String {
+    let stem = file_stem(Some(file_name)).trim();
+    let stem = if stem.is_empty() {
+        "linked-media"
+    } else {
+        stem
+    };
+    sanitize_download_filename(&format!("{stem}.{extension}"))
+}
+
+/// Creates a unique temp path for a linked download or conversion output.
+fn temp_link_path(file_name: &str) -> Result<PathBuf> {
+    let safe_name = sanitize_download_filename(file_name);
+    let random: u64 = rand::random();
+    let path = std::env::temp_dir().join(format!(
+        "commons-link-{}-{random:016x}-{safe_name}",
+        std::process::id()
+    ));
+    Ok(path)
+}
+
+/// Finds the main yt-dlp output file in a temp directory.
+fn find_downloaded_file(dir: &Path) -> Result<PathBuf> {
+    let mut files = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.ends_with(".part")
+            || name.ends_with(".ytdl")
+            || name.ends_with(".temp")
+            || name.ends_with(".tmp")
+        {
+            continue;
+        }
+        let len = entry.metadata()?.len();
+        files.push((len, path));
+    }
+    files
+        .into_iter()
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, path)| path)
+        .context("no downloaded media file found")
+}
+
+/// Returns a short content id for a local file.
+fn short_id_path(path: &Path) -> Result<String> {
+    Ok(sha1_hex_path(path)?[..10].to_string())
+}
+
+/// Compact command stderr for user-facing download/conversion errors.
+fn command_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        "(no stderr)".to_string()
+    } else {
+        const MAX_CHARS: usize = 700;
+        let mut chars = text.chars();
+        let truncated = chars.by_ref().take(MAX_CHARS).collect::<String>();
+        if chars.next().is_some() {
+            format!("{truncated}…")
+        } else {
+            truncated
+        }
+    }
+}
+
+/// Chooses the cheapest ffmpeg action that yields a Commons-accepted file.
+fn ffmpeg_plan_for_probe(probe: &MediaProbe) -> Option<FfmpegPlan> {
+    let video = probe.first_video_codec();
+    let audio = probe.first_audio_codec();
+    match video {
+        None => match audio {
+            Some("mp3") => Some(FfmpegPlan {
+                kind: FfmpegPlanKind::ExtractMp3,
+                extension: "mp3",
+                mime: "audio/mpeg",
+            }),
+            Some("flac") => Some(FfmpegPlan {
+                kind: FfmpegPlanKind::ExtractFlac,
+                extension: "flac",
+                mime: "audio/flac",
+            }),
+            Some(codec) if is_ogg_audio_codec(codec) => Some(FfmpegPlan {
+                kind: FfmpegPlanKind::ExtractOggAudio,
+                extension: "ogg",
+                mime: "audio/ogg",
+            }),
+            Some(_) => Some(FfmpegPlan {
+                kind: FfmpegPlanKind::TranscodeAudioOpus,
+                extension: "ogg",
+                mime: "audio/ogg",
+            }),
+            None => None,
+        },
+        Some(codec) if codec == "theora" && audio.is_none_or(is_ogg_audio_codec) => {
+            Some(FfmpegPlan {
+                kind: FfmpegPlanKind::RemuxOgv,
+                extension: "ogv",
+                mime: "video/ogg",
+            })
+        }
+        Some(codec) if is_webm_video_codec(codec) && audio.is_none_or(is_webm_audio_codec) => {
+            Some(FfmpegPlan {
+                kind: FfmpegPlanKind::RemuxWebm,
+                extension: "webm",
+                mime: "video/webm",
+            })
+        }
+        Some(codec) if is_webm_video_codec(codec) => Some(FfmpegPlan {
+            kind: FfmpegPlanKind::CopyVideoTranscodeAudioWebm,
+            extension: "webm",
+            mime: "video/webm",
+        }),
+        Some(_) if audio.is_none_or(is_webm_audio_codec) => Some(FfmpegPlan {
+            kind: FfmpegPlanKind::TranscodeVideoAv1CopyAudio,
+            extension: "webm",
+            mime: "video/webm",
+        }),
+        Some(_) => Some(FfmpegPlan {
+            kind: FfmpegPlanKind::TranscodeVideoAv1Opus,
+            extension: "webm",
+            mime: "video/webm",
+        }),
+    }
+}
+
+fn is_webm_video_codec(codec: &str) -> bool {
+    matches!(codec, "av1" | "vp8" | "vp9")
+}
+
+fn is_webm_audio_codec(codec: &str) -> bool {
+    matches!(codec, "opus" | "vorbis")
+}
+
+fn is_ogg_audio_codec(codec: &str) -> bool {
+    matches!(codec, "opus" | "vorbis")
+}
+
+/// Builds ffmpeg arguments for a media conversion plan.
+fn ffmpeg_args_for_plan(
+    input: &Path,
+    output: &Path,
+    plan: FfmpegPlan,
+    av1_encoder: Option<&str>,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+    ];
+    match plan.kind {
+        FfmpegPlanKind::RemuxWebm | FfmpegPlanKind::RemuxOgv => {
+            args.extend(os_args(["-map", "0", "-c", "copy"]));
+        }
+        FfmpegPlanKind::ExtractOggAudio
+        | FfmpegPlanKind::ExtractMp3
+        | FfmpegPlanKind::ExtractFlac => {
+            args.extend(os_args(["-vn", "-map", "0:a:0", "-c:a", "copy"]));
+        }
+        FfmpegPlanKind::TranscodeAudioOpus => {
+            args.extend(os_args([
+                "-vn", "-map", "0:a:0", "-c:a", "libopus", "-b:a", "128k", "-f", "ogg",
+            ]));
+        }
+        FfmpegPlanKind::CopyVideoTranscodeAudioWebm => {
+            args.extend(os_args([
+                "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "libopus", "-b:a",
+                "128k",
+            ]));
+        }
+        FfmpegPlanKind::TranscodeVideoAv1CopyAudio => {
+            args.extend(os_args(["-map", "0:v:0", "-map", "0:a:0?"]));
+            append_av1_encoder_args(&mut args, av1_encoder.unwrap_or("libsvtav1"));
+            args.extend(os_args(["-c:a", "copy"]));
+        }
+        FfmpegPlanKind::TranscodeVideoAv1Opus => {
+            args.extend(os_args(["-map", "0:v:0", "-map", "0:a:0?"]));
+            append_av1_encoder_args(&mut args, av1_encoder.unwrap_or("libsvtav1"));
+            args.extend(os_args(["-c:a", "libopus", "-b:a", "128k"]));
+        }
+    }
+    args.push(output.as_os_str().to_os_string());
+    args
+}
+
+fn append_av1_encoder_args(args: &mut Vec<OsString>, encoder: &str) {
+    match encoder {
+        "libaom-av1" => args.extend(os_args([
+            "-c:v",
+            "libaom-av1",
+            "-crf",
+            "35",
+            "-b:v",
+            "0",
+            "-cpu-used",
+            "6",
+            "-row-mt",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ])),
+        _ => args.extend(os_args([
+            "-c:v",
+            "libsvtav1",
+            "-crf",
+            "35",
+            "-preset",
+            "8",
+            "-pix_fmt",
+            "yuv420p",
+        ])),
+    }
+}
+
+fn os_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
+    args.into_iter().map(OsString::from).collect()
+}
+
 /// Builds a Commons URL from a canonical `File:`/`Category:` title.
 fn commons_title_url(title: &str) -> String {
     format!(
@@ -3646,8 +5105,11 @@ fn commons_title_url(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        conversion_rejection_reason, effective_filename_prefix, filename_needs_descriptive_context,
-        merge_categories, parse_category_list, settings_keyboard, settings_license_keyboard,
+        FfmpegPlan, FfmpegPlanKind, MediaProbe, MediaStreamInfo, caption_without_link,
+        conversion_rejection_reason, effective_filename_prefix, ffmpeg_plan_for_probe,
+        filename_needs_descriptive_context, first_external_url, merge_categories,
+        parse_category_list, settings_keyboard, settings_license_keyboard,
+        settings_prefix_keyboard,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -3668,6 +5130,77 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
+    }
+
+    #[test]
+    fn finds_external_urls_in_forwarded_text_forms() {
+        let link = first_external_url("Forwarded: see youtu.be/abc123?si=x").unwrap();
+        assert_eq!(link.url.as_str(), "https://youtu.be/abc123?si=x");
+        assert_eq!(
+            caption_without_link("Forwarded: see youtu.be/abc123?si=x", &link),
+            "Forwarded: see"
+        );
+
+        let direct = first_external_url("Archive: https://example.org/a.rar").unwrap();
+        assert_eq!(direct.url.as_str(), "https://example.org/a.rar");
+        assert_eq!(
+            caption_without_link("Archive: https://example.org/a.rar", &direct),
+            "Archive:"
+        );
+    }
+
+    #[test]
+    fn media_probe_plans_remux_extract_or_convert() {
+        assert_eq!(plan(None, Some("mp3")).kind, FfmpegPlanKind::ExtractMp3);
+        assert_eq!(
+            plan(None, Some("opus")).kind,
+            FfmpegPlanKind::ExtractOggAudio
+        );
+        assert_eq!(
+            plan(Some("av1"), Some("opus")),
+            FfmpegPlan {
+                kind: FfmpegPlanKind::RemuxWebm,
+                extension: "webm",
+                mime: "video/webm",
+            }
+        );
+        assert_eq!(
+            plan(Some("theora"), Some("vorbis")),
+            FfmpegPlan {
+                kind: FfmpegPlanKind::RemuxOgv,
+                extension: "ogv",
+                mime: "video/ogg",
+            }
+        );
+        assert_eq!(
+            plan(Some("av1"), Some("aac")).kind,
+            FfmpegPlanKind::CopyVideoTranscodeAudioWebm
+        );
+        assert_eq!(
+            plan(Some("h264"), Some("aac")).kind,
+            FfmpegPlanKind::TranscodeVideoAv1Opus
+        );
+    }
+
+    fn plan(video: Option<&str>, audio: Option<&str>) -> FfmpegPlan {
+        ffmpeg_plan_for_probe(&probe(video, audio)).unwrap()
+    }
+
+    fn probe(video: Option<&str>, audio: Option<&str>) -> MediaProbe {
+        let mut streams = Vec::new();
+        if let Some(codec) = video {
+            streams.push(MediaStreamInfo {
+                kind: "video".into(),
+                codec: Some(codec.into()),
+            });
+        }
+        if let Some(codec) = audio {
+            streams.push(MediaStreamInfo {
+                kind: "audio".into(),
+                codec: Some(codec.into()),
+            });
+        }
+        MediaProbe { streams }
     }
 
     #[test]
@@ -3739,6 +5272,43 @@ mod tests {
                     .as_deref()
                     .unwrap_or_default()
                     .starts_with(crate::telegram::LICENSE_CALLBACK_PREFIX))
+        );
+    }
+
+    #[test]
+    fn settings_keyboard_has_prefix_submenu_button() {
+        let profile = Profile {
+            filename_prefix: "A long filename prefix for a trip".into(),
+            ..Profile::default()
+        };
+        let keyboard = settings_keyboard(&profile);
+        let prefix_button = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|button| button.callback_data.as_deref() == Some("set:prefix"))
+            .expect("settings should include a filename-prefix submenu");
+
+        assert!(prefix_button.text.starts_with("Filename prefix: "));
+    }
+
+    #[test]
+    fn settings_prefix_keyboard_can_set_clear_and_return() {
+        let profile = Profile {
+            filename_prefix: "Trip".into(),
+            ..Profile::default()
+        };
+        let keyboard = settings_prefix_keyboard(&profile);
+        let callbacks: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|button| button.callback_data.as_deref().unwrap_or_default())
+            .collect();
+
+        assert_eq!(
+            callbacks,
+            vec!["set:prefix:set", "set:prefix:clear", "set:main"]
         );
     }
 

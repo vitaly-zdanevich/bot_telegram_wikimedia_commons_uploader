@@ -20,7 +20,8 @@ password without it. Nothing to install locally; the `toolforge` CLI lives on th
 4. **Build** from Git: `toolforge build start <repo>` → `toolforge build show` (§3).
 5. **Run:** `cp toolforge/service.template ~/service.template`, then `toolforge webservice buildservice start --mount=all --health-check-path=/healthz` (§4).
 6. **Register webhook:** locally run `TOOLFORGE_TOOL=YOURTOOL ./scripts/set-webhook.sh`.
-7. **Verify:** `toolforge webservice status`, `toolforge webservice buildservice logs -f`
+7. **Optional media-site cookies:** locally run `./scripts/toolforge-upload-ytdlp-cookies.sh /tmp/cookies-youtube-com.txt` (§6).
+8. **Verify:** `toolforge webservice status`, `toolforge webservice buildservice logs -f`
    or locally `./scripts/toolforge-logs.sh -f`, then message the bot `/start`.
 
 OAuth is **additive** — deploy on a bot password now; add the consumer envvars later and restart
@@ -101,6 +102,9 @@ webservice logs with `kubectl logs`. Common forms:
 ./scripts/toolforge-logs.sh --follow
 ```
 
+Use `scripts/toolforge-code-deploy.sh` for an explicit code-only deploy wrapper. It does not
+read or rewrite the yt-dlp cookies file.
+
 To keep using long polling instead, set `BOT_MODE=polling`, edit the image in
 `toolforge/jobs.yaml`, and run:
 
@@ -128,5 +132,26 @@ For the first switch from Telegram's cloud Bot API, set:
 toolforge envvars create TELEGRAM_BOT_API_CLOUD_LOGOUT 1
 ```
 
-Remove it after a successful local start. The server can handle much larger files, but the
-Rust bot still buffers downloads in memory, so raise `MAX_FILE_MB` deliberately.
+Remove it after a successful local start. The server can handle much larger files, but archive
+extraction and conversions still need local disk/RAM, so raise `MAX_FILE_MB`,
+`MAX_ARCHIVE_FILE_MB`, and `MAX_CONVERSION_FILE_MB` deliberately.
+
+## 6. yt-dlp cookies for YouTube/VK/Rutube/Apple Podcasts
+
+The bot resolves media-site links with `yt-dlp`. If a site needs browser cookies, store them
+as a **file** in the Toolforge data directory, not in an envvar. The default runtime path is:
+
+```bash
+/data/project/YOURTOOL/ytdlp-cookies.txt
+```
+
+Upload a local Netscape-format cookie export without printing it:
+
+```bash
+TOOLFORGE_TOOL=YOURTOOL ./scripts/toolforge-upload-ytdlp-cookies.sh /tmp/cookies-youtube-com.txt
+```
+
+The script writes the remote file with mode `0600`. Override the remote path with
+`YTDLP_COOKIES_PATH` if needed, and set the same envvar in Toolforge if you choose a
+non-default path. Code deploys (`scripts/toolforge-webhook-deploy.sh` or
+`scripts/toolforge-code-deploy.sh`) leave this cookie file untouched.
