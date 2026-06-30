@@ -22,6 +22,7 @@ Environment:
   TOOLFORGE_LOG_TARGET  kubectl logs target (default: deploy/TOOLFORGE_DEPLOYMENT)
   TOOLFORGE_SSH         full SSH target override, e.g. user@login.toolforge.org
   TOOLFORGE_SSH_CONFIG  SSH config file override, e.g. /dev/null
+  KUBECTL_GOMAXPROCS    Go thread limit for kubectl (default: 2)
   ERROR_PATTERN         grep pattern for --errors
 EOF
 }
@@ -33,6 +34,7 @@ TOOLFORGE_DEPLOYMENT="${TOOLFORGE_DEPLOYMENT:-$TOOLFORGE_TOOL}"
 TOOLFORGE_LOG_TARGET="${TOOLFORGE_LOG_TARGET:-deploy/$TOOLFORGE_DEPLOYMENT}"
 TOOLFORGE_SSH="${TOOLFORGE_SSH:-${TOOLFORGE_LOGIN}@${TOOLFORGE_HOST}}"
 TOOLFORGE_SSH_CONFIG="${TOOLFORGE_SSH_CONFIG:-}"
+KUBECTL_GOMAXPROCS="${KUBECTL_GOMAXPROCS:-2}"
 ERROR_PATTERN="${ERROR_PATTERN:-error|panic|failed|warn|exception}"
 
 TAIL="${TAIL:-200}"
@@ -66,7 +68,7 @@ if [[ "$FOLLOW" == "1" ]]; then
 fi
 
 if [[ "$LOCAL" == "1" ]]; then
-  cmd=(kubectl "${log_args[@]}")
+  cmd=(env "GOMAXPROCS=$KUBECTL_GOMAXPROCS" kubectl "${log_args[@]}")
 else
   ssh_args=()
   if [[ -n "$TOOLFORGE_SSH_CONFIG" ]]; then
@@ -81,7 +83,7 @@ else
       fi
     done
   fi
-  cmd=(ssh "${ssh_args[@]}" "$TOOLFORGE_SSH" become "$TOOLFORGE_TOOL" kubectl "${log_args[@]}")
+  cmd=(ssh "${ssh_args[@]}" "$TOOLFORGE_SSH" become "$TOOLFORGE_TOOL" env "GOMAXPROCS=$KUBECTL_GOMAXPROCS" kubectl "${log_args[@]}")
 fi
 
 if [[ "$ERRORS_ONLY" == "1" ]]; then
