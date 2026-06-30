@@ -46,15 +46,13 @@ if [[ -n "$TOOLFORGE_SSH_CONFIG" ]]; then
   ssh_args=(-F "$TOOLFORGE_SSH_CONFIG")
 fi
 
-ssh "${ssh_args[@]}" "$TOOLFORGE_SSH" become "$TOOLFORGE_TOOL" sh -c '
-  set -eu
-  dest="$1"
-  tmp="${dest}.tmp.$$"
-  umask 077
-  cat > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$dest"
-  ls -l "$dest"
-' sh "$REMOTE_COOKIES" <"$LOCAL_COOKIES"
+remote_quote() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+
+REMOTE_COOKIES_QUOTED="$(remote_quote "$REMOTE_COOKIES")"
+REMOTE_COMMAND="set -eu; dest=${REMOTE_COOKIES_QUOTED}; tmp=\"\${dest}.tmp.\$\$\"; umask 077; cat > \"\$tmp\"; chmod 600 \"\$tmp\"; mv \"\$tmp\" \"\$dest\"; ls -l \"\$dest\""
+
+ssh "${ssh_args[@]}" "$TOOLFORGE_SSH" become "$TOOLFORGE_TOOL" "$REMOTE_COMMAND" <"$LOCAL_COOKIES"
 
 echo "Uploaded yt-dlp cookies to $REMOTE_COOKIES"
