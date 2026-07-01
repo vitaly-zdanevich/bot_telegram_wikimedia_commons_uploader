@@ -19,4 +19,8 @@ install = [
     "yt-dlp",
     "ffmpeg",
     "curl",
+    "libheif-dev",
+    "libde265-dev",
+    "libheif1",
+    "libde265-0",
 ]

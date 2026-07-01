@@ -38,17 +38,46 @@ if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
   case "$BUILD_BACKEND" in
     docker)
       echo "==> Building portable release binary in Docker"
-      docker run --rm \
-        --user "$(id -u):$(id -g)" \
-        --volume "$ROOT_DIR:/work" \
-        --workdir /work \
-        --env CARGO_HOME=/work/target/toolforge-cargo-home \
-        --env CARGO_TARGET_DIR="/work/$DOCKER_TARGET_DIR" \
-        --env RUSTFLAGS="${RUSTFLAGS:--C target-cpu=x86-64}" \
-        --env CFLAGS="${CFLAGS:--march=x86-64 -mtune=generic}" \
-        --env CXXFLAGS="${CXXFLAGS:--march=x86-64 -mtune=generic}" \
-        "$DOCKER_IMAGE" \
-        cargo build --locked --release --features "$FEATURES" --bin "$BIN_NAME"
+      if [[ ",$FEATURES," == *",heic,"* ]]; then
+        docker run --rm \
+          --user 0:0 \
+          --volume "$ROOT_DIR:/work" \
+          --workdir /work \
+          --env CARGO_HOME=/work/target/toolforge-cargo-home \
+          --env CARGO_TARGET_DIR="/work/$DOCKER_TARGET_DIR" \
+          --env RUSTFLAGS="${RUSTFLAGS:--C target-cpu=x86-64}" \
+          --env CFLAGS="${CFLAGS:--march=x86-64 -mtune=generic}" \
+          --env CXXFLAGS="${CXXFLAGS:--march=x86-64 -mtune=generic}" \
+          --env FEATURES="$FEATURES" \
+          --env BIN_NAME="$BIN_NAME" \
+          --env HOST_UID="$(id -u)" \
+          --env HOST_GID="$(id -g)" \
+          "$DOCKER_IMAGE" \
+          bash -lc '
+            set -euo pipefail
+            cleanup() {
+              chown -R "$HOST_UID:$HOST_GID" "$CARGO_HOME" "$CARGO_TARGET_DIR" 2>/dev/null || true
+            }
+            trap cleanup EXIT
+            if ! pkg-config --exists "libheif >= 1.18"; then
+              apt-get update
+              apt-get install -y --no-install-recommends libheif-dev libde265-dev pkg-config
+            fi
+            cargo build --locked --release --features "$FEATURES" --bin "$BIN_NAME"
+          '
+      else
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          --volume "$ROOT_DIR:/work" \
+          --workdir /work \
+          --env CARGO_HOME=/work/target/toolforge-cargo-home \
+          --env CARGO_TARGET_DIR="/work/$DOCKER_TARGET_DIR" \
+          --env RUSTFLAGS="${RUSTFLAGS:--C target-cpu=x86-64}" \
+          --env CFLAGS="${CFLAGS:--march=x86-64 -mtune=generic}" \
+          --env CXXFLAGS="${CXXFLAGS:--march=x86-64 -mtune=generic}" \
+          "$DOCKER_IMAGE" \
+          cargo build --locked --release --features "$FEATURES" --bin "$BIN_NAME"
+      fi
       LOCAL_BIN="${LOCAL_BIN:-$ROOT_DIR/$DOCKER_TARGET_DIR/release/$BIN_NAME}"
       ;;
     host)
