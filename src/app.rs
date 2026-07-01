@@ -82,6 +82,11 @@ const MEDIA_GROUP_CAPTION_WAIT_MS: u64 = 300;
 const MEDIA_GROUP_UPLOAD_DELAY_MS: u64 = 5_000;
 /// Keeps deferred album uploads from starting all at once.
 static MEDIA_GROUP_UPLOADS: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(1));
+/// How long an incomplete album progress counter is kept after its last update.
+const MEDIA_GROUP_PROGRESS_TTL_SECONDS: i64 = 10 * 60;
+/// Album upload progress keyed by `(chat_id, media_group_id)`.
+static MEDIA_GROUP_PROGRESS: Lazy<std::sync::Mutex<HashMap<MediaGroupKey, MediaGroupProgress>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 /// How long a forwarded text-only message can be reused as the next upload caption.
 const FORWARDED_TEXT_CONTEXT_TTL_SECONDS: i64 = 2 * 60;
 /// Recently forwarded text-only messages keyed by `(chat_id, user_id)`.
@@ -112,6 +117,28 @@ struct ChatActionGuard {
 struct ForwardedTextContext {
     text: String,
     expires_at: i64,
+}
+
+/// Stable key for one Telegram media group inside a chat.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MediaGroupKey {
+    chat_id: i64,
+    group_id: String,
+}
+
+/// In-memory upload counter for one deferred Telegram album.
+#[derive(Clone, Debug)]
+struct MediaGroupProgress {
+    total: usize,
+    completed: usize,
+    updated_at: i64,
+}
+
+/// Position of a file inside a multi-file upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UploadProgress {
+    current: usize,
+    total: usize,
 }
 
 impl ChatActionGuard {
@@ -204,6 +231,59 @@ fn spawn_media_group_upload(config: Config, chat_id: i64, user_id: i64, message:
                 .await
                 .ok();
         }
+    });
+}
+
+/// Registers one incoming Telegram album item before the deferred upload starts.
+fn register_media_group_upload(chat_id: i64, group_id: Option<&str>) {
+    let Some(group_id) = group_id.filter(|group_id| !group_id.trim().is_empty()) else {
+        return;
+    };
+    let now = now_ts();
+    let mut groups = MEDIA_GROUP_PROGRESS.lock().unwrap();
+    retain_fresh_media_group_progress(&mut groups, now);
+    let progress = groups
+        .entry(MediaGroupKey {
+            chat_id,
+            group_id: group_id.to_string(),
+        })
+        .or_insert(MediaGroupProgress {
+            total: 0,
+            completed: 0,
+            updated_at: now,
+        });
+    progress.total = progress.total.saturating_add(1);
+    progress.updated_at = now;
+}
+
+/// Returns the next progress position for a Telegram album upload item.
+fn media_group_upload_progress(chat_id: i64, group_id: Option<&str>) -> Option<UploadProgress> {
+    let group_id = group_id.filter(|group_id| !group_id.trim().is_empty())?;
+    let now = now_ts();
+    let key = MediaGroupKey {
+        chat_id,
+        group_id: group_id.to_string(),
+    };
+    let mut groups = MEDIA_GROUP_PROGRESS.lock().unwrap();
+    retain_fresh_media_group_progress(&mut groups, now);
+    let progress = groups.get_mut(&key)?;
+    progress.completed = progress.completed.saturating_add(1);
+    progress.updated_at = now;
+    let current = progress.completed;
+    let total = progress.total.max(current);
+    if current >= total {
+        groups.remove(&key);
+    }
+    (total > 1).then_some(UploadProgress { current, total })
+}
+
+/// Drops stale Telegram album progress counters.
+fn retain_fresh_media_group_progress(
+    groups: &mut HashMap<MediaGroupKey, MediaGroupProgress>,
+    now: i64,
+) {
+    groups.retain(|_, progress| {
+        now.saturating_sub(progress.updated_at) <= MEDIA_GROUP_PROGRESS_TTL_SECONDS
     });
 }
 
@@ -818,6 +898,15 @@ enum FileResult {
     Failed { message: String },
 }
 
+/// Data needed to format a single successful upload reply.
+struct UploadSuccessReply<'a> {
+    filename: &'a str,
+    url: &'a str,
+    categories: &'a [String],
+    compressed_photo: bool,
+    progress: Option<UploadProgress>,
+}
+
 impl Bot {
     /// Builds a bot from runtime configuration.
     fn from_config(config: Config) -> Self {
@@ -870,6 +959,7 @@ impl Bot {
         if extract_file(&message).is_some() {
             if message.media_group_id.is_some() && defer_media_group_uploads() {
                 send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+                register_media_group_upload(chat_id, message.media_group_id.as_deref());
                 spawn_media_group_upload(self.config.clone(), chat_id, user_id, message);
                 return Ok(());
             }
@@ -2213,6 +2303,7 @@ impl Bot {
                 &author_username,
             )
             .await?;
+        let progress = media_group_upload_progress(chat_id, message.media_group_id.as_deref());
 
         match result {
             FileResult::Uploaded {
@@ -2223,11 +2314,14 @@ impl Bot {
                 self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(
                     chat_id,
-                    &filename,
-                    &url,
-                    &categories,
                     &profile,
-                    file.compressed_photo,
+                    UploadSuccessReply {
+                        filename: &filename,
+                        url: &url,
+                        categories: &categories,
+                        compressed_photo: file.compressed_photo,
+                        progress,
+                    },
                 )
                 .await
             }
@@ -2381,8 +2475,18 @@ impl Bot {
                 categories,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
-                self.send_success(chat_id, &filename, &url, &categories, &profile, false)
-                    .await
+                self.send_success(
+                    chat_id,
+                    &profile,
+                    UploadSuccessReply {
+                        filename: &filename,
+                        url: &url,
+                        categories: &categories,
+                        compressed_photo: false,
+                        progress: None,
+                    },
+                )
+                .await
             }
             FileResult::Duplicate { titles } => {
                 let links = titles
@@ -2957,26 +3061,28 @@ impl Bot {
     async fn send_success(
         &self,
         chat_id: i64,
-        filename: &str,
-        url: &str,
-        categories: &[String],
         profile: &Profile,
-        compressed_photo: bool,
+        reply: UploadSuccessReply<'_>,
     ) -> Result<()> {
+        let label = match reply.progress {
+            Some(progress) => format!("Uploaded {}/{}", progress.current, progress.total),
+            None => "Uploaded".to_string(),
+        };
         let mut text = if profile.return_upload_links {
             format!(
-                "✅ Uploaded: <a href=\"{url}\">{}</a>",
-                escape_html(filename)
+                "✅ {label}: <a href=\"{}\">{}</a>",
+                reply.url,
+                escape_html(reply.filename)
             )
         } else {
-            format!("✅ Uploaded <code>{}</code>", escape_html(filename))
+            format!("✅ {label} <code>{}</code>", escape_html(reply.filename))
         };
-        if compressed_photo {
+        if reply.compressed_photo {
             text.push_str("\nℹ️ This was a compressed photo; send it as a file for full quality.");
         }
-        if profile.return_category_links && !categories.is_empty() {
+        if profile.return_category_links && !reply.categories.is_empty() {
             text.push_str("\n\n<b>Categories</b>:");
-            for category in categories {
+            for category in reply.categories {
                 text.push_str(&format!(
                     "\n• <a href=\"{}\">{}</a>",
                     category_url(category),
@@ -2985,8 +3091,8 @@ impl Bot {
             }
         }
         if profile.return_missing_category_links
-            && !categories.is_empty()
-            && let Ok(missing) = self.commons.missing_categories(categories).await
+            && !reply.categories.is_empty()
+            && let Ok(missing) = self.commons.missing_categories(reply.categories).await
             && !missing.is_empty()
         {
             text.push_str("\n\n<b>These categories don't exist yet</b> (create them?):");
@@ -5508,9 +5614,9 @@ mod tests {
         dropmefiles_download_url_from_page, dropmefiles_file_ids, dropmefiles_upload_id,
         effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
         filename_needs_descriptive_context, first_external_url, is_dropmefiles_url,
-        merge_categories, now_ts, parse_category_list, settings_keyboard,
-        settings_license_keyboard, settings_prefix_keyboard, status_for_webhook_error,
-        take_forwarded_text_context,
+        media_group_upload_progress, merge_categories, now_ts, parse_category_list,
+        register_media_group_upload, settings_keyboard, settings_license_keyboard,
+        settings_prefix_keyboard, status_for_webhook_error, take_forwarded_text_context,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -5558,6 +5664,30 @@ mod tests {
             caption_without_link("Archive: https://example.org/a.rar", &direct),
             "Archive:"
         );
+    }
+
+    #[test]
+    fn media_group_progress_counts_registered_album_items() {
+        let chat_id = -9_001_003;
+        let group_id = "album-progress-test";
+        register_media_group_upload(chat_id, Some(group_id));
+        register_media_group_upload(chat_id, Some(group_id));
+
+        assert_eq!(
+            media_group_upload_progress(chat_id, Some(group_id)),
+            Some(super::UploadProgress {
+                current: 1,
+                total: 2,
+            })
+        );
+        assert_eq!(
+            media_group_upload_progress(chat_id, Some(group_id)),
+            Some(super::UploadProgress {
+                current: 2,
+                total: 2,
+            })
+        );
+        assert_eq!(media_group_upload_progress(chat_id, Some(group_id)), None);
     }
 
     #[test]
