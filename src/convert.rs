@@ -300,11 +300,51 @@ fn jpeg_spans_largest_first(bytes: &[u8]) -> Vec<&[u8]> {
 /// Decodes a HEIC/HEIF image into an sRGB 8-bit buffer via libheif.
 #[cfg(feature = "heic")]
 fn decode_heic(bytes: &[u8]) -> Result<RawRgb> {
-    use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+    use libheif_rs::{HeifContext, LibHeif};
 
     let lib_heif = LibHeif::new();
-    let context = HeifContext::read_from_bytes(bytes)
-        .map_err(|error| anyhow!("failed to read HEIC: {error}"))?;
+    match HeifContext::read_from_bytes(bytes) {
+        Ok(context) => decode_heic_context(&lib_heif, &context),
+        Err(memory_error) => decode_heic_from_temp_file(&lib_heif, bytes).map_err(|file_error| {
+            anyhow!(
+                "failed to read HEIC from memory ({memory_error}) or temporary file ({file_error})"
+            )
+        }),
+    }
+}
+
+/// Decodes a HEIC/HEIF image through libheif's file-path API.
+///
+/// Some libheif versions reject otherwise usable Apple HEIC files when reading from an in-memory
+/// buffer. Keeping this fallback local avoids exposing that implementation detail to users.
+#[cfg(feature = "heic")]
+fn decode_heic_from_temp_file(lib_heif: &libheif_rs::LibHeif, bytes: &[u8]) -> Result<RawRgb> {
+    use std::io::Write;
+
+    let mut file = tempfile::Builder::new()
+        .suffix(".heic")
+        .tempfile()
+        .context("failed to create temporary HEIC file")?;
+    file.write_all(bytes)
+        .context("failed to write temporary HEIC file")?;
+    file.flush().ok();
+    let path = file
+        .path()
+        .to_str()
+        .context("temporary HEIC path is not valid UTF-8")?;
+    let context = libheif_rs::HeifContext::read_from_file(path)
+        .map_err(|error| anyhow!("failed to read temporary HEIC file: {error}"))?;
+    decode_heic_context(lib_heif, &context)
+}
+
+/// Decodes the primary image in an already-open HEIC context.
+#[cfg(feature = "heic")]
+fn decode_heic_context(
+    lib_heif: &libheif_rs::LibHeif,
+    context: &libheif_rs::HeifContext<'_>,
+) -> Result<RawRgb> {
+    use libheif_rs::{ColorSpace, RgbChroma};
+
     let handle = context
         .primary_image_handle()
         .map_err(|error| anyhow!("failed to read HEIC image handle: {error}"))?;
