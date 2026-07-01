@@ -1,15 +1,14 @@
 # Cloud Native Buildpacks project descriptor, read by the Toolforge Build Service.
 # Only buildpack builds (Toolforge) read this; the Lambda Docker build and CI/cargo ignore it.
 #
-# Tune the Rust build for the build node's CPU.
+# Build a portable binary for Toolforge workers.
 #
-# WARNING: target-cpu=native emits instructions for the CPU of the BUILD node. Toolforge is a
-# shared cluster, so the RUN node may have a different microarchitecture. If the bot crashes
-# with "illegal instruction" (SIGILL), change the value below to "-C target-cpu=x86-64-v3"
-# (portable across all modern servers). On a single-host Cloud VPS, native is always safe.
+# Toolforge is a shared cluster, so the run node can have a lower CPU ISA level than the
+# build node or the local development machine. Keep this at baseline x86-64 unless the
+# service is pinned to known-compatible hardware.
 [[build.env]]
 name = "RUSTFLAGS"
-value = "-C target-cpu=native"
+value = "-C target-cpu=x86-64"
 
 # Toolforge's current default deb-packages buildpack reads this table. Keep Aptfile too
 # for older/deprecated buildpack stacks.

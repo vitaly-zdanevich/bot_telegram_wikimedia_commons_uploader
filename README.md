@@ -247,7 +247,7 @@ via the `SERVICE` env var (default `commons-uploader-bot`).
 | `scripts/update-code.sh` | Rebuild and push only the Lambda code |
 | `scripts/set-webhook.sh` | Point Telegram at `WEBHOOK_URL`, `TOOLFORGE_TOOL`, or the Lambda Function URL |
 | `scripts/toolforge-webhook-deploy.sh` | Build and start the Toolforge webhook webservice |
-| `scripts/toolforge-code-deploy.sh` | Toolforge code-only deploy; leaves the yt-dlp cookies file unchanged |
+| `scripts/toolforge-code-deploy.sh` | Upload only the Toolforge Rust binary and restart; skips Aptfile/image rebuilds and leaves yt-dlp cookies unchanged |
 | `scripts/toolforge-upload-ytdlp-cookies.sh` | Upload a local yt-dlp cookies file to Toolforge persistent storage |
 | `scripts/toolforge-deploy.sh` | Build and load the older Toolforge long-polling job |
 | `scripts/show-logs.sh` | Read CloudWatch logs (`--since 2h`, `--errors`, `--follow`) — Lambda |

@@ -64,22 +64,18 @@ toolforge envvars create OAUTH_CONSUMER_SECRET
 
 ## 3. Build the image
 The Build Service installs packages from the repo-root `Aptfile` (e.g. `unar` for RAR) and
-compiles the bot. The repo-root `project.toml` sets `RUSTFLAGS=-C target-cpu=native` so the
-binary is tuned for the build node's CPU:
+compiles the bot. The repo-root `project.toml` sets `RUSTFLAGS=-C target-cpu=x86-64` so the
+binary remains portable across Toolforge worker CPUs:
 
 ```bash
 toolforge build start https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader
 toolforge build show     # wait until it succeeds
 ```
 
-> **`target-cpu=native` caveat:** it targets the *build* node's CPU, and Toolforge's run node
-> may differ. If the bot ever crashes with **illegal instruction (SIGILL)**, change
-> `project.toml` to `-C target-cpu=x86-64-v3` (portable across modern servers) and rebuild.
-
 If a Rust buildpack isn't available on your Toolforge, build the binary in CI instead (a
 portable build with `--features sqlite,archive,rar` and **without** `heic` needs only glibc +
-`unar` at runtime; pass `RUSTFLAGS=-C target-cpu=native` to that build) and run it under a
-base image.
+`unar` at runtime; pass `RUSTFLAGS=-C target-cpu=x86-64` to that build) and run it under a base
+image.
 
 ## 4. Run the webhook webservice
 
@@ -103,7 +99,22 @@ webservice logs with `kubectl logs`. Common forms:
 ```
 
 Use `scripts/toolforge-code-deploy.sh` for an explicit code-only deploy wrapper. It does not
-read or rewrite the yt-dlp cookies file.
+rebuild the Toolforge image, so Aptfile packages are not reinstalled. By default it builds a
+portable release binary in Docker with `--features sqlite,archive,rar`, rejects binaries whose
+ELF notes require `x86-64-v2` or newer, uploads the binary to
+`/data/project/YOURTOOL/bin/telegram-wikimedia-commons-uploader-bot`, sets `BOT_BIN` to that
+path, and restarts the existing buildservice webservice:
+
+```bash
+TOOLFORGE_TOOL=YOURTOOL ./scripts/toolforge-code-deploy.sh
+```
+
+Use `BUILD_BACKEND=host` only when the local Rust toolchain is known to produce Toolforge-safe
+baseline `x86-64` binaries. The script checks this before upload.
+
+Use the full buildservice deploy instead when `Aptfile`, `Procfile`,
+`scripts/run-toolforge-webhook.sh`, `project.toml`, `toolforge/service.template`, or runtime
+package requirements change. The code-only deploy also leaves the yt-dlp cookies file untouched.
 
 To keep using long polling instead, set `BOT_MODE=polling`, edit the image in
 `toolforge/jobs.yaml`, and run:
