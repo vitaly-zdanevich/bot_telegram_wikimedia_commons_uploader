@@ -21,7 +21,7 @@ image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"]
 imagepipe = "0.5"
 kamadak-exif = "0.5"
 lambda_http = "1.2"
-libheif-rs = { version = "1", optional = true }
+libheif-rs = { version = "=1.0.0", default-features = false, optional = true }
 md-5 = "0.10"
 once_cell = "1"
 rand = "0.8"
