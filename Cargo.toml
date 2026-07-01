@@ -41,11 +41,10 @@ urlencoding = "2"
 webp = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
-# HEIC/HEIF support depends on the system libheif C/C++ library, which does not
-# zig-cross-compile cleanly. It is therefore opt-in: plain `cargo build`/tests need no
-# libheif, while the Lambda build enables `--features heic` (see scripts/build-lambda.sh).
+# HEIC/HEIF support is part of the normal build. Use `--no-default-features`
+# only for constrained cross-builds that cannot build/link libheif.
 [features]
-default = []
+default = ["heic"]
 heic = ["dep:libheif-rs"]
 # SQLite storage backend for the long-living server deployment (Toolforge / Cloud VPS).
 sqlite = ["dep:rusqlite"]

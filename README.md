@@ -206,12 +206,12 @@ project-local toolchain + `cargo-lambda` if missing), and a Telegram bot token f
 
 ### HEIC support (libheif)
 
-HEIC decoding needs the C/C++ `libheif` library, which does not cross-compile cleanly,
-so it is behind the Cargo `heic` feature. `./scripts/build-lambda.sh` builds **with HEIC
-via Docker** (`scripts/build-lambda-docker.sh`, an arm64 Amazon Linux 2023 image that
-compiles libheif + libde265) when Docker is available, and otherwise falls back to a fast
-`cargo-lambda`/zig cross-build **without** HEIC (DNG and BMP still convert). Force the
-fast build with `HEIC=0 ./scripts/build-lambda.sh`.
+HEIC decoding needs `libheif`, and the Cargo `heic` feature is enabled by default.
+`./scripts/build-lambda.sh` builds **with HEIC via Docker**
+(`scripts/build-lambda-docker.sh`, an arm64 Amazon Linux 2023 image that compiles
+libheif + libde265) when Docker is available. The fast `cargo-lambda`/zig fallback is
+explicitly built with `--no-default-features`, so it is the only supported no-HEIC build
+(DNG and BMP still convert). Force that fast fallback with `HEIC=0 ./scripts/build-lambda.sh`.
 
 ### Long-living server (Toolforge / Cloud VPS)
 
@@ -232,6 +232,8 @@ cargo build --release --features sqlite,archive
 # add RAR (shells out to unar/unrar at runtime, e.g. apt install unar)
 cargo build --release --features sqlite,archive,rar
 ```
+
+HEIC support is included by default in these builds.
 
 Operate it with `scripts/server-logs.sh` (journald logs) and `scripts/server-status.sh`
 (service state, memory, recent errors, Telegram `getMe`); both take the systemd unit name

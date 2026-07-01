@@ -90,6 +90,7 @@ echo "Building $BIN_NAME for $TARGET with target-cpu=$RUST_TARGET_CPU (no HEIC)"
 "$CARGO_LAMBDA" lambda build \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
   --release --arm64 \
+  --no-default-features \
   --lambda-dir "$LAMBDA_DIR" \
   --output-format zip \
   --bin "$BIN_NAME"
