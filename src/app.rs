@@ -4406,7 +4406,7 @@ fn conversion_rejection_reason(
             "This DNG does not contain a usable embedded JPEG preview. Run /settings dng webp and resend it, or export it to JPEG, TIFF, or WebP first.".to_string()
         }
         (convert::SourceFormat::Heic, _) => {
-            "This HEIC cannot be decoded on this server. Export it to JPEG, TIFF, or WebP and resend it.".to_string()
+            "This HEIC cannot be decoded on this server. Export it to JPEG, TIFF, or WebP and resend it".to_string()
         }
         _ => format!("Couldn't convert this file: {error}"),
     }

@@ -109,9 +109,22 @@ pub fn convert(
 ) -> Result<(Vec<u8>, &'static str)> {
     match source {
         SourceFormat::Dng => convert_dng(bytes, quality, dng_mode),
-        SourceFormat::Heic => Ok((encode_webp_lossy(&decode_heic(bytes)?, quality)?, "webp")),
+        SourceFormat::Heic => convert_heic(bytes, quality),
         SourceFormat::Bmp => Ok((encode_webp_lossless(&decode_bmp(bytes)?)?, "webp")),
         SourceFormat::PassThrough => bail!("pass-through files must not be converted"),
+    }
+}
+
+/// Converts HEIC/HEIF to WebP, falling back to an embedded JPEG preview when full decode fails.
+fn convert_heic(bytes: &[u8], quality: f32) -> Result<(Vec<u8>, &'static str)> {
+    match decode_heic(bytes) {
+        Ok(image) => Ok((encode_webp_lossy(&image, quality)?, "webp")),
+        Err(decode_error) => match extract_largest_valid_jpeg(bytes) {
+            Some(jpeg) => Ok((jpeg.to_vec(), "jpg")),
+            None => bail!(
+                "could not decode HEIC ({decode_error}); no usable embedded JPEG preview found"
+            ),
+        },
     }
 }
 
@@ -592,6 +605,23 @@ mod tests {
 
         let (bytes, extension) =
             convert(&dng_like, SourceFormat::Dng, 80.0, DngMode::ConvertToWebp).unwrap();
+
+        assert_eq!(extension, "jpg");
+        assert_eq!(bytes, *jpeg.get_ref());
+    }
+
+    #[test]
+    fn convert_heic_falls_back_to_embedded_jpeg_preview() {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([0, 255, 0])))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let mut heic_like = vec![0, 0, 0, 24];
+        heic_like.extend_from_slice(b"ftypheic");
+        heic_like.extend_from_slice(jpeg.get_ref());
+
+        let (bytes, extension) =
+            convert(&heic_like, SourceFormat::Heic, 80.0, DngMode::ConvertToWebp).unwrap();
 
         assert_eq!(extension, "jpg");
         assert_eq!(bytes, *jpeg.get_ref());
