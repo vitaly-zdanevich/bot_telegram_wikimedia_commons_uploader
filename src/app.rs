@@ -96,7 +96,7 @@ static FORWARDED_TEXT_CONTEXTS: Lazy<RwLock<HashMap<(i64, i64), ForwardedTextCon
 const DIRECT_URL_DOWNLOAD_TIMEOUT_SECS: u64 = 20 * 60;
 /// Maximum time spent downloading with yt-dlp.
 const YTDLP_DOWNLOAD_TIMEOUT_SECS: u64 = 45 * 60;
-/// Maximum time spent transcoding unsupported linked media.
+/// Maximum time spent transcoding unsupported media.
 const FFMPEG_TRANSCODE_TIMEOUT_SECS: u64 = 60 * 60;
 /// Maximum single-file upload size currently documented by Wikimedia Commons.
 const COMMONS_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -791,6 +791,15 @@ struct LinkedFile {
     cleanup_paths: Vec<PathBuf>,
 }
 
+/// Disk-backed result of an ffmpeg conversion/remux.
+struct ConvertedMediaFile {
+    file: TelegramFile,
+    file_name: String,
+    mime: String,
+    unique_id: String,
+    cleanup_paths: Vec<PathBuf>,
+}
+
 /// Removes temporary files when an upload/download path exits.
 #[derive(Default)]
 struct TempPathCleanup {
@@ -798,8 +807,19 @@ struct TempPathCleanup {
 }
 
 impl TempPathCleanup {
+    /// Creates a cleanup guard for paths that should be removed on drop.
     fn new(paths: Vec<PathBuf>) -> Self {
         Self { paths }
+    }
+
+    /// Adds a path to remove when the guard is dropped.
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    /// Hands the paths to another owner without removing them.
+    fn into_paths(mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
     }
 }
 
@@ -857,7 +877,7 @@ struct MediaStreamInfo {
     codec: Option<String>,
 }
 
-/// What ffmpeg should do to make a linked media file acceptable to Commons.
+/// What ffmpeg should do to make a media file acceptable to Commons.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FfmpegPlan {
     kind: FfmpegPlanKind,
@@ -1996,7 +2016,7 @@ impl Bot {
         );
         let metadata = metadata_from_telegram_file(&original);
 
-        // Convert DNG/HEIC/BMP to WebP; pass everything else through if Commons accepts it.
+        // Convert DNG/HEIC/BMP to WebP; remux/transcode unsupported media to Commons formats.
         let sniff = original.read_prefix(FILE_SNIFF_BYTES)?;
         let format = convert::classify(file_name, mime, &sniff);
         let mut provenance = UploadProvenance {
@@ -2005,6 +2025,7 @@ impl Bot {
                 .unwrap_or_else(|| format!("telegram_{unique_id}")),
             ..UploadProvenance::default()
         };
+        let mut upload_cleanup_paths = Vec::new();
         let (upload_data, extension) = if format.needs_conversion() {
             if original.len() > self.config.max_conversion_file_bytes {
                 let limit = format_size_limit(self.config.max_conversion_file_bytes);
@@ -2047,12 +2068,52 @@ impl Bot {
         } else {
             let extension = convert::passthrough_extension(file_name, mime);
             if !convert::is_commons_accepted(&extension) {
-                return Ok(FileResult::Rejected {
-                    reason: format!("Commons does not accept .{extension} files"),
-                });
+                if !should_try_ffmpeg_media_conversion(file_name, mime, &extension) {
+                    return Ok(FileResult::Rejected {
+                        reason: format!("Commons does not accept .{extension} files"),
+                    });
+                }
+                if original.len() > self.config.max_conversion_file_bytes {
+                    let limit = format_size_limit(self.config.max_conversion_file_bytes);
+                    return Ok(FileResult::Rejected {
+                        reason: format!(
+                            "This media file needs conversion, and conversion is currently limited to {limit}"
+                        ),
+                    });
+                }
+                provenance.original_sha1 = Some(sha1_hex_telegram_file(&original)?);
+                provenance.original_md5 = Some(md5_hex_telegram_file(&original)?);
+                let converted = match self
+                    .convert_telegram_media_with_ffmpeg(&original, file_name, mime, &extension)
+                    .await
+                {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        tracing::warn!(
+                            file_name = ?file_name,
+                            mime = ?mime,
+                            unique_id,
+                            error = %format!("{error:#}"),
+                            "media conversion failed"
+                        );
+                        return Ok(FileResult::Rejected {
+                            reason: format!(
+                                "Couldn't convert this media file to a Commons-compatible format: {error}"
+                            ),
+                        });
+                    }
+                };
+                upload_cleanup_paths = converted.cleanup_paths;
+                (
+                    upload_data_from_telegram_file(converted.file),
+                    file_extension_for_name(&converted.file_name)
+                        .unwrap_or_else(|| "webm".to_string()),
+                )
+            } else {
+                (upload_data_from_telegram_file(original), extension)
             }
-            (upload_data_from_telegram_file(original), extension)
         };
+        let _upload_cleanup = TempPathCleanup::new(upload_cleanup_paths);
 
         // Duplicate pre-check by content hash.
         let upload_sha1 = sha1_hex_upload_data(&upload_data)?;
@@ -2868,6 +2929,51 @@ impl Bot {
         })
     }
 
+    /// Converts/remuxes a direct Telegram audio/video file through ffmpeg.
+    async fn convert_telegram_media_with_ffmpeg(
+        &self,
+        original: &TelegramFile,
+        file_name: Option<&str>,
+        mime: Option<&str>,
+        extension: &str,
+    ) -> Result<ConvertedMediaFile> {
+        let source_name = ffmpeg_source_filename(file_name, mime);
+        let mut cleanup_paths = Vec::new();
+        let input_path = match original {
+            TelegramFile::LocalPath { path, .. } => path.clone(),
+            TelegramFile::Bytes(bytes) => {
+                let path = temp_link_path(&source_name)?;
+                let mut file = std::fs::File::create(&path)
+                    .with_context(|| format!("failed to create temp file {}", path.display()))?;
+                file.write_all(bytes)
+                    .with_context(|| format!("failed to write temp file {}", path.display()))?;
+                file.flush()
+                    .with_context(|| format!("failed to flush temp file {}", path.display()))?;
+                cleanup_paths.push(path.clone());
+                path
+            }
+        };
+        let cleanup = TempPathCleanup::new(cleanup_paths);
+        let probe = self.probe_media(&input_path).await.with_context(|| {
+            format!(
+                "Commons does not accept .{} files, and ffprobe could not inspect it",
+                if extension.is_empty() {
+                    "bin"
+                } else {
+                    extension
+                }
+            )
+        })?;
+        let plan = ffmpeg_plan_for_probe(&probe).with_context(|| {
+            format!(
+                "Commons does not accept .{} files, and ffprobe did not find convertible audio/video streams",
+                if extension.is_empty() { "bin" } else { extension }
+            )
+        })?;
+        self.run_ffmpeg_plan_to_file(&input_path, &source_name, plan, cleanup.into_paths())
+            .await
+    }
+
     /// Runs the selected ffmpeg plan and returns a new disk-backed linked file.
     async fn run_ffmpeg_plan(
         &self,
@@ -2875,9 +2981,36 @@ impl Bot {
         linked: LinkedFile,
         plan: FfmpegPlan,
     ) -> Result<LinkedFile> {
-        let source_name = linked.file_name.as_deref().unwrap_or("linked-media");
+        let source_name = linked
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "linked-media".to_string());
+        let source_url = linked.source_url;
+        let converted = self
+            .run_ffmpeg_plan_to_file(input, &source_name, plan, linked.cleanup_paths)
+            .await?;
+        Ok(LinkedFile {
+            file: converted.file,
+            file_name: Some(converted.file_name),
+            mime: Some(converted.mime),
+            source_url,
+            unique_id: converted.unique_id,
+            cleanup_paths: converted.cleanup_paths,
+        })
+    }
+
+    /// Runs ffmpeg and returns the converted/remuxed file with cleanup paths.
+    async fn run_ffmpeg_plan_to_file(
+        &self,
+        input: &Path,
+        source_name: &str,
+        plan: FfmpegPlan,
+        cleanup_paths: Vec<PathBuf>,
+    ) -> Result<ConvertedMediaFile> {
+        let mut cleanup = TempPathCleanup::new(cleanup_paths);
         let output_name = filename_with_extension(source_name, plan.extension);
         let output_path = temp_link_path(&output_name)?;
+        cleanup.push(output_path.clone());
 
         match plan.kind {
             FfmpegPlanKind::TranscodeVideoAv1CopyAudio | FfmpegPlanKind::TranscodeVideoAv1Opus => {
@@ -2911,19 +3044,16 @@ impl Bot {
             bail!("ffmpeg wrote an empty output file");
         }
 
-        let mut cleanup_paths = linked.cleanup_paths;
-        cleanup_paths.push(output_path.clone());
         let unique_id = short_id_path(&output_path)?;
-        Ok(LinkedFile {
+        Ok(ConvertedMediaFile {
             file: TelegramFile::LocalPath {
                 path: output_path,
                 size,
             },
-            file_name: Some(output_name),
-            mime: Some(plan.mime.to_string()),
-            source_url: linked.source_url,
+            file_name: output_name,
+            mime: plan.mime.to_string(),
             unique_id,
-            cleanup_paths,
+            cleanup_paths: cleanup.into_paths(),
         })
     }
 
@@ -4763,6 +4893,14 @@ fn sha1_hex_upload_data(data: &UploadData) -> Result<String> {
     }
 }
 
+/// Returns lower-case SHA-1 hex of a Telegram file without loading disk-backed files.
+fn sha1_hex_telegram_file(file: &TelegramFile) -> Result<String> {
+    match file {
+        TelegramFile::Bytes(bytes) => Ok(sha1_hex(bytes)),
+        TelegramFile::LocalPath { path, .. } => sha1_hex_path(path),
+    }
+}
+
 /// Returns lower-case SHA-1 hex of a file, streaming it in bounded chunks.
 fn sha1_hex_path(path: &Path) -> Result<String> {
     use sha1::{Digest, Sha1};
@@ -4788,6 +4926,35 @@ fn sha1_hex_path(path: &Path) -> Result<String> {
 fn md5_hex(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     hex::encode(Md5::digest(bytes))
+}
+
+/// Returns lower-case MD5 hex of a Telegram file without loading disk-backed files.
+fn md5_hex_telegram_file(file: &TelegramFile) -> Result<String> {
+    match file {
+        TelegramFile::Bytes(bytes) => Ok(md5_hex(bytes)),
+        TelegramFile::LocalPath { path, .. } => md5_hex_path(path),
+    }
+}
+
+/// Returns lower-case MD5 hex of a file, streaming it in bounded chunks.
+fn md5_hex_path(path: &Path) -> Result<String> {
+    use md5::{Digest, Md5};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open upload file {}", path.display()))?;
+    let mut hasher = Md5::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read upload file {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Extracts metadata from either in-memory Telegram bytes or a local Bot API file path.
@@ -5361,6 +5528,67 @@ fn file_extension_for_name(name: &str) -> Option<String> {
         })
 }
 
+/// Returns true when an unsupported file is likely audio/video that ffmpeg can convert.
+fn should_try_ffmpeg_media_conversion(
+    file_name: Option<&str>,
+    mime: Option<&str>,
+    extension: &str,
+) -> bool {
+    let extension = file_name
+        .and_then(file_extension_for_name)
+        .unwrap_or_else(|| extension.trim_start_matches('.').to_ascii_lowercase());
+    if matches!(
+        extension.as_str(),
+        "mov"
+            | "qt"
+            | "mp4"
+            | "m4v"
+            | "m4a"
+            | "mkv"
+            | "avi"
+            | "wmv"
+            | "flv"
+            | "3gp"
+            | "3g2"
+            | "mts"
+            | "m2ts"
+            | "ts"
+            | "aac"
+            | "wma"
+    ) {
+        return true;
+    }
+    mime.map(str::to_ascii_lowercase).is_some_and(|mime| {
+        mime.starts_with("video/")
+            || mime.starts_with("audio/")
+            || matches!(mime.as_str(), "application/ogg" | "application/x-matroska")
+    })
+}
+
+/// Builds a stable local source filename for ffmpeg when Telegram did not provide one.
+fn ffmpeg_source_filename(file_name: Option<&str>, mime: Option<&str>) -> String {
+    if let Some(file_name) = file_name.filter(|name| !name.trim().is_empty()) {
+        return sanitize_download_filename(file_name);
+    }
+    let extension = mime
+        .and_then(ffmpeg_input_extension_for_mime)
+        .unwrap_or("media");
+    format!("telegram-media.{extension}")
+}
+
+/// Maps common non-Commons media MIME types to an ffmpeg-friendly input extension.
+fn ffmpeg_input_extension_for_mime(mime: &str) -> Option<&'static str> {
+    match mime.to_ascii_lowercase().as_str() {
+        "video/quicktime" => Some("mov"),
+        "video/mp4" => Some("mp4"),
+        "video/x-matroska" | "application/x-matroska" => Some("mkv"),
+        "video/x-msvideo" => Some("avi"),
+        "audio/aac" => Some("aac"),
+        "audio/mp4" | "audio/x-m4a" => Some("m4a"),
+        _ => None,
+    }
+}
+
 /// Maps extensions to MIME types used when re-entering the upload pipeline.
 fn mime_for_extension(extension: String) -> Option<String> {
     let mime = match extension.as_str() {
@@ -5646,8 +5874,8 @@ mod tests {
         filename_needs_descriptive_context, first_external_url, forwarded_text_context_for_upload,
         is_dropmefiles_url, media_group_upload_progress, merge_categories, now_ts,
         parse_category_list, register_media_group_upload, settings_keyboard,
-        settings_license_keyboard, settings_prefix_keyboard, status_for_webhook_error,
-        take_forwarded_text_context,
+        settings_license_keyboard, settings_prefix_keyboard, should_try_ffmpeg_media_conversion,
+        status_for_webhook_error, take_forwarded_text_context,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -5919,6 +6147,30 @@ mod tests {
             Some("video/mp4")
         ));
         assert!(!direct_link_looks_like_commons_file(None, None));
+    }
+
+    #[test]
+    fn mov_files_are_ffmpeg_conversion_candidates() {
+        assert!(should_try_ffmpeg_media_conversion(
+            Some("clip.mov"),
+            None,
+            "mov"
+        ));
+        assert!(should_try_ffmpeg_media_conversion(
+            None,
+            Some("video/quicktime"),
+            "bin"
+        ));
+        assert!(should_try_ffmpeg_media_conversion(
+            Some("clip.MOV"),
+            Some("application/octet-stream"),
+            "mov"
+        ));
+        assert!(!should_try_ffmpeg_media_conversion(
+            Some("archive.zip"),
+            None,
+            "zip"
+        ));
     }
 
     #[test]
