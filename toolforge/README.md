@@ -100,8 +100,9 @@ webservice logs with `kubectl logs`. Common forms:
 
 Use `scripts/toolforge-code-deploy.sh` for an explicit code-only deploy wrapper. It does not
 rebuild the Toolforge image, so Aptfile packages are not reinstalled. By default it builds a
-portable release binary in Docker with `--features sqlite,archive,rar`, rejects binaries whose
-ELF notes require `x86-64-v2` or newer, uploads the binary to
+portable release binary in a cached Ubuntu 24.04 Rust Docker image with
+`--features sqlite,archive,rar,heic`, rejects binaries whose ELF notes require `x86-64-v2`
+or newer, uploads the binary to
 `/data/project/YOURTOOL/bin/telegram-wikimedia-commons-uploader-bot`, sets `BOT_BIN` to that
 path, and restarts the existing buildservice webservice:
 
