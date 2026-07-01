@@ -388,6 +388,12 @@ pub struct Document {
     pub mime_type: Option<String>,
     /// File size in bytes, if known.
     pub file_size: Option<u64>,
+    /// Telegram-generated preview image, if Telegram provided one.
+    #[serde(default)]
+    pub thumbnail: Option<PhotoSize>,
+    /// Legacy Telegram-generated preview image field.
+    #[serde(default)]
+    pub thumb: Option<PhotoSize>,
 }
 
 /// Telegram photo size subset (one entry per compressed resolution).
@@ -450,7 +456,7 @@ pub struct Video {
 
 #[cfg(test)]
 mod tests {
-    use super::{Chat, DngMode, License, Message, OnboardingStep, Profile};
+    use super::{Chat, DngMode, Document, License, Message, OnboardingStep, Profile};
 
     #[test]
     fn license_parse_round_trips_keys() {
@@ -554,5 +560,38 @@ mod tests {
             ..normal
         };
         assert!(forwarded.is_forwarded());
+    }
+
+    #[test]
+    fn document_deserializes_thumbnail_and_legacy_thumb() {
+        let document: Document = serde_json::from_value(serde_json::json!({
+            "file_id": "file",
+            "file_unique_id": "unique",
+            "thumbnail": {
+                "file_id": "thumbnail-file",
+                "file_unique_id": "thumbnail-unique",
+                "width": 320,
+                "height": 240,
+                "file_size": 12345
+            },
+            "thumb": {
+                "file_id": "thumb-file",
+                "file_unique_id": "thumb-unique",
+                "width": 160,
+                "height": 120,
+                "file_size": 6789
+            }
+        }))
+        .unwrap();
+
+        let thumbnail = document.thumbnail.unwrap();
+        assert_eq!(thumbnail.file_id, "thumbnail-file");
+        assert_eq!(thumbnail.file_unique_id, "thumbnail-unique");
+        assert_eq!(thumbnail.file_size, Some(12345));
+
+        let thumb = document.thumb.unwrap();
+        assert_eq!(thumb.file_id, "thumb-file");
+        assert_eq!(thumb.file_unique_id, "thumb-unique");
+        assert_eq!(thumb.file_size, Some(6789));
     }
 }

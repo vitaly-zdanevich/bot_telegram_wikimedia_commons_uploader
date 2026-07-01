@@ -12,6 +12,9 @@ libraw-bin
 yt-dlp
 ffmpeg
 
+# Full-resolution HEIC still-image fallback when libheif-rs/ffmpeg reject Apple HEIC variants.
+libvips-tools
+
 # Used by the Toolforge wrapper to register the local Bot API webhook on startup.
 curl
 

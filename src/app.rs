@@ -2072,23 +2072,80 @@ impl Bot {
             ) {
                 Ok((bytes, ext)) => (UploadData::Bytes(bytes), ext.to_string()),
                 Err(error) => {
-                    tracing::warn!(
-                        file_name = ?file_name,
-                        mime = ?mime,
-                        unique_id,
-                        source_format = ?format,
-                        dng_mode = ?profile.dng_mode,
-                        error = %format!("{error:#}"),
-                        "file conversion failed"
-                    );
-                    return Ok(FileResult::Rejected {
-                        reason: conversion_rejection_reason(
-                            format,
-                            profile.dng_mode,
-                            &original,
-                            &error,
-                        ),
-                    });
+                    if format == convert::SourceFormat::Heic {
+                        match self
+                            .convert_heic_still_with_vips(&original, self.config.webp_quality)
+                            .await
+                        {
+                            Ok(webp) => {
+                                tracing::warn!(
+                                    file_name = ?file_name,
+                                    mime = ?mime,
+                                    unique_id,
+                                    source_format = ?format,
+                                    error = %format!("{error:#}"),
+                                    "primary HEIC conversion failed; using vips WebP fallback"
+                                );
+                                (UploadData::Bytes(webp), "webp".to_string())
+                            }
+                            Err(vips_error) => match self
+                                .convert_heic_still_with_ffmpeg(&original, self.config.webp_quality)
+                                .await
+                            {
+                                Ok(webp) => {
+                                    tracing::warn!(
+                                        file_name = ?file_name,
+                                        mime = ?mime,
+                                        unique_id,
+                                        source_format = ?format,
+                                        error = %format!("{error:#}"),
+                                        vips_error = %format!("{vips_error:#}"),
+                                        "primary HEIC conversion failed; using ffmpeg WebP fallback"
+                                    );
+                                    (UploadData::Bytes(webp), "webp".to_string())
+                                }
+                                Err(ffmpeg_error) => {
+                                    tracing::warn!(
+                                        file_name = ?file_name,
+                                        mime = ?mime,
+                                        unique_id,
+                                        source_format = ?format,
+                                        dng_mode = ?profile.dng_mode,
+                                        error = %format!("{error:#}"),
+                                        vips_error = %format!("{vips_error:#}"),
+                                        ffmpeg_error = %format!("{ffmpeg_error:#}"),
+                                        "file conversion failed"
+                                    );
+                                    return Ok(FileResult::Rejected {
+                                        reason: conversion_rejection_reason(
+                                            format,
+                                            profile.dng_mode,
+                                            &original,
+                                            &error,
+                                        ),
+                                    });
+                                }
+                            },
+                        }
+                    } else {
+                        tracing::warn!(
+                            file_name = ?file_name,
+                            mime = ?mime,
+                            unique_id,
+                            source_format = ?format,
+                            dng_mode = ?profile.dng_mode,
+                            error = %format!("{error:#}"),
+                            "file conversion failed"
+                        );
+                        return Ok(FileResult::Rejected {
+                            reason: conversion_rejection_reason(
+                                format,
+                                profile.dng_mode,
+                                &original,
+                                &error,
+                            ),
+                        });
+                    }
                 }
             }
         } else {
@@ -3115,6 +3172,77 @@ impl Bot {
             );
         }
         Ok(())
+    }
+
+    /// Converts a still HEIC/HEIF file to WebP through libvips as a decoder fallback.
+    async fn convert_heic_still_with_vips(&self, bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
+        let dir = tempfile::tempdir().context("failed to create temp directory for HEIC vips")?;
+        let input_path = dir.path().join("input.heic");
+        let output_path = dir.path().join("output.webp");
+        write_temp_bytes(&input_path, bytes)?;
+
+        let quality = format!("{:.0}", quality.clamp(1.0, 100.0));
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(FFMPEG_TRANSCODE_TIMEOUT_SECS),
+            Command::new("vips")
+                .arg("webpsave")
+                .arg(&input_path)
+                .arg(&output_path)
+                .arg("--Q")
+                .arg(&quality)
+                .output(),
+        )
+        .await
+        .context("vips timed out")?
+        .context("failed to launch vips")?;
+        if !output.status.success() {
+            bail!(
+                "vips exited with {}: {}",
+                output.status,
+                command_stderr(&output.stderr)
+            );
+        }
+
+        let webp = std::fs::read(&output_path)
+            .with_context(|| format!("vips did not write {}", output_path.display()))?;
+        if webp.is_empty() {
+            bail!("vips wrote an empty WebP output");
+        }
+        Ok(webp)
+    }
+
+    /// Converts a still HEIC/HEIF file to WebP through ffmpeg as a decoder fallback.
+    async fn convert_heic_still_with_ffmpeg(&self, bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
+        let dir = tempfile::tempdir().context("failed to create temp directory for HEIC ffmpeg")?;
+        let input_path = dir.path().join("input.heic");
+        let output_path = dir.path().join("output.webp");
+        write_temp_bytes(&input_path, bytes)?;
+
+        let quality = format!("{:.0}", quality.clamp(1.0, 100.0));
+        self.run_ffmpeg_args(vec![
+            "-y".into(),
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-i".into(),
+            input_path.as_os_str().to_os_string(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-c:v".into(),
+            "libwebp".into(),
+            "-quality".into(),
+            quality.into(),
+            output_path.as_os_str().to_os_string(),
+        ])
+        .await?;
+
+        let webp = std::fs::read(&output_path)
+            .with_context(|| format!("ffmpeg did not write {}", output_path.display()))?;
+        if webp.is_empty() {
+            bail!("ffmpeg wrote an empty WebP output");
+        }
+        Ok(webp)
     }
 
     /// Largest external file this bot is willing to download before deciding what to do.
@@ -5687,6 +5815,17 @@ fn temp_link_path(file_name: &str) -> Result<PathBuf> {
         std::process::id()
     ));
     Ok(path)
+}
+
+/// Writes bytes to a temporary conversion input file and flushes them to disk.
+fn write_temp_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
 }
 
 /// Finds the main yt-dlp output file in a temp directory.
