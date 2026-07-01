@@ -2191,6 +2191,7 @@ impl Bot {
         // Resolve the description and categories before any upload work so album items can reuse
         // the captioned item after the deferred media-group delay.
         let caption = self.resolve_caption(chat_id, user_id, message).await;
+        let progress = media_group_upload_progress(chat_id, message.media_group_id.as_deref());
 
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         let _upload_chat_action = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
@@ -2303,7 +2304,6 @@ impl Bot {
                 &author_username,
             )
             .await?;
-        let progress = media_group_upload_progress(chat_id, message.media_group_id.as_deref());
 
         match result {
             FileResult::Uploaded {
@@ -3000,7 +3000,9 @@ impl Bot {
             if !caption.trim().is_empty() {
                 return caption;
             }
-            if let Some(caption) = take_forwarded_text_context(chat_id, user_id).await {
+            if let Some(caption) =
+                forwarded_text_context_for_upload(chat_id, user_id, message).await
+            {
                 self.store.put_group_caption(group_id, &caption).await.ok();
                 return caption;
             }
@@ -3013,7 +3015,7 @@ impl Bot {
         {
             return caption;
         }
-        take_forwarded_text_context(chat_id, user_id)
+        forwarded_text_context_for_upload(chat_id, user_id, message)
             .await
             .unwrap_or_default()
     }
@@ -4696,7 +4698,35 @@ async fn remember_forwarded_text_context(
     true
 }
 
-/// Consumes recent forwarded text for the next uncaptained upload in the same chat.
+/// Returns recent forwarded text for an uncaptained upload.
+///
+/// Telegram can forward several adjacent message bubbles as one user action. For forwarded media,
+/// the text bubble is treated as shared context and is not consumed, so both the preceding and
+/// following media batches can use it. Normal uploads keep the older one-shot behavior.
+async fn forwarded_text_context_for_upload(
+    chat_id: i64,
+    user_id: i64,
+    message: &Message,
+) -> Option<String> {
+    if message.is_forwarded() {
+        peek_forwarded_text_context(chat_id, user_id).await
+    } else {
+        take_forwarded_text_context(chat_id, user_id).await
+    }
+}
+
+/// Returns recent forwarded text without consuming it.
+async fn peek_forwarded_text_context(chat_id: i64, user_id: i64) -> Option<String> {
+    let now = now_ts();
+    let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
+    contexts.retain(|_, context| context.expires_at >= now);
+    contexts
+        .get(&(chat_id, user_id))
+        .filter(|context| context.expires_at >= now)
+        .map(|context| context.text.clone())
+}
+
+/// Consumes recent forwarded text for the next normal uncaptained upload in the same chat.
 async fn take_forwarded_text_context(chat_id: i64, user_id: i64) -> Option<String> {
     let now = now_ts();
     let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
@@ -5613,15 +5643,37 @@ mod tests {
         conversion_rejection_reason, direct_link_looks_like_commons_file,
         dropmefiles_download_url_from_page, dropmefiles_file_ids, dropmefiles_upload_id,
         effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
-        filename_needs_descriptive_context, first_external_url, is_dropmefiles_url,
-        media_group_upload_progress, merge_categories, now_ts, parse_category_list,
-        register_media_group_upload, settings_keyboard, settings_license_keyboard,
-        settings_prefix_keyboard, status_for_webhook_error, take_forwarded_text_context,
+        filename_needs_descriptive_context, first_external_url, forwarded_text_context_for_upload,
+        is_dropmefiles_url, media_group_upload_progress, merge_categories, now_ts,
+        parse_category_list, register_media_group_upload, settings_keyboard,
+        settings_license_keyboard, settings_prefix_keyboard, status_for_webhook_error,
+        take_forwarded_text_context,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
-    use crate::models::{DngMode, License, Profile};
+    use crate::models::{Chat, DngMode, License, Message, Profile, User};
     use http::StatusCode;
+
+    fn test_message(chat_id: i64, user_id: i64, forwarded: bool) -> Message {
+        Message {
+            message_id: Some(1),
+            chat: Chat { id: chat_id },
+            from: Some(User { id: user_id }),
+            forward_origin: forwarded.then(|| serde_json::json!({"type": "user"})),
+            forward_from: None,
+            forward_sender_name: None,
+            forward_from_chat: None,
+            forward_date: None,
+            text: None,
+            caption: None,
+            media_group_id: None,
+            document: None,
+            photo: None,
+            audio: None,
+            voice: None,
+            video: None,
+        }
+    }
 
     #[test]
     fn in_progress_webhook_errors_are_retryable() {
@@ -5761,9 +5813,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarded_text_context_is_consumed_once() {
+    async fn forwarded_text_context_is_reusable_for_forwarded_uploads() {
         let chat_id = -9_001_001;
         let user_id = 9_001_001;
+        let message = test_message(chat_id, user_id, true);
         FORWARDED_TEXT_CONTEXTS.write().await.insert(
             (chat_id, user_id),
             ForwardedTextContext {
@@ -5773,12 +5826,42 @@ mod tests {
         );
 
         assert_eq!(
-            take_forwarded_text_context(chat_id, user_id)
+            forwarded_text_context_for_upload(chat_id, user_id, &message)
                 .await
                 .as_deref(),
             Some("Храм Вознесения Господня\nCategories: Churches")
         );
-        assert_eq!(take_forwarded_text_context(chat_id, user_id).await, None);
+        assert_eq!(
+            forwarded_text_context_for_upload(chat_id, user_id, &message)
+                .await
+                .as_deref(),
+            Some("Храм Вознесения Господня\nCategories: Churches")
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_text_context_is_consumed_for_normal_uploads() {
+        let chat_id = -9_001_004;
+        let user_id = 9_001_004;
+        let message = test_message(chat_id, user_id, false);
+        FORWARDED_TEXT_CONTEXTS.write().await.insert(
+            (chat_id, user_id),
+            ForwardedTextContext {
+                text: "Фонтан усадьбы".into(),
+                expires_at: now_ts() + 60,
+            },
+        );
+
+        assert_eq!(
+            forwarded_text_context_for_upload(chat_id, user_id, &message)
+                .await
+                .as_deref(),
+            Some("Фонтан усадьбы")
+        );
+        assert_eq!(
+            forwarded_text_context_for_upload(chat_id, user_id, &message).await,
+            None
+        );
     }
 
     #[tokio::test]
