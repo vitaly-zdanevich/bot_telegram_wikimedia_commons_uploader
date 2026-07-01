@@ -59,7 +59,7 @@ if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
               chown -R "$HOST_UID:$HOST_GID" "$CARGO_HOME" "$CARGO_TARGET_DIR" 2>/dev/null || true
             }
             trap cleanup EXIT
-            if ! pkg-config --exists "libheif >= 1.16"; then
+            if ! pkg-config --exists "libheif >= 1.17"; then
               apt-get update
               apt-get install -y --no-install-recommends libheif-dev libde265-dev pkg-config
             fi
