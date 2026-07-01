@@ -87,10 +87,14 @@ const MEDIA_GROUP_PROGRESS_TTL_SECONDS: i64 = 10 * 60;
 /// Album upload progress keyed by `(chat_id, media_group_id)`.
 static MEDIA_GROUP_PROGRESS: Lazy<std::sync::Mutex<HashMap<MediaGroupKey, MediaGroupProgress>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
-/// How long a forwarded text-only message can be reused as the next upload caption.
-const FORWARDED_TEXT_CONTEXT_TTL_SECONDS: i64 = 2 * 60;
-/// Recently forwarded text-only messages keyed by `(chat_id, user_id)`.
-static FORWARDED_TEXT_CONTEXTS: Lazy<RwLock<HashMap<(i64, i64), ForwardedTextContext>>> =
+/// How long a text-only message can be reused as nearby upload caption context.
+const TEXT_CONTEXT_TTL_SECONDS: i64 = 2 * 60;
+/// How many times a generic single-file upload waits for adjacent text context.
+const TEXT_CONTEXT_WAIT_ATTEMPTS: usize = 20;
+/// Delay between adjacent-text context checks.
+const TEXT_CONTEXT_WAIT_MS: u64 = 300;
+/// Recently seen text-only messages keyed by `(chat_id, user_id)`.
+static TEXT_CONTEXTS: Lazy<RwLock<HashMap<(i64, i64), TextContext>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 /// Maximum time spent downloading a direct URL.
 const DIRECT_URL_DOWNLOAD_TIMEOUT_SECS: u64 = 20 * 60;
@@ -114,7 +118,7 @@ struct ChatActionGuard {
 }
 
 #[derive(Clone, Debug)]
-struct ForwardedTextContext {
+struct TextContext {
     text: String,
     expires_at: i64,
 }
@@ -198,13 +202,26 @@ async fn send_chat_action_best_effort(telegram: &TelegramClient, chat_id: i64, a
     }
 }
 
-/// Returns true when webhook/polling updates can acknowledge album items before uploading them.
-fn defer_media_group_uploads() -> bool {
+/// Returns true when updates can be acknowledged before deferred upload work starts.
+fn defer_uploads_after_ack() -> bool {
     std::env::var("AWS_LAMBDA_RUNTIME_API").is_err()
 }
 
-/// Uploads one album item after a short delay, giving Telegram time to deliver the captioned item.
-fn spawn_media_group_upload(config: Config, chat_id: i64, user_id: i64, message: Message) {
+/// Returns true when a single generic camera file should wait for adjacent text context.
+fn should_defer_single_upload_for_text_context(message: &Message, file: &FileRef) -> bool {
+    message.media_group_id.is_none()
+        && message
+            .caption
+            .as_ref()
+            .is_none_or(|caption| caption.trim().is_empty())
+        && file
+            .file_name
+            .as_deref()
+            .is_some_and(|file_name| file_stem(Some(file_name)).starts_with("IMG_"))
+}
+
+/// Uploads one media item after a short delay, giving Telegram time to deliver adjacent text.
+fn spawn_deferred_upload(config: Config, chat_id: i64, user_id: i64, message: Message) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(
             MEDIA_GROUP_UPLOAD_DELAY_MS,
@@ -976,12 +993,22 @@ impl Bot {
         let user_id = user.id;
         self.remember_group_caption(&message).await;
 
-        if extract_file(&message).is_some() {
-            if message.media_group_id.is_some() && defer_media_group_uploads() {
+        if let Some(file) = extract_file(&message) {
+            if message.media_group_id.is_some() && defer_uploads_after_ack() {
                 send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
                 register_media_group_upload(chat_id, message.media_group_id.as_deref());
-                spawn_media_group_upload(self.config.clone(), chat_id, user_id, message);
+                spawn_deferred_upload(self.config.clone(), chat_id, user_id, message);
                 return Ok(());
+            }
+            if defer_uploads_after_ack()
+                && should_defer_single_upload_for_text_context(&message, &file)
+            {
+                let profile = self.store.get_profile(user_id).await;
+                if profile.is_ready() && profile.filename_prefix.trim().is_empty() {
+                    send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+                    spawn_deferred_upload(self.config.clone(), chat_id, user_id, message);
+                    return Ok(());
+                }
             }
             return self.handle_upload(chat_id, user_id, &message).await;
         }
@@ -996,13 +1023,12 @@ impl Bot {
                 .handle_link_upload(chat_id, user_id, &message, url)
                 .await;
         }
-        if message.is_forwarded() {
-            let profile = self.store.get_profile(user_id).await;
-            if profile.is_ready()
-                && remember_forwarded_text_context(chat_id, user_id, &message, &trimmed).await
-            {
-                return Ok(());
-            }
+        let profile = self.store.get_profile(user_id).await;
+        if profile.is_ready()
+            && crate::commons::parse_settings_command(&trimmed).is_empty()
+            && remember_text_context(chat_id, user_id, &trimmed).await
+        {
+            return Ok(());
         }
         self.handle_onboarding_text(chat_id, user_id, &message, &trimmed)
             .await
@@ -2249,13 +2275,13 @@ impl Bot {
             return self.reject_too_large(chat_id).await;
         }
 
-        // Resolve the description and categories before any upload work so album items can reuse
-        // the captioned item after the deferred media-group delay.
-        let caption = self.resolve_caption(chat_id, user_id, message).await;
-        let progress = media_group_upload_progress(chat_id, message.media_group_id.as_deref());
-
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
         let _upload_chat_action = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
+
+        // Resolve the description and categories before any upload work so album items can reuse
+        // the captioned item after the deferred media-group delay.
+        let mut caption = self.resolve_caption(chat_id, user_id, message).await;
+        let progress = media_group_upload_progress(chat_id, message.media_group_id.as_deref());
 
         let original = match self
             .telegram
@@ -2317,14 +2343,29 @@ impl Bot {
             }
         }
 
-        let parsed_caption = parse_caption(&caption);
+        let mut parsed_caption = parse_caption(&caption);
         let original_stem = file_stem(file.file_name.as_deref());
-        let filename_prefix = effective_filename_prefix(
+        let mut filename_prefix = effective_filename_prefix(
             &profile.filename_prefix,
             None,
             &parsed_caption.description,
             original_stem,
         );
+        if filename_needs_descriptive_context(
+            filename_prefix,
+            &parsed_caption.description,
+            original_stem,
+        ) && let Some(late_caption) = self.wait_for_text_context(chat_id, user_id).await
+        {
+            caption = late_caption;
+            parsed_caption = parse_caption(&caption);
+            filename_prefix = effective_filename_prefix(
+                &profile.filename_prefix,
+                None,
+                &parsed_caption.description,
+                original_stem,
+            );
+        }
         if filename_needs_descriptive_context(
             filename_prefix,
             &parsed_caption.description,
@@ -3130,9 +3171,7 @@ impl Bot {
             if !caption.trim().is_empty() {
                 return caption;
             }
-            if let Some(caption) =
-                forwarded_text_context_for_upload(chat_id, user_id, message).await
-            {
+            if let Some(caption) = text_context_for_upload(chat_id, user_id, message).await {
                 self.store.put_group_caption(group_id, &caption).await.ok();
                 return caption;
             }
@@ -3145,9 +3184,24 @@ impl Bot {
         {
             return caption;
         }
-        forwarded_text_context_for_upload(chat_id, user_id, message)
+        text_context_for_upload(chat_id, user_id, message)
             .await
             .unwrap_or_default()
+    }
+
+    /// Waits briefly for an adjacent text-only message to become upload caption context.
+    async fn wait_for_text_context(&self, chat_id: i64, user_id: i64) -> Option<String> {
+        for attempt in 0..TEXT_CONTEXT_WAIT_ATTEMPTS {
+            if let Some(text) = peek_text_context(chat_id, user_id).await
+                && !text.trim().is_empty()
+            {
+                return Some(text);
+            }
+            if attempt + 1 < TEXT_CONTEXT_WAIT_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(TEXT_CONTEXT_WAIT_MS)).await;
+            }
+        }
+        None
     }
 
     /// Stores an album caption before any file download/conversion work starts.
@@ -4799,56 +4853,43 @@ fn touch(profile: &mut Profile) {
     profile.updated_at = now;
 }
 
-/// Remembers a forwarded text-only message as context for the next uncaptained upload.
-async fn remember_forwarded_text_context(
-    chat_id: i64,
-    user_id: i64,
-    message: &Message,
-    text: &str,
-) -> bool {
+/// Remembers a text-only message as context for nearby uncaptained uploads.
+async fn remember_text_context(chat_id: i64, user_id: i64, text: &str) -> bool {
     let text = text.trim();
-    if !message.is_forwarded() || text.is_empty() {
+    if text.is_empty() {
         return false;
     }
     let now = now_ts();
-    let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
+    let mut contexts = TEXT_CONTEXTS.write().await;
     contexts.retain(|_, context| context.expires_at >= now);
     contexts.insert(
         (chat_id, user_id),
-        ForwardedTextContext {
+        TextContext {
             text: text.to_string(),
-            expires_at: now + FORWARDED_TEXT_CONTEXT_TTL_SECONDS,
+            expires_at: now + TEXT_CONTEXT_TTL_SECONDS,
         },
     );
-    tracing::info!(
-        user_id,
-        chat_id,
-        "remembered forwarded text for next upload"
-    );
+    tracing::info!(user_id, chat_id, "remembered text for nearby upload");
     true
 }
 
-/// Returns recent forwarded text for an uncaptained upload.
+/// Returns recent text for an uncaptained upload.
 ///
 /// Telegram can forward several adjacent message bubbles as one user action. For forwarded media,
 /// the text bubble is treated as shared context and is not consumed, so both the preceding and
 /// following media batches can use it. Normal uploads keep the older one-shot behavior.
-async fn forwarded_text_context_for_upload(
-    chat_id: i64,
-    user_id: i64,
-    message: &Message,
-) -> Option<String> {
+async fn text_context_for_upload(chat_id: i64, user_id: i64, message: &Message) -> Option<String> {
     if message.is_forwarded() {
-        peek_forwarded_text_context(chat_id, user_id).await
+        peek_text_context(chat_id, user_id).await
     } else {
-        take_forwarded_text_context(chat_id, user_id).await
+        take_text_context(chat_id, user_id).await
     }
 }
 
-/// Returns recent forwarded text without consuming it.
-async fn peek_forwarded_text_context(chat_id: i64, user_id: i64) -> Option<String> {
+/// Returns recent text context without consuming it.
+async fn peek_text_context(chat_id: i64, user_id: i64) -> Option<String> {
     let now = now_ts();
-    let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
+    let mut contexts = TEXT_CONTEXTS.write().await;
     contexts.retain(|_, context| context.expires_at >= now);
     contexts
         .get(&(chat_id, user_id))
@@ -4856,10 +4897,10 @@ async fn peek_forwarded_text_context(chat_id: i64, user_id: i64) -> Option<Strin
         .map(|context| context.text.clone())
 }
 
-/// Consumes recent forwarded text for the next normal uncaptained upload in the same chat.
-async fn take_forwarded_text_context(chat_id: i64, user_id: i64) -> Option<String> {
+/// Consumes recent text for the next normal uncaptained upload in the same chat.
+async fn take_text_context(chat_id: i64, user_id: i64) -> Option<String> {
     let now = now_ts();
-    let mut contexts = FORWARDED_TEXT_CONTEXTS.write().await;
+    let mut contexts = TEXT_CONTEXTS.write().await;
     contexts.retain(|_, context| context.expires_at >= now);
     contexts
         .remove(&(chat_id, user_id))
@@ -5865,17 +5906,17 @@ fn commons_title_url(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FORWARDED_TEXT_CONTEXTS, FfmpegPlan,
-        FfmpegPlanKind, ForwardedTextContext, MediaProbe, MediaStreamInfo,
-        UPDATE_ALREADY_IN_PROGRESS_ERROR, caption_without_link, commons_max_file_size_message,
-        conversion_rejection_reason, direct_link_looks_like_commons_file,
-        dropmefiles_download_url_from_page, dropmefiles_file_ids, dropmefiles_upload_id,
-        effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
-        filename_needs_descriptive_context, first_external_url, forwarded_text_context_for_upload,
-        is_dropmefiles_url, media_group_upload_progress, merge_categories, now_ts,
-        parse_category_list, register_media_group_upload, settings_keyboard,
-        settings_license_keyboard, settings_prefix_keyboard, should_try_ffmpeg_media_conversion,
-        status_for_webhook_error, take_forwarded_text_context,
+        COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FfmpegPlan, FfmpegPlanKind, MediaProbe,
+        MediaStreamInfo, TEXT_CONTEXTS, TextContext, UPDATE_ALREADY_IN_PROGRESS_ERROR,
+        caption_without_link, commons_max_file_size_message, conversion_rejection_reason,
+        direct_link_looks_like_commons_file, dropmefiles_download_url_from_page,
+        dropmefiles_file_ids, dropmefiles_upload_id, effective_filename_prefix,
+        ensure_commons_file_size_limit, ffmpeg_plan_for_probe, filename_needs_descriptive_context,
+        first_external_url, is_dropmefiles_url, media_group_upload_progress, merge_categories,
+        now_ts, parse_category_list, register_media_group_upload, remember_text_context,
+        settings_keyboard, settings_license_keyboard, settings_prefix_keyboard,
+        should_try_ffmpeg_media_conversion, status_for_webhook_error, take_text_context,
+        text_context_for_upload,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -6041,26 +6082,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarded_text_context_is_reusable_for_forwarded_uploads() {
+    async fn text_context_is_reusable_for_forwarded_uploads() {
         let chat_id = -9_001_001;
         let user_id = 9_001_001;
         let message = test_message(chat_id, user_id, true);
-        FORWARDED_TEXT_CONTEXTS.write().await.insert(
+        TEXT_CONTEXTS.write().await.insert(
             (chat_id, user_id),
-            ForwardedTextContext {
+            TextContext {
                 text: "Храм Вознесения Господня\nCategories: Churches".into(),
                 expires_at: now_ts() + 60,
             },
         );
 
         assert_eq!(
-            forwarded_text_context_for_upload(chat_id, user_id, &message)
+            text_context_for_upload(chat_id, user_id, &message)
                 .await
                 .as_deref(),
             Some("Храм Вознесения Господня\nCategories: Churches")
         );
         assert_eq!(
-            forwarded_text_context_for_upload(chat_id, user_id, &message)
+            text_context_for_upload(chat_id, user_id, &message)
                 .await
                 .as_deref(),
             Some("Храм Вознесения Господня\nCategories: Churches")
@@ -6068,43 +6109,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarded_text_context_is_consumed_for_normal_uploads() {
+    async fn text_context_is_consumed_for_normal_uploads() {
         let chat_id = -9_001_004;
         let user_id = 9_001_004;
         let message = test_message(chat_id, user_id, false);
-        FORWARDED_TEXT_CONTEXTS.write().await.insert(
+        TEXT_CONTEXTS.write().await.insert(
             (chat_id, user_id),
-            ForwardedTextContext {
+            TextContext {
                 text: "Фонтан усадьбы".into(),
                 expires_at: now_ts() + 60,
             },
         );
 
         assert_eq!(
-            forwarded_text_context_for_upload(chat_id, user_id, &message)
+            text_context_for_upload(chat_id, user_id, &message)
                 .await
                 .as_deref(),
             Some("Фонтан усадьбы")
         );
         assert_eq!(
-            forwarded_text_context_for_upload(chat_id, user_id, &message).await,
+            text_context_for_upload(chat_id, user_id, &message).await,
             None
         );
     }
 
     #[tokio::test]
-    async fn expired_forwarded_text_context_is_ignored() {
+    async fn plain_text_can_be_remembered_as_upload_context() {
+        let chat_id = -9_001_005;
+        let user_id = 9_001_005;
+        let message = test_message(chat_id, user_id, false);
+
+        assert!(remember_text_context(chat_id, user_id, "Фонтан усадьбы").await);
+        assert_eq!(
+            text_context_for_upload(chat_id, user_id, &message)
+                .await
+                .as_deref(),
+            Some("Фонтан усадьбы")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_text_context_is_ignored() {
         let chat_id = -9_001_002;
         let user_id = 9_001_002;
-        FORWARDED_TEXT_CONTEXTS.write().await.insert(
+        TEXT_CONTEXTS.write().await.insert(
             (chat_id, user_id),
-            ForwardedTextContext {
+            TextContext {
                 text: "Too old".into(),
                 expires_at: now_ts() - 1,
             },
         );
 
-        assert_eq!(take_forwarded_text_context(chat_id, user_id).await, None);
+        assert_eq!(take_text_context(chat_id, user_id).await, None);
     }
 
     #[test]
