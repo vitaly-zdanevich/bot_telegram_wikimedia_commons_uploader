@@ -120,6 +120,9 @@ Commons-compatible path:
 - Unsupported audio is converted to **OGG/Opus**.
 - Unsupported video is converted to **WebM AV1/Opus** (AV1, not VP9).
 
+Image conversions use `MAX_CONVERSION_FILE_MB`; streaming ffmpeg audio/video conversions use
+`MAX_VIDEO_AUDIO_CONVERSION_FILE_MB` (default 3072 MB).
+
 `yt-dlp` can use a Netscape-format cookies file. On Toolforge the default path is
 `/data/project/bot-telegram-commons-uploader/ytdlp-cookies.txt`; override it with
 `YTDLP_COOKIES_PATH`. Normal code deploys do not touch this file.

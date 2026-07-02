@@ -1943,10 +1943,12 @@ impl Bot {
             None => String::new(),
         };
         let max_upload_size = format_size_limit(self.config.max_file_bytes);
-        let conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
+        let image_conversion_limit = format_size_limit(self.config.max_conversion_file_bytes);
+        let video_audio_conversion_limit =
+            format_size_limit(self.config.max_video_audio_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let mut text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; conversions are limited to {conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; image conversions are limited to {image_conversion_limit}; video/audio conversions are limited to {video_audio_conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -2156,11 +2158,12 @@ impl Bot {
                         reason: format!("Commons does not accept .{extension} files"),
                     });
                 }
-                if original.len() > self.config.max_conversion_file_bytes {
-                    let limit = format_size_limit(self.config.max_conversion_file_bytes);
+                if original.len() > self.config.max_video_audio_conversion_file_bytes {
+                    let limit =
+                        format_size_limit(self.config.max_video_audio_conversion_file_bytes);
                     return Ok(FileResult::Rejected {
                         reason: format!(
-                            "This media file needs conversion, and conversion is currently limited to {limit}"
+                            "This video/audio file needs conversion, and video/audio conversion is currently limited to {limit}"
                         ),
                     });
                 }
@@ -2747,15 +2750,23 @@ impl Bot {
         let max_bytes = self.max_external_download_bytes();
         let is_direct_supported_file =
             direct_link_looks_like_commons_file(Some(&file_name), mime.as_deref());
+        let direct_video_audio_conversion_limit = if is_direct_supported_file {
+            None
+        } else {
+            let extension = file_extension_for_name(&file_name).unwrap_or_default();
+            should_try_ffmpeg_media_conversion(Some(&file_name), mime.as_deref(), &extension)
+                .then_some(self.config.max_video_audio_conversion_file_bytes)
+        };
+        let download_max_bytes = direct_video_audio_conversion_limit.unwrap_or(max_bytes);
         if let Some(length) = response.content_length() {
             if is_direct_supported_file {
                 ensure_commons_file_size_limit(length)?;
             }
-            if length > max_bytes {
+            if length > download_max_bytes {
                 bail!(
                     "linked file is {}, larger than the configured {} limit",
                     format_size_limit(length),
-                    format_size_limit(max_bytes)
+                    format_size_limit(download_max_bytes)
                 );
             }
         }
@@ -2775,12 +2786,12 @@ impl Bot {
                 std::fs::remove_file(&path).ok();
                 bail!("{}", commons_max_file_size_message(Some(written)));
             }
-            if written > max_bytes {
+            if written > download_max_bytes {
                 drop(file);
                 std::fs::remove_file(&path).ok();
                 bail!(
                     "linked file is larger than the configured {} limit",
-                    format_size_limit(max_bytes)
+                    format_size_limit(download_max_bytes)
                 );
             }
             file.write_all(&chunk)
@@ -2950,11 +2961,11 @@ impl Bot {
             return Ok(linked);
         }
 
-        if linked.file.len() > self.config.max_conversion_file_bytes {
+        if linked.file.len() > self.config.max_video_audio_conversion_file_bytes {
             bail!(
-                "linked file needs conversion and is {}, larger than the configured {} conversion limit",
+                "linked file needs video/audio conversion and is {}, larger than the configured {} video/audio conversion limit",
                 format_size_limit(linked.file.len()),
-                format_size_limit(self.config.max_conversion_file_bytes)
+                format_size_limit(self.config.max_video_audio_conversion_file_bytes)
             );
         }
         let probe = self.probe_media(&path).await?;
@@ -3251,6 +3262,7 @@ impl Bot {
             .max_file_bytes
             .max(self.config.max_archive_file_bytes)
             .max(self.config.max_conversion_file_bytes)
+            .max(self.config.max_video_audio_conversion_file_bytes)
     }
 
     /// Returns the configured yt-dlp cookie file when it exists.

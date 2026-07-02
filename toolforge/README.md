@@ -145,8 +145,10 @@ toolforge envvars create TELEGRAM_BOT_API_CLOUD_LOGOUT 1
 ```
 
 Remove it after a successful local start. The server can handle much larger files, but archive
-extraction and conversions still need local disk/RAM, so raise `MAX_FILE_MB`,
-`MAX_ARCHIVE_FILE_MB`, and `MAX_CONVERSION_FILE_MB` deliberately.
+extraction and image conversions still need local disk/RAM, so raise `MAX_FILE_MB`,
+`MAX_ARCHIVE_FILE_MB`, and `MAX_CONVERSION_FILE_MB` deliberately. Audio/video ffmpeg
+conversion is controlled separately by `MAX_VIDEO_AUDIO_CONVERSION_FILE_MB` and defaults to
+3072 MB.
 
 ## 6. yt-dlp cookies for YouTube/VK/Rutube/Apple Podcasts
 

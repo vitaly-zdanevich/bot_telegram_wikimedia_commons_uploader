@@ -5,6 +5,8 @@ use std::env;
 const DEFAULT_MAX_FILE_MB: u64 = 20;
 /// Default cap for image formats that need full decode/re-encode in memory.
 const DEFAULT_MAX_CONVERSION_FILE_MB: u64 = 100;
+/// Default cap for audio/video formats converted by streaming ffmpeg.
+const DEFAULT_MAX_VIDEO_AUDIO_CONVERSION_FILE_MB: u64 = 3072;
 /// Default cap for archive input and extracted uploadable members.
 const DEFAULT_MAX_ARCHIVE_FILE_MB: u64 = 100;
 /// Default lossy WebP quality used when converting DNG files.
@@ -61,6 +63,8 @@ pub struct Config {
     pub max_file_bytes: u64,
     /// Maximum file size for formats that need conversion in memory.
     pub max_conversion_file_bytes: u64,
+    /// Maximum file size for audio/video formats converted by streaming ffmpeg.
+    pub max_video_audio_conversion_file_bytes: u64,
     /// Maximum archive input size and extracted uploadable member total.
     pub max_archive_file_bytes: u64,
     /// Whether archive preview photos are decoded/resized before sending to Telegram.
@@ -102,9 +106,13 @@ impl Config {
             .unwrap_or(DEFAULT_MAX_FILE_MB)
             * 1024
             * 1024;
-        let max_conversion_file_bytes = lookup("MAX_CONVERSION_FILE_MB")
+        let max_conversion_file_mb = lookup("MAX_CONVERSION_FILE_MB")
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_CONVERSION_FILE_MB)
+            .unwrap_or(DEFAULT_MAX_CONVERSION_FILE_MB);
+        let max_conversion_file_bytes = max_conversion_file_mb * 1024 * 1024;
+        let max_video_audio_conversion_file_bytes = lookup("MAX_VIDEO_AUDIO_CONVERSION_FILE_MB")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_VIDEO_AUDIO_CONVERSION_FILE_MB)
             * 1024
             * 1024;
         let max_archive_file_bytes = lookup("MAX_ARCHIVE_FILE_MB")
@@ -162,6 +170,7 @@ impl Config {
             webp_quality,
             max_file_bytes,
             max_conversion_file_bytes,
+            max_video_audio_conversion_file_bytes,
             max_archive_file_bytes,
             archive_thumbnail_resize,
             commons_api_url: lookup("COMMONS_API_URL")
