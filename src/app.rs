@@ -88,7 +88,9 @@ const MEDIA_GROUP_PROGRESS_TTL_SECONDS: i64 = 10 * 60;
 static MEDIA_GROUP_PROGRESS: Lazy<std::sync::Mutex<HashMap<MediaGroupKey, MediaGroupProgress>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 /// How long a text-only message can be reused as nearby upload caption context.
-const TEXT_CONTEXT_TTL_SECONDS: i64 = 2 * 60;
+const TEXT_CONTEXT_TTL_SECONDS: i64 = 60 * 60;
+/// Maximum Telegram send-time gap for treating a text bubble as media caption context.
+const TEXT_CONTEXT_MATCH_SECONDS: i64 = 60;
 /// How many times a generic single-file upload waits for adjacent text context.
 const TEXT_CONTEXT_WAIT_ATTEMPTS: usize = 20;
 /// Delay between adjacent-text context checks.
@@ -121,6 +123,7 @@ struct ChatActionGuard {
 struct TextContext {
     text: String,
     expires_at: i64,
+    message_date: Option<i64>,
 }
 
 /// Stable key for one Telegram media group inside a chat.
@@ -1031,7 +1034,7 @@ impl Bot {
         let profile = self.store.get_profile(user_id).await;
         if profile.is_ready()
             && crate::commons::parse_settings_command(&trimmed).is_empty()
-            && remember_text_context(chat_id, user_id, &trimmed).await
+            && remember_text_context(chat_id, user_id, &message, &trimmed).await
         {
             return Ok(());
         }
@@ -2420,7 +2423,7 @@ impl Bot {
             filename_prefix,
             &parsed_caption.description,
             original_stem,
-        ) && let Some(late_caption) = self.wait_for_text_context(chat_id, user_id).await
+        ) && let Some(late_caption) = self.wait_for_text_context(chat_id, user_id, message).await
         {
             caption = late_caption;
             parsed_caption = parse_caption(&caption);
@@ -3333,9 +3336,14 @@ impl Bot {
     }
 
     /// Waits briefly for an adjacent text-only message to become upload caption context.
-    async fn wait_for_text_context(&self, chat_id: i64, user_id: i64) -> Option<String> {
+    async fn wait_for_text_context(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        message: &Message,
+    ) -> Option<String> {
         for attempt in 0..TEXT_CONTEXT_WAIT_ATTEMPTS {
-            if let Some(text) = peek_text_context(chat_id, user_id).await
+            if let Some(text) = peek_text_context(chat_id, user_id, message).await
                 && !text.trim().is_empty()
             {
                 return Some(text);
@@ -5026,7 +5034,7 @@ fn touch(profile: &mut Profile) {
 }
 
 /// Remembers a text-only message as context for nearby uncaptained uploads.
-async fn remember_text_context(chat_id: i64, user_id: i64, text: &str) -> bool {
+async fn remember_text_context(chat_id: i64, user_id: i64, message: &Message, text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() {
         return false;
@@ -5039,6 +5047,7 @@ async fn remember_text_context(chat_id: i64, user_id: i64, text: &str) -> bool {
         TextContext {
             text: text.to_string(),
             expires_at: now + TEXT_CONTEXT_TTL_SECONDS,
+            message_date: message.date.or(Some(now)),
         },
     );
     tracing::info!(user_id, chat_id, "remembered text for nearby upload");
@@ -5047,37 +5056,69 @@ async fn remember_text_context(chat_id: i64, user_id: i64, text: &str) -> bool {
 
 /// Returns recent text for an uncaptained upload.
 ///
-/// Telegram can forward several adjacent message bubbles as one user action. For forwarded media,
-/// the text bubble is treated as shared context and is not consumed, so both the preceding and
-/// following media batches can use it. Normal uploads keep the older one-shot behavior.
+/// Telegram's send timestamp lets one text bubble act as shared context for every uncaptained
+/// media message sent within the configured window. Payloads without `date` keep the older
+/// one-shot behavior unless Telegram marks them as forwarded.
 async fn text_context_for_upload(chat_id: i64, user_id: i64, message: &Message) -> Option<String> {
-    if message.is_forwarded() {
-        peek_text_context(chat_id, user_id).await
+    if message.date.is_some() || message.is_forwarded() {
+        peek_text_context(chat_id, user_id, message).await
     } else {
-        take_text_context(chat_id, user_id).await
+        take_text_context(chat_id, user_id, message).await
     }
 }
 
 /// Returns recent text context without consuming it.
-async fn peek_text_context(chat_id: i64, user_id: i64) -> Option<String> {
+async fn peek_text_context(chat_id: i64, user_id: i64, message: &Message) -> Option<String> {
     let now = now_ts();
     let mut contexts = TEXT_CONTEXTS.write().await;
     contexts.retain(|_, context| context.expires_at >= now);
     contexts
         .get(&(chat_id, user_id))
         .filter(|context| context.expires_at >= now)
+        .filter(|context| text_context_matches_message(context, message))
         .map(|context| context.text.clone())
 }
 
 /// Consumes recent text for the next normal uncaptained upload in the same chat.
-async fn take_text_context(chat_id: i64, user_id: i64) -> Option<String> {
+async fn take_text_context(chat_id: i64, user_id: i64, message: &Message) -> Option<String> {
     let now = now_ts();
     let mut contexts = TEXT_CONTEXTS.write().await;
     contexts.retain(|_, context| context.expires_at >= now);
-    contexts
-        .remove(&(chat_id, user_id))
+    let key = (chat_id, user_id);
+    let matches = contexts
+        .get(&key)
         .filter(|context| context.expires_at >= now)
-        .map(|context| context.text)
+        .is_some_and(|context| text_context_matches_message(context, message));
+    if matches {
+        return contexts.remove(&key).map(|context| context.text);
+    }
+    if contexts
+        .get(&key)
+        .is_some_and(|context| text_context_is_older_than_message_window(context, message))
+    {
+        contexts.remove(&key);
+    }
+    None
+}
+
+/// Returns true when a remembered text bubble is close enough to a media message.
+fn text_context_matches_message(context: &TextContext, message: &Message) -> bool {
+    match (context.message_date, message.date) {
+        (Some(text_date), Some(media_date)) => {
+            media_date.abs_diff(text_date) <= TEXT_CONTEXT_MATCH_SECONDS as u64
+        }
+        _ => true,
+    }
+}
+
+/// Returns true when a stale text bubble can no longer match this or later media.
+fn text_context_is_older_than_message_window(context: &TextContext, message: &Message) -> bool {
+    match (context.message_date, message.date) {
+        (Some(text_date), Some(media_date)) => {
+            media_date > text_date.saturating_add(TEXT_CONTEXT_MATCH_SECONDS)
+        }
+        _ => false,
+    }
 }
 
 /// Returns the current unix timestamp in seconds.
@@ -6109,6 +6150,7 @@ mod tests {
     fn test_message(chat_id: i64, user_id: i64, forwarded: bool) -> Message {
         Message {
             message_id: Some(1),
+            date: Some(1_000),
             chat: Chat { id: chat_id },
             from: Some(User { id: user_id }),
             forward_origin: forwarded.then(|| serde_json::json!({"type": "user"})),
@@ -6274,6 +6316,7 @@ mod tests {
             TextContext {
                 text: "Храм Вознесения Господня\nCategories: Churches".into(),
                 expires_at: now_ts() + 60,
+                message_date: Some(1_030),
             },
         );
 
@@ -6292,7 +6335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_context_is_consumed_for_normal_uploads() {
+    async fn text_context_is_reusable_for_dated_normal_uploads() {
         let chat_id = -9_001_004;
         let user_id = 9_001_004;
         let message = test_message(chat_id, user_id, false);
@@ -6301,6 +6344,7 @@ mod tests {
             TextContext {
                 text: "Фонтан усадьбы".into(),
                 expires_at: now_ts() + 60,
+                message_date: Some(1_030),
             },
         );
 
@@ -6311,8 +6355,10 @@ mod tests {
             Some("Фонтан усадьбы")
         );
         assert_eq!(
-            text_context_for_upload(chat_id, user_id, &message).await,
-            None
+            text_context_for_upload(chat_id, user_id, &message)
+                .await
+                .as_deref(),
+            Some("Фонтан усадьбы")
         );
     }
 
@@ -6322,12 +6368,34 @@ mod tests {
         let user_id = 9_001_005;
         let message = test_message(chat_id, user_id, false);
 
-        assert!(remember_text_context(chat_id, user_id, "Фонтан усадьбы").await);
+        let mut text_message = test_message(chat_id, user_id, false);
+        text_message.date = Some(1_030);
+        assert!(remember_text_context(chat_id, user_id, &text_message, "Фонтан усадьбы").await);
         assert_eq!(
             text_context_for_upload(chat_id, user_id, &message)
                 .await
                 .as_deref(),
             Some("Фонтан усадьбы")
+        );
+    }
+
+    #[tokio::test]
+    async fn text_context_requires_one_minute_send_time_window() {
+        let chat_id = -9_001_006;
+        let user_id = 9_001_006;
+        let message = test_message(chat_id, user_id, false);
+        TEXT_CONTEXTS.write().await.insert(
+            (chat_id, user_id),
+            TextContext {
+                text: "Too far away".into(),
+                expires_at: now_ts() + 60,
+                message_date: Some(900),
+            },
+        );
+
+        assert_eq!(
+            text_context_for_upload(chat_id, user_id, &message).await,
+            None
         );
     }
 
@@ -6340,10 +6408,12 @@ mod tests {
             TextContext {
                 text: "Too old".into(),
                 expires_at: now_ts() - 1,
+                message_date: Some(1_000),
             },
         );
 
-        assert_eq!(take_text_context(chat_id, user_id).await, None);
+        let message = test_message(chat_id, user_id, false);
+        assert_eq!(take_text_context(chat_id, user_id, &message).await, None);
     }
 
     #[test]

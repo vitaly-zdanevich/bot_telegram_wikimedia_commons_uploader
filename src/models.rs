@@ -305,6 +305,8 @@ pub struct Update {
 pub struct Message {
     /// Telegram message id (used for `deleteMessage`).
     pub message_id: Option<i64>,
+    /// Telegram message send timestamp, in Unix seconds.
+    pub date: Option<i64>,
     /// Chat the message belongs to.
     pub chat: Chat,
     /// Sender.
@@ -537,6 +539,7 @@ mod tests {
     fn detects_forwarded_messages() {
         let normal = Message {
             message_id: Some(1),
+            date: Some(1_000),
             chat: Chat { id: 1 },
             from: None,
             forward_origin: None,

@@ -19,7 +19,7 @@ static IDEMPOTENCY_RAM: Lazy<RwLock<HashMap<String, i64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// How long an album's caption is remembered for its later photos.
-const GROUP_CAPTION_TTL_SECONDS: i64 = 10 * 60;
+const GROUP_CAPTION_TTL_SECONDS: i64 = 60 * 60;
 
 /// Aggregate upload statistics for the admin `/stat` command.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
