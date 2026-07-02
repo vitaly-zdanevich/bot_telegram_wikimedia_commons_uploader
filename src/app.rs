@@ -808,6 +808,7 @@ struct LinkedFile {
     mime: Option<String>,
     source_url: String,
     unique_id: String,
+    processing: Option<UploadProcessingInfo>,
     cleanup_paths: Vec<PathBuf>,
 }
 
@@ -817,7 +818,22 @@ struct ConvertedMediaFile {
     file_name: String,
     mime: String,
     unique_id: String,
+    processing: UploadProcessingInfo,
     cleanup_paths: Vec<PathBuf>,
+}
+
+/// User-facing details about a file that changed before upload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UploadProcessingInfo {
+    output_size: u64,
+    action: UploadProcessingAction,
+}
+
+/// Type of processing applied before the Commons upload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UploadProcessingAction {
+    Converted { command: String },
+    ExtractedEmbeddedJpeg,
 }
 
 /// Removes temporary files when an upload/download path exits.
@@ -929,6 +945,7 @@ enum FileResult {
         filename: String,
         url: String,
         categories: Vec<String>,
+        processing: Option<UploadProcessingInfo>,
     },
     /// An identical file already exists on Commons (matched by SHA-1).
     Duplicate { titles: Vec<String> },
@@ -949,6 +966,7 @@ struct UploadSuccessReply<'a> {
     categories: &'a [String],
     compressed_photo: bool,
     progress: Option<UploadProgress>,
+    processing: Option<&'a UploadProcessingInfo>,
 }
 
 impl Bot {
@@ -2042,6 +2060,7 @@ impl Bot {
         auth: &UploadAuth,
         bot_password_session: Option<&CommonsBotPasswordSession>,
         author_username: &str,
+        initial_processing: Option<UploadProcessingInfo>,
     ) -> Result<FileResult> {
         let parsed = parse_caption(caption);
         let source = parsed.source.as_deref().or(source_url);
@@ -2061,6 +2080,7 @@ impl Bot {
                 .unwrap_or_else(|| format!("telegram_{unique_id}")),
             ..UploadProvenance::default()
         };
+        let mut processing = initial_processing;
         let mut upload_cleanup_paths = Vec::new();
         let (upload_data, extension) = if format.needs_conversion() {
             if original.len() > self.config.max_conversion_file_bytes {
@@ -2080,7 +2100,15 @@ impl Bot {
                 self.config.webp_quality,
                 profile.dng_mode,
             ) {
-                Ok((bytes, ext)) => (UploadData::Bytes(bytes), ext.to_string()),
+                Ok((bytes, ext)) => {
+                    processing = Some(image_processing_info(
+                        format,
+                        ext,
+                        self.config.webp_quality,
+                        &bytes,
+                    ));
+                    (UploadData::Bytes(bytes), ext.to_string())
+                }
                 Err(error) => {
                     if format == convert::SourceFormat::Heic {
                         match self
@@ -2096,6 +2124,12 @@ impl Bot {
                                     error = %format!("{error:#}"),
                                     "primary HEIC conversion failed; using vips WebP fallback"
                                 );
+                                processing = Some(UploadProcessingInfo {
+                                    output_size: webp.len() as u64,
+                                    action: UploadProcessingAction::Converted {
+                                        command: vips_webp_command(self.config.webp_quality),
+                                    },
+                                });
                                 (UploadData::Bytes(webp), "webp".to_string())
                             }
                             Err(vips_error) => match self
@@ -2112,6 +2146,15 @@ impl Bot {
                                         vips_error = %format!("{vips_error:#}"),
                                         "primary HEIC conversion failed; using ffmpeg WebP fallback"
                                     );
+                                    processing = Some(UploadProcessingInfo {
+                                        output_size: webp.len() as u64,
+                                        action: UploadProcessingAction::Converted {
+                                            command: heic_ffmpeg_webp_command(
+                                                &self.config.ffmpeg_path,
+                                                self.config.webp_quality,
+                                            ),
+                                        },
+                                    });
                                     (UploadData::Bytes(webp), "webp".to_string())
                                 }
                                 Err(ffmpeg_error) => {
@@ -2198,6 +2241,7 @@ impl Bot {
                     }
                 };
                 upload_cleanup_paths = converted.cleanup_paths;
+                processing = Some(converted.processing);
                 (
                     upload_data_from_telegram_file(converted.file),
                     file_extension_for_name(&converted.file_name)
@@ -2293,6 +2337,7 @@ impl Bot {
                 filename,
                 url,
                 categories,
+                processing,
             },
             UploadOutcome::Failed { message, html } => FileResult::Failed { message, html },
         })
@@ -2472,6 +2517,7 @@ impl Bot {
                 &auth,
                 None,
                 &author_username,
+                None,
             )
             .await?;
 
@@ -2480,6 +2526,7 @@ impl Bot {
                 filename,
                 url,
                 categories,
+                processing,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(
@@ -2491,6 +2538,7 @@ impl Bot {
                         categories: &categories,
                         compressed_photo: file.compressed_photo,
                         progress,
+                        processing: processing.as_ref(),
                     },
                 )
                 .await
@@ -2501,8 +2549,9 @@ impl Bot {
                     .map(|title| format!("• {}", commons_title_url(title)))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let text =
-                    format!("⚠️ This exact file already exists on Commons:\n{links}\n\nSkipped.");
+                let text = format!(
+                    "⚠️ This exact file content already exists on Commons (same SHA-1):\n{links}\n\nSkipped."
+                );
                 self.telegram.send_message(chat_id, &text, None).await
             }
             FileResult::Rejected { reason } => {
@@ -2620,6 +2669,7 @@ impl Bot {
             .send_chat_action(chat_id, "upload_document")
             .await
             .ok();
+        let processing = linked.processing.clone();
         let result = self
             .process_one_file(
                 &profile,
@@ -2634,6 +2684,7 @@ impl Bot {
                 &auth,
                 None,
                 &author_username,
+                processing,
             )
             .await?;
 
@@ -2642,6 +2693,7 @@ impl Bot {
                 filename,
                 url,
                 categories,
+                processing,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(
@@ -2653,6 +2705,7 @@ impl Bot {
                         categories: &categories,
                         compressed_photo: false,
                         progress: None,
+                        processing: processing.as_ref(),
                     },
                 )
                 .await
@@ -2663,8 +2716,9 @@ impl Bot {
                     .map(|title| format!("• {}", commons_title_url(title)))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let text =
-                    format!("⚠️ This exact file already exists on Commons:\n{links}\n\nSkipped.");
+                let text = format!(
+                    "⚠️ This exact file content already exists on Commons (same SHA-1):\n{links}\n\nSkipped."
+                );
                 self.telegram.send_message(chat_id, &text, None).await
             }
             FileResult::Rejected { reason } => {
@@ -2823,6 +2877,7 @@ impl Bot {
             mime,
             source_url: url.as_str().to_string(),
             unique_id,
+            processing: None,
             cleanup_paths: vec![path],
         })
     }
@@ -2903,6 +2958,7 @@ impl Bot {
             file_name: Some(file_name),
             source_url: url.as_str().to_string(),
             unique_id,
+            processing: None,
             cleanup_paths: vec![target],
         })
     }
@@ -3110,6 +3166,7 @@ impl Bot {
             mime: Some(converted.mime),
             source_url,
             unique_id: converted.unique_id,
+            processing: Some(converted.processing),
             cleanup_paths: converted.cleanup_paths,
         })
     }
@@ -3126,6 +3183,7 @@ impl Bot {
         let output_name = filename_with_extension(source_name, plan.extension);
         let output_path = temp_link_path(&output_name)?;
         cleanup.push(output_path.clone());
+        let command;
 
         match plan.kind {
             FfmpegPlanKind::TranscodeVideoAv1CopyAudio | FfmpegPlanKind::TranscodeVideoAv1Opus => {
@@ -3143,11 +3201,26 @@ impl Bot {
                             "libsvtav1 failed first ({svt_error:#}); libaom-av1 fallback failed"
                         )
                     })?;
+                    command = ffmpeg_command_for_display(
+                        &self.config.ffmpeg_path,
+                        source_name,
+                        plan,
+                        Some("libaom-av1"),
+                    );
+                } else {
+                    command = ffmpeg_command_for_display(
+                        &self.config.ffmpeg_path,
+                        source_name,
+                        plan,
+                        Some("libsvtav1"),
+                    );
                 }
             }
             _ => {
                 let args = ffmpeg_args_for_plan(input, &output_path, plan, None);
                 self.run_ffmpeg_args(args).await?;
+                command =
+                    ffmpeg_command_for_display(&self.config.ffmpeg_path, source_name, plan, None);
             }
         }
 
@@ -3168,6 +3241,10 @@ impl Bot {
             file_name: output_name,
             mime: plan.mime.to_string(),
             unique_id,
+            processing: UploadProcessingInfo {
+                output_size: size,
+                action: UploadProcessingAction::Converted { command },
+            },
             cleanup_paths: cleanup.into_paths(),
         })
     }
@@ -3416,6 +3493,9 @@ impl Bot {
         };
         if reply.compressed_photo {
             text.push_str("\nℹ️ This was a compressed photo; send it as a file for full quality.");
+        }
+        if let Some(processing) = reply.processing {
+            text.push_str(&format_upload_processing(processing));
         }
         if profile.return_category_links && !reply.categories.is_empty() {
             text.push_str("\n\n<b>Categories</b>:");
@@ -3923,6 +4003,7 @@ impl Bot {
                     &auth,
                     bot_password_session.as_ref(),
                     &author_username,
+                    None,
                 )
                 .await
             {
@@ -5227,6 +5308,158 @@ fn upload_data_from_telegram_file(file: TelegramFile) -> UploadData {
     }
 }
 
+/// Formats pre-upload processing details for the success message.
+fn format_upload_processing(processing: &UploadProcessingInfo) -> String {
+    match &processing.action {
+        UploadProcessingAction::Converted { command } => format!(
+            "\nℹ️ Converted file size: {}.\n<code>{}</code>",
+            format_file_size(processing.output_size),
+            escape_html(command)
+        ),
+        UploadProcessingAction::ExtractedEmbeddedJpeg => format!(
+            "\nℹ️ Extracted embedded JPEG without conversion. Size: {}.",
+            format_file_size(processing.output_size)
+        ),
+    }
+}
+
+/// Builds processing metadata for in-memory still-image conversion/extraction.
+fn image_processing_info(
+    format: convert::SourceFormat,
+    extension: &str,
+    quality: f32,
+    bytes: &[u8],
+) -> UploadProcessingInfo {
+    let action = if matches!(extension, "jpg" | "jpeg") {
+        UploadProcessingAction::ExtractedEmbeddedJpeg
+    } else {
+        UploadProcessingAction::Converted {
+            command: internal_image_conversion_preset(format, quality),
+        }
+    };
+    UploadProcessingInfo {
+        output_size: bytes.len() as u64,
+        action,
+    }
+}
+
+/// Describes non-shell image conversion paths with the same preset detail as commands.
+fn internal_image_conversion_preset(format: convert::SourceFormat, quality: f32) -> String {
+    match format {
+        convert::SourceFormat::Bmp => "internal bmp -> webp lossless".to_string(),
+        convert::SourceFormat::Dng => {
+            format!("internal dng -> webp quality={}", webp_quality_arg(quality))
+        }
+        convert::SourceFormat::Heic => {
+            format!(
+                "internal heic -> webp quality={}",
+                webp_quality_arg(quality)
+            )
+        }
+        convert::SourceFormat::PassThrough => "internal passthrough".to_string(),
+    }
+}
+
+/// Displays the libvips HEIC fallback command without leaking temp paths.
+fn vips_webp_command(quality: f32) -> String {
+    format_command_for_display(
+        "vips",
+        &[
+            "webpsave".into(),
+            "input.heic".into(),
+            "output.webp".into(),
+            "--Q".into(),
+            webp_quality_arg(quality).into(),
+        ],
+    )
+}
+
+/// Displays the ffmpeg still-image fallback command without leaking temp paths.
+fn heic_ffmpeg_webp_command(ffmpeg_path: &str, quality: f32) -> String {
+    format_command_for_display(
+        ffmpeg_path,
+        &[
+            "-y".into(),
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-i".into(),
+            "input.heic".into(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-c:v".into(),
+            "libwebp".into(),
+            "-quality".into(),
+            webp_quality_arg(quality).into(),
+            "output.webp".into(),
+        ],
+    )
+}
+
+/// Displays the ffmpeg media command with placeholder paths and the successful encoder preset.
+fn ffmpeg_command_for_display(
+    ffmpeg_path: &str,
+    source_name: &str,
+    plan: FfmpegPlan,
+    av1_encoder: Option<&str>,
+) -> String {
+    let source_extension =
+        file_extension_for_name(source_name).unwrap_or_else(|| "media".to_string());
+    let input_name = format!("input.{source_extension}");
+    let output_name = format!("output.{}", plan.extension);
+    let args = ffmpeg_args_for_plan(
+        Path::new(&input_name),
+        Path::new(&output_name),
+        plan,
+        av1_encoder,
+    );
+    format_command_for_display(ffmpeg_path, &args)
+}
+
+/// Formats a command line for display in Telegram HTML.
+fn format_command_for_display(program: &str, args: &[OsString]) -> String {
+    std::iter::once(shell_quote_word(program))
+        .chain(
+            args.iter()
+                .map(|arg| shell_quote_word(&arg.to_string_lossy())),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Shell-quotes one command word when it contains characters that would split or expand.
+fn shell_quote_word(word: &str) -> String {
+    if word
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', r#"'\''"#))
+}
+
+/// Formats WebP quality as the integer accepted by the configured tools.
+fn webp_quality_arg(quality: f32) -> String {
+    format!("{:.0}", quality.clamp(1.0, 100.0))
+}
+
+/// Formats an actual file size for user-facing messages.
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{:.2} GB", bytes as f64 / GB)
+    }
+}
+
 /// Formats a byte limit for user-facing messages.
 fn format_size_limit(bytes: u64) -> String {
     let mb = bytes / (1024 * 1024);
@@ -6513,6 +6746,50 @@ mod tests {
             plan(Some("h264"), Some("aac")).kind,
             FfmpegPlanKind::TranscodeVideoAv1Opus
         );
+    }
+
+    #[test]
+    fn upload_processing_text_mentions_converted_size_and_command() {
+        let text = super::format_upload_processing(&super::UploadProcessingInfo {
+            output_size: 3 * 1024 * 1024,
+            action: super::UploadProcessingAction::Converted {
+                command: "ffmpeg -i input.mov -c:v libsvtav1 output.webm".into(),
+            },
+        });
+
+        assert!(text.contains("Converted file size: 3.0 MB"));
+        assert!(text.contains("<code>ffmpeg -i input.mov -c:v libsvtav1 output.webm</code>"));
+    }
+
+    #[test]
+    fn upload_processing_text_mentions_embedded_jpeg_extraction() {
+        let text = super::format_upload_processing(&super::UploadProcessingInfo {
+            output_size: 512 * 1024,
+            action: super::UploadProcessingAction::ExtractedEmbeddedJpeg,
+        });
+
+        assert!(text.contains("Extracted embedded JPEG without conversion"));
+        assert!(text.contains("Size: 512.0 KB"));
+    }
+
+    #[test]
+    fn ffmpeg_display_command_includes_successful_av1_preset() {
+        let command = super::ffmpeg_command_for_display(
+            "ffmpeg",
+            "clip.mov",
+            FfmpegPlan {
+                kind: FfmpegPlanKind::TranscodeVideoAv1Opus,
+                extension: "webm",
+                mime: "video/webm",
+            },
+            Some("libsvtav1"),
+        );
+
+        assert!(command.contains("input.mov"));
+        assert!(command.contains("-c:v libsvtav1"));
+        assert!(command.contains("-crf 35"));
+        assert!(command.contains("-preset 8"));
+        assert!(command.contains("output.webm"));
     }
 
     fn plan(video: Option<&str>, audio: Option<&str>) -> FfmpegPlan {
