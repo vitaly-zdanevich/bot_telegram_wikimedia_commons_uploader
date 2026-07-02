@@ -59,9 +59,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
+      cmake \
       curl \
       libde265-dev \
       libheif-dev \
+      libnuma-dev \
       pkg-config \
       zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
