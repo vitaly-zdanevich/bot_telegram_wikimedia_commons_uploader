@@ -132,6 +132,10 @@ Image conversions use `MAX_CONVERSION_FILE_MB`; streaming ffmpeg audio/video con
 files are rejected with a clear message (this is a Telegram limit, not a Commons one). Send
 originals as a **file/document** for full quality.
 
+By default the bot retries Commons uploads with `ignorewarnings=1` when the only warning is
+`exists-normalized`; set `COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING=false` to keep that warning
+blocking.
+
 **Wikimedia IP blocks:** Wikimedia globally blocks many data-centre IP ranges (including
 AWS) as "open proxy/webhost", so uploads from Lambda can be refused with a `blocked` error.
 Affected uploads need the account to hold a global IP-block exemption, or the bot to route

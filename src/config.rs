@@ -22,6 +22,8 @@ const DEFAULT_PROJECT_NAME: &str = "telegram-wikimedia-commons-uploader-bot";
 const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 /// Whether archive previews are resized to small JPEG thumbnails before sending.
 const DEFAULT_ARCHIVE_THUMBNAIL_RESIZE: bool = false;
+/// Whether to retry Commons uploads when the only warning is `exists-normalized`.
+const DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING: bool = true;
 /// Default yt-dlp command name.
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
 /// Default ffmpeg command name.
@@ -75,6 +77,8 @@ pub struct Config {
     pub user_agent: String,
     /// Optional HTTP(S) proxy URL for Commons traffic (to upload from a non-blocked IP).
     pub commons_proxy: Option<String>,
+    /// Whether Commons `exists-normalized` upload warnings are retried with `ignorewarnings=1`.
+    pub commons_ignore_exists_normalized_warning: bool,
     /// OAuth 1.0a consumer key (from Special:OAuthConsumerRegistration); enables OAuth login.
     pub oauth_consumer_key: Option<String>,
     /// OAuth 1.0a consumer secret.
@@ -131,6 +135,10 @@ impl Config {
         let archive_thumbnail_resize = lookup("ARCHIVE_THUMBNAIL_RESIZE")
             .and_then(|value| parse_bool(&value))
             .unwrap_or(DEFAULT_ARCHIVE_THUMBNAIL_RESIZE);
+        let commons_ignore_exists_normalized_warning =
+            lookup("COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING")
+                .and_then(|value| parse_bool(&value))
+                .unwrap_or(DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING);
         let tool_data_cookies_path = lookup("TOOL_DATA_DIR")
             .filter(|value| !value.trim().is_empty())
             .map(|dir| format!("{}/ytdlp-cookies.txt", dir.trim_end_matches('/')))
@@ -178,6 +186,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_COMMONS_API_URL.into()),
             user_agent,
             commons_proxy: lookup("COMMONS_PROXY").filter(|value| !value.trim().is_empty()),
+            commons_ignore_exists_normalized_warning,
             oauth_consumer_key: lookup("OAUTH_CONSUMER_KEY")
                 .filter(|value| !value.trim().is_empty()),
             oauth_consumer_secret: lookup("OAUTH_CONSUMER_SECRET")
@@ -227,9 +236,10 @@ fn parse_admin_ids(value: &str) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_ARCHIVE_THUMBNAIL_RESIZE, DEFAULT_FFMPEG_PATH, DEFAULT_FFPROBE_PATH,
-        DEFAULT_MAX_ARCHIVE_FILE_MB, DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_WEBP_QUALITY,
-        DEFAULT_YTDLP_PATH, parse_admin_ids,
+        Config, DEFAULT_ARCHIVE_THUMBNAIL_RESIZE, DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING,
+        DEFAULT_FFMPEG_PATH, DEFAULT_FFPROBE_PATH, DEFAULT_MAX_ARCHIVE_FILE_MB,
+        DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_MAX_VIDEO_AUDIO_CONVERSION_FILE_MB,
+        DEFAULT_WEBP_QUALITY, DEFAULT_YTDLP_PATH, parse_admin_ids,
     };
     use crate::models::License;
     use std::collections::HashMap;
@@ -263,6 +273,10 @@ mod tests {
             DEFAULT_MAX_CONVERSION_FILE_MB * 1024 * 1024
         );
         assert_eq!(
+            config.max_video_audio_conversion_file_bytes,
+            DEFAULT_MAX_VIDEO_AUDIO_CONVERSION_FILE_MB * 1024 * 1024
+        );
+        assert_eq!(
             config.max_archive_file_bytes,
             DEFAULT_MAX_ARCHIVE_FILE_MB * 1024 * 1024
         );
@@ -273,6 +287,10 @@ mod tests {
         assert_eq!(
             config.commons_api_url,
             "https://commons.wikimedia.org/w/api.php"
+        );
+        assert_eq!(
+            config.commons_ignore_exists_normalized_warning,
+            DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING
         );
         assert_eq!(config.ytdlp_path, DEFAULT_YTDLP_PATH);
         assert_eq!(config.ffmpeg_path, DEFAULT_FFMPEG_PATH);
@@ -292,8 +310,10 @@ mod tests {
             ("WEBP_QUALITY", "250"),
             ("MAX_FILE_MB", "10"),
             ("MAX_CONVERSION_FILE_MB", "128"),
+            ("MAX_VIDEO_AUDIO_CONVERSION_FILE_MB", "3072"),
             ("MAX_ARCHIVE_FILE_MB", "2048"),
             ("ARCHIVE_THUMBNAIL_RESIZE", "false"),
+            ("COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING", "false"),
             ("YTDLP_PATH", "/opt/bin/yt-dlp"),
             ("YTDLP_COOKIES_PATH", "/cookies/youtube.txt"),
             ("FFMPEG_PATH", "/opt/bin/ffmpeg"),
@@ -310,8 +330,13 @@ mod tests {
         assert_eq!(config.webp_quality, 100.0);
         assert_eq!(config.max_file_bytes, 10 * 1024 * 1024);
         assert_eq!(config.max_conversion_file_bytes, 128 * 1024 * 1024);
+        assert_eq!(
+            config.max_video_audio_conversion_file_bytes,
+            3072 * 1024 * 1024
+        );
         assert_eq!(config.max_archive_file_bytes, 2048 * 1024 * 1024);
         assert!(!config.archive_thumbnail_resize);
+        assert!(!config.commons_ignore_exists_normalized_warning);
         assert_eq!(config.ytdlp_path, "/opt/bin/yt-dlp");
         assert_eq!(
             config.ytdlp_cookies_path.as_deref(),
@@ -328,6 +353,20 @@ mod tests {
         let config = config_from_pairs(&[("MAX_IN_MEMORY_FILE_MB", "512")]);
 
         assert_eq!(config.max_conversion_file_bytes, 100 * 1024 * 1024);
+        assert_eq!(
+            config.max_video_audio_conversion_file_bytes,
+            3072 * 1024 * 1024
+        );
         assert_eq!(config.max_archive_file_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn video_audio_conversion_limit_default_is_independent_from_image_conversion_limit() {
+        let config = config_from_pairs(&[("MAX_CONVERSION_FILE_MB", "2048")]);
+
+        assert_eq!(
+            config.max_video_audio_conversion_file_bytes,
+            DEFAULT_MAX_VIDEO_AUDIO_CONVERSION_FILE_MB * 1024 * 1024
+        );
     }
 }

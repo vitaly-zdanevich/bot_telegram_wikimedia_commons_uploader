@@ -932,7 +932,11 @@ enum FileResult {
     /// The file could not be converted or its type is not accepted.
     Rejected { reason: String },
     /// Commons refused the upload (e.g. blocked, permission denied).
-    Failed { message: String },
+    Failed {
+        message: String,
+        /// Whether `message` is trusted Telegram HTML.
+        html: bool,
+    },
 }
 
 /// Data needed to format a single successful upload reply.
@@ -958,6 +962,7 @@ impl Bot {
             config.user_agent.clone(),
             config.commons_proxy.clone(),
             oauth.clone(),
+            config.commons_ignore_exists_normalized_warning,
         );
         let cipher = config
             .credential_enc_key
@@ -2286,7 +2291,7 @@ impl Bot {
                 url,
                 categories,
             },
-            UploadOutcome::Failed { message } => FileResult::Failed { message },
+            UploadOutcome::Failed { message, html } => FileResult::Failed { message, html },
         })
     }
 
@@ -2504,10 +2509,9 @@ impl Bot {
                 );
                 self.telegram.send_message(chat_id, &text, None).await
             }
-            FileResult::Failed { message } => {
-                self.telegram
-                    .send_message(chat_id, &escape_html(&message), None)
-                    .await
+            FileResult::Failed { message, html } => {
+                let text = if html { message } else { escape_html(&message) };
+                self.telegram.send_message(chat_id, &text, None).await
             }
         }
     }
@@ -2667,10 +2671,9 @@ impl Bot {
                 );
                 self.telegram.send_message(chat_id, &text, None).await
             }
-            FileResult::Failed { message } => {
-                self.telegram
-                    .send_message(chat_id, &escape_html(&message), None)
-                    .await
+            FileResult::Failed { message, html } => {
+                let text = if html { message } else { escape_html(&message) };
+                self.telegram.send_message(chat_id, &text, None).await
             }
         }
     }
@@ -3946,7 +3949,7 @@ impl Bot {
                     );
                     record_archive_reason(&mut rejected_reasons, reason);
                 }
-                Ok(FileResult::Failed { message }) => {
+                Ok(FileResult::Failed { message, html }) => {
                     failed += 1;
                     tracing::warn!(
                         user_id,
@@ -3957,7 +3960,14 @@ impl Bot {
                         message = %message,
                         "archive member upload failed"
                     );
-                    record_archive_reason(&mut failed_reasons, message);
+                    record_archive_reason(
+                        &mut failed_reasons,
+                        if html {
+                            plain_text_from_telegram_html(&message)
+                        } else {
+                            message
+                        },
+                    );
                 }
                 Err(error) => {
                     failed += 1;
@@ -4877,6 +4887,25 @@ fn archive_confirmation_buttons(
 /// Renders a boolean as a human on/off label.
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+/// Converts trusted Telegram HTML into plain text for grouped archive summaries.
+#[cfg(feature = "archive")]
+fn plain_text_from_telegram_html(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    text.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Adds a grouped archive failure/rejection reason while preserving first-seen order.

@@ -89,6 +89,24 @@ variable "max_file_mb" {
   default     = 20
 }
 
+variable "max_conversion_file_mb" {
+  type        = number
+  description = "Maximum file size for image formats that need in-memory conversion."
+  default     = 100
+}
+
+variable "max_video_audio_conversion_file_mb" {
+  type        = number
+  description = "Maximum file size for audio/video formats converted by streaming ffmpeg."
+  default     = 3072
+}
+
+variable "commons_ignore_exists_normalized_warning" {
+  type        = bool
+  description = "Retry Commons uploads with ignorewarnings=1 when the only warning is exists-normalized."
+  default     = true
+}
+
 variable "lambda_memory_size" {
   type        = number
   description = "Lambda memory in MB. 3008 (~3 GB) is the most an account gets without a limit increase; raise toward 10240 after one."

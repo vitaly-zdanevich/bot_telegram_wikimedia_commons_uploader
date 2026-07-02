@@ -60,6 +60,9 @@ toolforge envvars create OAUTH_CONSUMER_SECRET
 # toolforge envvars create TELEGRAM_API_HASH       # from https://my.telegram.org/apps
 # toolforge envvars create TELEGRAM_BOT_API_CLOUD_LOGOUT 1  # first local switch only
 # toolforge envvars create MAX_FILE_MB             # optional; keep conservative until streaming
+# toolforge envvars create MAX_CONVERSION_FILE_MB  # image conversions; default 100
+# toolforge envvars create MAX_VIDEO_AUDIO_CONVERSION_FILE_MB  # ffmpeg; default 3072
+# toolforge envvars create COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING  # default true; set false to block
 ```
 
 ## 3. Build the image

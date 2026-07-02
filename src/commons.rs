@@ -21,6 +21,7 @@ pub struct CommonsClient {
     user_agent: String,
     proxy: Option<String>,
     oauth: Option<OAuthClient>,
+    ignore_exists_normalized_warning: bool,
 }
 
 /// Result of attempting an upload.
@@ -29,7 +30,11 @@ pub enum UploadOutcome {
     /// The file was uploaded; carries the canonical title and file-page URL.
     Success { title: String, url: String },
     /// Commons declined the upload; carries a user-facing explanation.
-    Failed { message: String },
+    Failed {
+        message: String,
+        /// Whether `message` is trusted Telegram HTML built by this module.
+        html: bool,
+    },
 }
 
 /// How an upload authenticates to Commons.
@@ -103,12 +108,14 @@ impl CommonsClient {
         user_agent: impl Into<String>,
         proxy: Option<String>,
         oauth: Option<OAuthClient>,
+        ignore_exists_normalized_warning: bool,
     ) -> Self {
         Self {
             api_url: api_url.into(),
             user_agent: user_agent.into(),
             proxy,
             oauth,
+            ignore_exists_normalized_warning,
         }
     }
 
@@ -159,6 +166,7 @@ impl CommonsClient {
             Ok(client) => self.upload_logged_in(&client, request).await,
             Err(error) => Ok(UploadOutcome::Failed {
                 message: format!("{error}"),
+                html: false,
             }),
         }
     }
@@ -210,15 +218,15 @@ impl CommonsClient {
         request: &UploadRequest,
     ) -> Result<UploadOutcome> {
         let csrf_token = self.fetch_token(client, "csrf").await?;
-        let response: Value = client
-            .post(&self.api_url)
-            .multipart(build_upload_form(request, &csrf_token).await?)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("Commons upload response was not valid JSON")?;
+        let response = self
+            .post_upload_form(client, request, &csrf_token, None, false)
+            .await?;
+        if self.should_retry_exists_normalized_warning(&response, &request.filename) {
+            let response = self
+                .post_upload_form(client, request, &csrf_token, None, true)
+                .await?;
+            return Ok(interpret_upload_response(&response, &request.filename));
+        }
         Ok(interpret_upload_response(&response, &request.filename))
     }
 
@@ -260,17 +268,55 @@ impl CommonsClient {
 
         // Multipart upload, signed (OAuth does not sign multipart bodies).
         let upload_auth = oauth.api_authorization("POST", &self.api_url, token, secret, &[]);
-        let response: Value = client
-            .post(&self.api_url)
-            .header("Authorization", upload_auth)
-            .multipart(build_upload_form(request, &csrf_token).await?)
+        let response = self
+            .post_upload_form(&client, request, &csrf_token, Some(&upload_auth), false)
+            .await?;
+        if self.should_retry_exists_normalized_warning(&response, &request.filename) {
+            let retry_auth = oauth.api_authorization("POST", &self.api_url, token, secret, &[]);
+            let response = self
+                .post_upload_form(&client, request, &csrf_token, Some(&retry_auth), true)
+                .await?;
+            return Ok(interpret_upload_response(&response, &request.filename));
+        }
+        Ok(interpret_upload_response(&response, &request.filename))
+    }
+
+    /// Posts one multipart upload form, optionally signed for OAuth and with warning override.
+    async fn post_upload_form(
+        &self,
+        client: &Client,
+        request: &UploadRequest,
+        csrf_token: &str,
+        authorization: Option<&str>,
+        ignore_warnings: bool,
+    ) -> Result<Value> {
+        let mut builder = client.post(&self.api_url);
+        if let Some(authorization) = authorization {
+            builder = builder.header("Authorization", authorization);
+        }
+        builder
+            .multipart(build_upload_form(request, csrf_token, ignore_warnings).await?)
             .send()
             .await?
             .error_for_status()?
             .json()
             .await
-            .context("Commons upload response was not valid JSON")?;
-        Ok(interpret_upload_response(&response, &request.filename))
+            .context("Commons upload response was not valid JSON")
+    }
+
+    /// Returns true when a retry with `ignorewarnings=1` is allowed for this warning only.
+    fn should_retry_exists_normalized_warning(&self, response: &Value, filename: &str) -> bool {
+        if !self.ignore_exists_normalized_warning {
+            return false;
+        }
+        if !is_only_exists_normalized_warning(response) {
+            return false;
+        }
+        tracing::warn!(
+            target_filename = filename,
+            "Commons returned only exists-normalized; retrying upload with ignorewarnings"
+        );
+        true
     }
 
     /// Returns the Commons username behind an OAuth access token (for author attribution).
@@ -482,7 +528,11 @@ fn login_failure_message(reason: &str) -> String {
 }
 
 /// Builds the multipart form for an `action=upload` request.
-async fn build_upload_form(request: &UploadRequest, csrf_token: &str) -> Result<multipart::Form> {
+async fn build_upload_form(
+    request: &UploadRequest,
+    csrf_token: &str,
+    ignore_warnings: bool,
+) -> Result<multipart::Form> {
     let file_part = match &request.data {
         UploadData::Bytes(bytes) => {
             multipart::Part::bytes(bytes.clone()).file_name(request.filename.clone())
@@ -492,14 +542,17 @@ async fn build_upload_form(request: &UploadRequest, csrf_token: &str) -> Result<
             .with_context(|| format!("failed to open upload file {}", path.display()))?
             .file_name(request.filename.clone()),
     };
-    Ok(multipart::Form::new()
+    let mut form = multipart::Form::new()
         .text("action", "upload")
         .text("filename", request.filename.clone())
         .text("comment", request.comment.clone())
         .text("text", request.wikitext.clone())
         .text("token", csrf_token.to_string())
-        .text("format", "json")
-        .part("file", file_part))
+        .text("format", "json");
+    if ignore_warnings {
+        form = form.text("ignorewarnings", "1");
+    }
+    Ok(form.part("file", file_part))
 }
 
 /// Turns an `action=upload` response into a success or user-facing failure.
@@ -509,6 +562,7 @@ fn interpret_upload_response(response: &Value, fallback_title: &str) -> UploadOu
         let info = error.get("info").and_then(Value::as_str).unwrap_or("");
         return UploadOutcome::Failed {
             message: friendly_error(code, info),
+            html: false,
         };
     }
     let upload = response.get("upload");
@@ -528,11 +582,23 @@ fn interpret_upload_response(response: &Value, fallback_title: &str) -> UploadOu
                 title,
             }
         }
-        "Warning" => UploadOutcome::Failed {
-            message: describe_warnings(upload.and_then(|value| value.get("warnings"))),
-        },
+        "Warning" => {
+            let warnings = upload.and_then(|value| value.get("warnings"));
+            tracing::warn!(
+                target_filename = fallback_title,
+                warnings = %warnings
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                "Commons refused upload with warnings"
+            );
+            UploadOutcome::Failed {
+                message: describe_warnings(warnings),
+                html: true,
+            }
+        }
         other => UploadOutcome::Failed {
             message: format!("❌ Commons returned an unexpected result: {other}"),
+            html: false,
         },
     }
 }
@@ -544,19 +610,48 @@ fn describe_warnings(warnings: Option<&Value>) -> String {
     };
     let mut reasons = Vec::new();
     if let Some(name) = map.get("exists").and_then(Value::as_str) {
-        reasons.push(format!("a file named \"{name}\" already exists"));
+        reasons.push(format!(
+            "a file named {} already exists",
+            warning_file_link(name)
+        ));
+    }
+    if map.contains_key("exists-normalized") {
+        let names = warning_string_values(map.get("exists-normalized"));
+        if names.is_empty() {
+            reasons.push(
+                "a file with the same normalized Commons filename already exists".to_string(),
+            );
+        } else {
+            let links = names
+                .iter()
+                .map(|name| warning_file_link(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            reasons.push(format!(
+                "a file with the same normalized Commons filename already exists: {}",
+                links
+            ));
+        }
     }
     if let Some(duplicates) = map.get("duplicate").and_then(Value::as_array) {
         let names: Vec<&str> = duplicates.iter().filter_map(Value::as_str).collect();
         if !names.is_empty() {
-            reasons.push(format!("it is a duplicate of: {}", names.join(", ")));
+            let links = names
+                .iter()
+                .map(|name| warning_file_link(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            reasons.push(format!("it is a duplicate of: {links}"));
         }
     }
     if map.contains_key("was-deleted") {
         reasons.push("a file with this name was previously deleted".to_string());
     }
     if let Some(name) = map.get("duplicate-archive").and_then(Value::as_str) {
-        reasons.push(format!("a deleted file \"{name}\" was a duplicate"));
+        reasons.push(format!(
+            "a deleted file {} was a duplicate",
+            warning_file_link(name)
+        ));
     }
     if map.contains_key("badfilename") {
         reasons.push("the filename is not allowed".to_string());
@@ -569,6 +664,66 @@ fn describe_warnings(warnings: Option<&Value>) -> String {
         "❌ Commons did not upload the file because {}.",
         reasons.join("; ")
     )
+}
+
+/// Detects the only Commons warning this bot may automatically retry with `ignorewarnings=1`.
+fn is_only_exists_normalized_warning(response: &Value) -> bool {
+    let result = response
+        .get("upload")
+        .and_then(|value| value.get("result"))
+        .and_then(Value::as_str);
+    if result != Some("Warning") {
+        return false;
+    }
+    let Some(warnings) = response
+        .get("upload")
+        .and_then(|value| value.get("warnings"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    warnings.len() == 1 && warnings.contains_key("exists-normalized")
+}
+
+/// Extracts displayable string values from the mixed upload-warning JSON shapes.
+fn warning_string_values(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(value)) => vec![value.to_string()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::Object(values)) => values
+            .values()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Builds a safe Telegram HTML link to a Commons file named in an upload warning.
+fn warning_file_link(name: &str) -> String {
+    let title = name.strip_prefix("File:").unwrap_or(name);
+    let url = file_page_url(title);
+    format!(
+        "<a href=\"{}\">{}</a>",
+        html_attribute(&url),
+        html_text(name)
+    )
+}
+
+/// Escapes text for a Telegram HTML text node.
+fn html_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Escapes text for a Telegram HTML quoted attribute.
+fn html_attribute(text: &str) -> String {
+    html_text(text).replace('"', "&quot;")
 }
 
 /// Turns a Commons API error code/info into a clear, actionable message for the user.
@@ -1273,7 +1428,7 @@ mod tests {
             json!({"upload": {"result": "Warning", "warnings": {"exists": "Minsk.webp"}}});
         let outcome = interpret_upload_response(&response, "Minsk.webp");
         match outcome {
-            super::UploadOutcome::Failed { message } => {
+            super::UploadOutcome::Failed { message, .. } => {
                 assert!(message.contains("already exists"));
                 assert!(message.contains("Minsk.webp"));
             }
@@ -1282,10 +1437,20 @@ mod tests {
     }
 
     #[test]
+    fn describes_normalized_existing_filename_warning() {
+        let warnings = json!({"exists-normalized": ["Minsk old town.webp"]});
+        let message = describe_warnings(Some(&warnings));
+
+        assert!(message.contains("normalized Commons filename"));
+        assert!(message.contains("Minsk old town.webp"));
+        assert!(message.contains("<a href=\"https://commons.wikimedia.org/wiki/File:Minsk_old_town.webp\">Minsk old town.webp</a>"));
+    }
+
+    #[test]
     fn reports_api_error_as_failure() {
         let response = json!({"error": {"code": "ratelimited", "info": "slow down"}});
         match interpret_upload_response(&response, "x.webp") {
-            super::UploadOutcome::Failed { message } => {
+            super::UploadOutcome::Failed { message, .. } => {
                 assert!(message.contains("too fast"));
             }
             other => panic!("expected failure, got {other:?}"),
@@ -1296,7 +1461,25 @@ mod tests {
     fn describes_duplicate_warning() {
         let warnings = json!({"duplicate": ["Existing1.jpg", "Existing2.jpg"]});
         let message = describe_warnings(Some(&warnings));
-        assert!(message.contains("duplicate of: Existing1.jpg, Existing2.jpg"));
+        assert!(message.contains("duplicate of:"));
+        assert!(message.contains(
+            "<a href=\"https://commons.wikimedia.org/wiki/File:Existing1.jpg\">Existing1.jpg</a>"
+        ));
+        assert!(message.contains(
+            "<a href=\"https://commons.wikimedia.org/wiki/File:Existing2.jpg\">Existing2.jpg</a>"
+        ));
+    }
+
+    #[test]
+    fn only_exists_normalized_warning_is_auto_retryable() {
+        let retryable =
+            json!({"upload": {"result": "Warning", "warnings": {"exists-normalized": ["A.jpg"]}}});
+        let mixed = json!({"upload": {"result": "Warning", "warnings": {"exists-normalized": ["A.jpg"], "duplicate": ["B.jpg"]}}});
+        let existing = json!({"upload": {"result": "Warning", "warnings": {"exists": "A.jpg"}}});
+
+        assert!(super::is_only_exists_normalized_warning(&retryable));
+        assert!(!super::is_only_exists_normalized_warning(&mixed));
+        assert!(!super::is_only_exists_normalized_warning(&existing));
     }
 
     #[test]
