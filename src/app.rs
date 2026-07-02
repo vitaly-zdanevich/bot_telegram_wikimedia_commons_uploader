@@ -1102,6 +1102,7 @@ impl Bot {
         match command {
             "/start" => self.cmd_start(chat_id, user_id).await,
             "/help" => self.send_help(chat_id, user_id).await,
+            "/admin" => self.cmd_admin(chat_id, user_id).await,
             "/stat" | "/stats" => self.cmd_stat(chat_id, user_id).await,
             "/settings" | "/prefs" | "/preferences" => {
                 self.cmd_settings(chat_id, user_id, argument).await
@@ -1989,6 +1990,25 @@ impl Bot {
         self.telegram.send_message(chat_id, &text, None).await
     }
 
+    /// Shows operational status to administrators.
+    async fn cmd_admin(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        if !self.config.is_admin(user_id) {
+            return self
+                .telegram
+                .send_message(chat_id, "This command is for administrators only.", None)
+                .await;
+        }
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        let stats = self.store.aggregate_stats().await.unwrap_or_default();
+        let load = load_average_text().unwrap_or_else(|| "unavailable".to_string());
+        let uptime = uptime_text().unwrap_or_else(|| "unavailable".to_string());
+        let text = format!(
+            "🛠 <b>Admin</b>\nUsers: <b>{}</b>\nTotal uploads: <b>{}</b>\nLoad average (1/5/15m): <b>{}</b>\nUptime: <b>{}</b>",
+            stats.users, stats.uploads, load, uptime
+        );
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
     /// Sends the help message with usage, limits, contact, and related projects.
     async fn send_help(&self, chat_id: i64, user_id: i64) -> Result<()> {
         let profile = self.store.get_profile(user_id).await;
@@ -2010,8 +2030,13 @@ impl Bot {
         let video_audio_conversion_limit =
             format_size_limit(self.config.max_video_audio_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
+        let commands = if self.config.is_admin(user_id) {
+            "/start, /settings, /forget, /help, /admin"
+        } else {
+            "/start, /settings, /forget, /help"
+        };
         let mut text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; image conversions are limited to {image_conversion_limit}; video/audio conversions are limited to {video_audio_conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: /start, /settings, /forget, /help\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; image conversions are limited to {image_conversion_limit}; video/audio conversions are limited to {video_audio_conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: {commands}\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -5313,6 +5338,47 @@ fn text_context_is_older_than_message_window(context: &TextContext, message: &Me
     }
 }
 
+/// Returns the system load averages as `1m / 5m / 15m` text.
+fn load_average_text() -> Option<String> {
+    parse_load_average(&std::fs::read_to_string("/proc/loadavg").ok()?)
+}
+
+/// Parses Linux `/proc/loadavg` and formats the first three load numbers.
+fn parse_load_average(raw: &str) -> Option<String> {
+    let mut parts = raw.split_whitespace();
+    let one = parts.next()?.parse::<f64>().ok()?;
+    let five = parts.next()?.parse::<f64>().ok()?;
+    let fifteen = parts.next()?.parse::<f64>().ok()?;
+    Some(format!("{one:.2} / {five:.2} / {fifteen:.2}"))
+}
+
+/// Returns host uptime as compact text.
+fn uptime_text() -> Option<String> {
+    parse_uptime(&std::fs::read_to_string("/proc/uptime").ok()?)
+}
+
+/// Parses Linux `/proc/uptime` and formats elapsed uptime.
+fn parse_uptime(raw: &str) -> Option<String> {
+    let seconds = raw.split_whitespace().next()?.parse::<f64>().ok()?;
+    Some(format_duration(seconds.max(0.0) as u64))
+}
+
+/// Formats elapsed seconds as `Xd Yh Zm` style text.
+fn format_duration(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// Returns the current unix timestamp in seconds.
 fn now_ts() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -6575,6 +6641,27 @@ mod tests {
             status_for_webhook_error(&error),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn parses_load_average_for_admin_status() {
+        assert_eq!(
+            super::parse_load_average("0.12 1.34 5.67 1/234 5678").as_deref(),
+            Some("0.12 / 1.34 / 5.67")
+        );
+        assert_eq!(super::parse_load_average("bad"), None);
+    }
+
+    #[test]
+    fn parses_and_formats_uptime_for_admin_status() {
+        assert_eq!(
+            super::parse_uptime("93784.12 123.45").as_deref(),
+            Some("1d 2h 3m")
+        );
+        assert_eq!(super::format_duration(59), "59s");
+        assert_eq!(super::format_duration(60), "1m");
+        assert_eq!(super::format_duration(3_900), "1h 5m");
+        assert_eq!(super::parse_uptime("bad"), None);
     }
 
     #[test]

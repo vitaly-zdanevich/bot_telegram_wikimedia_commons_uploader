@@ -171,12 +171,14 @@ add it to the build `Aptfile`). Archives are disabled on the Lambda build becaus
 - `/start` — connect your account / resume setup
 - `/help` — usage, your uploads link, related projects, contact
 - `/settings` — license, filename prefix, default categories, DNG handling, and toggles:
-  return upload links (**on** by default), return category links (**off**), return
-  non-existing category links (**off**).
+  return upload links (**on** by default), return upload metadata — resolution, EXIF camera
+  model, and EXIF date (**on**), return category links (**off**), return non-existing category
+  links (**off**).
   On the server build, two more: show an archive's file list (**off**), and require a
   thumbnail + **Confirm** step before uploading an archive (**on**)
 - `/forget` — delete your stored credentials and settings
 - `/stat` — admins only: total users and uploads
+- `/admin` — admins only: total users/uploads, system load averages (1/5/15 min), and uptime
 
 ## Deploy
 
@@ -194,7 +196,7 @@ project-local toolchain + `cargo-lambda` if missing), and a Telegram bot token f
    telegram_bot_token      = "123456:your-bot-token"      # from @BotFather
    telegram_webhook_secret = "some-random-string"
    credential_enc_key      = "base64-32-bytes"            # openssl rand -base64 32
-   admin_telegram_user_ids = "123456789"                  # optional, for /stat
+   admin_telegram_user_ids = "123456789"                  # optional, for /stat and /admin
    ```
 
    (You can instead export `TF_VAR_telegram_bot_token`, etc.)

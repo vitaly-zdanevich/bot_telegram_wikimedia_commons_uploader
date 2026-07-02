@@ -21,7 +21,7 @@ static IDEMPOTENCY_RAM: Lazy<RwLock<HashMap<String, i64>>> =
 /// How long an album's caption is remembered for its later photos.
 const GROUP_CAPTION_TTL_SECONDS: i64 = 60 * 60;
 
-/// Aggregate upload statistics for the admin `/stat` command.
+/// Aggregate upload statistics for admin status commands.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UploadStats {
     /// Number of onboarded user profiles.
@@ -326,7 +326,7 @@ impl Store {
         }
     }
 
-    /// Totals onboarded profiles and uploads (admin `/stat`).
+    /// Totals onboarded profiles and uploads for admin status commands.
     pub async fn aggregate_stats(&self) -> Result<UploadStats> {
         match &self.backend {
             Backend::Memory => Ok(UploadStats::default()),
