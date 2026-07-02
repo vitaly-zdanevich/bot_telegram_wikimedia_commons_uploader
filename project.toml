@@ -18,6 +18,7 @@ install = [
     "libraw-bin",
     "yt-dlp",
     "ffmpeg",
+    "cmake",
     "libvips-tools",
     "curl",
     "libheif-dev",

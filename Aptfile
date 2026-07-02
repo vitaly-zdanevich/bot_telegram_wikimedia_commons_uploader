@@ -12,6 +12,9 @@ libraw-bin
 yt-dlp
 ffmpeg
 
+# Builds the vendored libheif used by the Rust HEIC decoder.
+cmake
+
 # Full-resolution HEIC still-image fallback when libheif-rs/ffmpeg reject Apple HEIC variants.
 libvips-tools
 
