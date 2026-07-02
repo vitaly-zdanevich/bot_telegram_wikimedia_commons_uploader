@@ -29,7 +29,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
@@ -904,6 +904,14 @@ impl MediaProbe {
     fn has_video(&self) -> bool {
         self.first_video_codec().is_some()
     }
+
+    /// Returns the first video stream resolution reported by ffprobe.
+    fn first_video_resolution(&self) -> Option<MediaResolution> {
+        self.streams
+            .iter()
+            .find(|stream| stream.kind == "video")
+            .and_then(|stream| stream.resolution)
+    }
 }
 
 /// One ffprobe stream reduced to the fields needed for Commons format decisions.
@@ -911,6 +919,29 @@ impl MediaProbe {
 struct MediaStreamInfo {
     kind: String,
     codec: Option<String>,
+    resolution: Option<MediaResolution>,
+}
+
+/// Pixel dimensions of the file that is uploaded to Commons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MediaResolution {
+    width: u32,
+    height: u32,
+}
+
+/// Optional metadata appended to the post-upload success report.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct UploadReportMetadata {
+    resolution: Option<MediaResolution>,
+    camera_model: Option<String>,
+    date: Option<String>,
+}
+
+impl UploadReportMetadata {
+    /// Returns true when there is nothing useful to show.
+    fn is_empty(&self) -> bool {
+        self.resolution.is_none() && self.camera_model.is_none() && self.date.is_none()
+    }
 }
 
 /// What ffmpeg should do to make a media file acceptable to Commons.
@@ -946,6 +977,7 @@ enum FileResult {
         url: String,
         categories: Vec<String>,
         processing: Option<UploadProcessingInfo>,
+        report_metadata: Option<UploadReportMetadata>,
     },
     /// An identical file already exists on Commons (matched by SHA-1).
     Duplicate { titles: Vec<String> },
@@ -967,6 +999,7 @@ struct UploadSuccessReply<'a> {
     compressed_photo: bool,
     progress: Option<UploadProgress>,
     processing: Option<&'a UploadProcessingInfo>,
+    report_metadata: Option<&'a UploadReportMetadata>,
 }
 
 impl Bot {
@@ -1733,6 +1766,10 @@ impl Bot {
                 profile.return_missing_category_links = !profile.return_missing_category_links;
                 true
             }
+            "set:metadata" => {
+                profile.return_upload_metadata = !profile.return_upload_metadata;
+                true
+            }
             #[cfg(feature = "archive")]
             "set:arclist" => {
                 profile.return_archive_file_list = !profile.return_archive_file_list;
@@ -2260,6 +2297,12 @@ impl Bot {
         {
             return Ok(FileResult::Duplicate { titles: existing });
         }
+        let report_metadata = if profile.return_upload_metadata {
+            self.upload_report_metadata(&upload_data, &metadata, &extension)
+                .await
+        } else {
+            None
+        };
 
         // Build the filename: caption text as a descriptive prefix and the original stem
         // for per-file uniqueness (emoji dropped, newlines collapsed by build_filename).
@@ -2338,6 +2381,7 @@ impl Bot {
                 url,
                 categories,
                 processing,
+                report_metadata,
             },
             UploadOutcome::Failed { message, html } => FileResult::Failed { message, html },
         })
@@ -2527,6 +2571,7 @@ impl Bot {
                 url,
                 categories,
                 processing,
+                report_metadata,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(
@@ -2539,6 +2584,7 @@ impl Bot {
                         compressed_photo: file.compressed_photo,
                         progress,
                         processing: processing.as_ref(),
+                        report_metadata: report_metadata.as_ref(),
                     },
                 )
                 .await
@@ -2694,6 +2740,7 @@ impl Bot {
                 url,
                 categories,
                 processing,
+                report_metadata,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
                 self.send_success(
@@ -2706,6 +2753,7 @@ impl Bot {
                         compressed_photo: false,
                         progress: None,
                         processing: processing.as_ref(),
+                        report_metadata: report_metadata.as_ref(),
                     },
                 )
                 .await
@@ -3056,7 +3104,7 @@ impl Bot {
                 .arg("-v")
                 .arg("error")
                 .arg("-show_entries")
-                .arg("stream=codec_type,codec_name")
+                .arg("stream=codec_type,codec_name,width,height")
                 .arg("-of")
                 .arg("json")
                 .arg(path)
@@ -3082,6 +3130,8 @@ impl Bot {
         struct FfprobeStream {
             codec_type: Option<String>,
             codec_name: Option<String>,
+            width: Option<u32>,
+            height: Option<u32>,
         }
 
         let parsed: FfprobeOutput =
@@ -3094,10 +3144,54 @@ impl Bot {
                     Some(MediaStreamInfo {
                         kind: stream.codec_type?,
                         codec: stream.codec_name.map(|codec| codec.to_ascii_lowercase()),
+                        resolution: media_resolution(stream.width, stream.height),
                     })
                 })
                 .collect(),
         })
+    }
+
+    /// Builds optional metadata for the user-facing upload success report.
+    async fn upload_report_metadata(
+        &self,
+        upload_data: &UploadData,
+        image_metadata: &metadata::ImageMetadata,
+        extension: &str,
+    ) -> Option<UploadReportMetadata> {
+        let report = UploadReportMetadata {
+            resolution: self.upload_resolution(upload_data, extension).await,
+            camera_model: image_metadata.camera_model.clone(),
+            date: image_metadata.date.clone(),
+        };
+        (!report.is_empty()).then_some(report)
+    }
+
+    /// Reads the final upload resolution from image headers or video stream metadata.
+    async fn upload_resolution(
+        &self,
+        upload_data: &UploadData,
+        extension: &str,
+    ) -> Option<MediaResolution> {
+        if let Some(resolution) = image_resolution_from_upload_data(upload_data) {
+            return Some(resolution);
+        }
+        if !is_video_resolution_candidate(extension) {
+            return None;
+        }
+        let UploadData::File { path, .. } = upload_data else {
+            return None;
+        };
+        match self.probe_media(path).await {
+            Ok(probe) => probe.first_video_resolution(),
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "failed to read video resolution"
+                );
+                None
+            }
+        }
     }
 
     /// Converts/remuxes a direct Telegram audio/video file through ffmpeg.
@@ -3493,6 +3587,9 @@ impl Bot {
         };
         if reply.compressed_photo {
             text.push_str("\nℹ️ This was a compressed photo; send it as a file for full quality.");
+        }
+        if let Some(report_metadata) = reply.report_metadata {
+            text.push_str(&format_upload_report_metadata(report_metadata));
         }
         if let Some(processing) = reply.processing {
             text.push_str(&format_upload_processing(processing));
@@ -4007,13 +4104,21 @@ impl Bot {
                 )
                 .await
             {
-                Ok(FileResult::Uploaded { filename, url, .. }) => {
+                Ok(FileResult::Uploaded {
+                    filename,
+                    url,
+                    report_metadata,
+                    ..
+                }) => {
                     uploaded += 1;
                     if profile.return_upload_links {
-                        let text = format!(
+                        let mut text = format!(
                             "✅ Uploaded {member_index}/{entry_count}: <a href=\"{url}\">{}</a>",
                             escape_html(&filename)
                         );
+                        if let Some(report_metadata) = &report_metadata {
+                            text.push_str(&format_upload_report_metadata(report_metadata));
+                        }
                         if let Err(error) = self.telegram.send_message(chat_id, &text, None).await {
                             tracing::warn!(
                                 error = %format!("{error:#}"),
@@ -4668,13 +4773,14 @@ fn settings_overview(profile: &Profile) -> String {
         profile.default_categories.join(", ")
     };
     let mut text = format!(
-        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
+        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn upload metadata: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
         escape_html(&account),
         escape_html(profile.license.label()),
         escape_html(&prefix),
         escape_html(&categories),
         escape_html(profile.dng_mode.label()),
         on_off(profile.return_upload_links),
+        on_off(profile.return_upload_metadata),
         on_off(profile.return_category_links),
         on_off(profile.return_missing_category_links),
     );
@@ -4699,6 +4805,11 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             "Upload links",
             "set:links",
             profile.return_upload_links,
+        )],
+        vec![toggle_button(
+            "Upload metadata",
+            "set:metadata",
+            profile.return_upload_metadata,
         )],
         vec![toggle_button(
             "Category links",
@@ -5308,6 +5419,24 @@ fn upload_data_from_telegram_file(file: TelegramFile) -> UploadData {
     }
 }
 
+/// Formats optional media metadata for a post-upload success report.
+fn format_upload_report_metadata(report: &UploadReportMetadata) -> String {
+    let mut text = String::new();
+    if let Some(resolution) = report.resolution {
+        text.push_str(&format!(
+            "\nℹ️ Resolution: {}.",
+            format_resolution(resolution)
+        ));
+    }
+    if let Some(camera_model) = report.camera_model.as_deref() {
+        text.push_str(&format!("\nℹ️ Camera: {}.", escape_html(camera_model)));
+    }
+    if let Some(date) = report.date.as_deref() {
+        text.push_str(&format!("\nℹ️ Date: {}.", escape_html(date)));
+    }
+    text
+}
+
 /// Formats pre-upload processing details for the success message.
 fn format_upload_processing(processing: &UploadProcessingInfo) -> String {
     match &processing.action {
@@ -5321,6 +5450,43 @@ fn format_upload_processing(processing: &UploadProcessingInfo) -> String {
             format_file_size(processing.output_size)
         ),
     }
+}
+
+/// Reads image dimensions from upload bytes or a path without decoding full pixels.
+fn image_resolution_from_upload_data(upload_data: &UploadData) -> Option<MediaResolution> {
+    let dimensions = match upload_data {
+        UploadData::Bytes(bytes) => image::ImageReader::new(Cursor::new(bytes.as_slice()))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?,
+        UploadData::File { path, .. } => image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?,
+    };
+    media_resolution(Some(dimensions.0), Some(dimensions.1))
+}
+
+/// Builds a non-zero pixel resolution.
+fn media_resolution(width: Option<u32>, height: Option<u32>) -> Option<MediaResolution> {
+    let (width, height) = (width?, height?);
+    (width > 0 && height > 0).then_some(MediaResolution { width, height })
+}
+
+/// Returns true when ffprobe may be useful for reporting resolution.
+fn is_video_resolution_candidate(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "webm" | "ogv" | "ogg"
+    )
+}
+
+/// Formats pixel dimensions for user-facing messages.
+fn format_resolution(resolution: MediaResolution) -> String {
+    format!("{} × {}", resolution.width, resolution.height)
 }
 
 /// Builds processing metadata for in-memory still-image conversion/extraction.
@@ -6773,6 +6939,44 @@ mod tests {
     }
 
     #[test]
+    fn upload_report_metadata_mentions_resolution_and_camera() {
+        let text = super::format_upload_report_metadata(&super::UploadReportMetadata {
+            resolution: Some(super::MediaResolution {
+                width: 4032,
+                height: 3024,
+            }),
+            camera_model: Some("Canon <EOS>".into()),
+            date: Some("2026-06-20".into()),
+        });
+
+        assert!(text.contains("Resolution: 4032 × 3024"));
+        assert!(text.contains("Camera: Canon &lt;EOS&gt;"));
+        assert!(text.contains("Date: 2026-06-20"));
+    }
+
+    #[test]
+    fn media_probe_reports_first_video_resolution() {
+        let probe = MediaProbe {
+            streams: vec![MediaStreamInfo {
+                kind: "video".into(),
+                codec: Some("av1".into()),
+                resolution: Some(super::MediaResolution {
+                    width: 1920,
+                    height: 1080,
+                }),
+            }],
+        };
+
+        assert_eq!(
+            probe.first_video_resolution(),
+            Some(super::MediaResolution {
+                width: 1920,
+                height: 1080,
+            })
+        );
+    }
+
+    #[test]
     fn ffmpeg_display_command_includes_successful_av1_preset() {
         let command = super::ffmpeg_command_for_display(
             "ffmpeg",
@@ -6802,12 +7006,14 @@ mod tests {
             streams.push(MediaStreamInfo {
                 kind: "video".into(),
                 codec: Some(codec.into()),
+                resolution: None,
             });
         }
         if let Some(codec) = audio {
             streams.push(MediaStreamInfo {
                 kind: "audio".into(),
                 codec: Some(codec.into()),
+                resolution: None,
             });
         }
         MediaProbe { streams }
@@ -6900,6 +7106,20 @@ mod tests {
             .expect("settings should include a filename-prefix submenu");
 
         assert!(prefix_button.text.starts_with("Filename prefix: "));
+    }
+
+    #[test]
+    fn settings_keyboard_has_upload_metadata_toggle_on_by_default() {
+        let keyboard = settings_keyboard(&Profile::default());
+        let button = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|button| button.callback_data.as_deref() == Some("set:metadata"))
+            .expect("settings should include an upload metadata toggle");
+
+        assert!(button.text.contains("Upload metadata"));
+        assert!(button.text.contains("on"));
     }
 
     #[test]

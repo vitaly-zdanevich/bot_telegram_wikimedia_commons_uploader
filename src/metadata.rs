@@ -10,6 +10,8 @@ pub struct ImageMetadata {
     pub latitude: Option<f64>,
     /// GPS longitude in decimal degrees (negative for the western hemisphere).
     pub longitude: Option<f64>,
+    /// Camera make/model from EXIF, formatted for user-facing upload reports.
+    pub camera_model: Option<String>,
 }
 
 impl ImageMetadata {
@@ -48,6 +50,7 @@ fn metadata_from_exif(exif: &Exif) -> ImageMetadata {
         date: capture_date(exif),
         latitude: gps_coordinate(exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, 'S'),
         longitude: gps_coordinate(exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, 'W'),
+        camera_model: camera_model(exif),
     }
 }
 
@@ -89,6 +92,38 @@ fn gps_coordinate(exif: &Exif, coord_tag: Tag, ref_tag: Tag, negative_ref: char)
     Some(sign * degrees)
 }
 
+/// Reads a compact camera make/model string from EXIF.
+fn camera_model(exif: &Exif) -> Option<String> {
+    camera_model_from_parts(
+        exif.get_field(Tag::Make, In::PRIMARY).and_then(ascii_value),
+        exif.get_field(Tag::Model, In::PRIMARY)
+            .and_then(ascii_value),
+    )
+}
+
+/// Combines EXIF make/model while avoiding duplicated make prefixes.
+fn camera_model_from_parts(make: Option<String>, model: Option<String>) -> Option<String> {
+    let make = make
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let model = model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (make, model) {
+        (Some(make), Some(model))
+            if model
+                .to_ascii_lowercase()
+                .starts_with(&make.to_ascii_lowercase()) =>
+        {
+            Some(model)
+        }
+        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+        (Some(make), None) => Some(make),
+        (None, Some(model)) => Some(model),
+        (None, None) => None,
+    }
+}
+
 /// Converts EXIF degree/minute/second rationals into decimal degrees.
 fn rationals_to_degrees(value: &Value) -> Option<f64> {
     let Value::Rational(parts) = value else {
@@ -112,7 +147,7 @@ fn ascii_value(field: &Field) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::date_to_iso;
+    use super::{camera_model_from_parts, date_to_iso};
 
     #[test]
     fn converts_exif_datetime_to_iso_date() {
@@ -122,5 +157,21 @@ mod tests {
         );
         assert_eq!(date_to_iso("not a date"), None);
         assert_eq!(date_to_iso("2026:6:20 12:00:00"), None);
+    }
+
+    #[test]
+    fn combines_camera_make_and_model_without_duplicates() {
+        assert_eq!(
+            camera_model_from_parts(Some("Canon".into()), Some("EOS 5D".into())).as_deref(),
+            Some("Canon EOS 5D")
+        );
+        assert_eq!(
+            camera_model_from_parts(Some("Canon".into()), Some("Canon EOS 5D".into())).as_deref(),
+            Some("Canon EOS 5D")
+        );
+        assert_eq!(
+            camera_model_from_parts(None, Some("Pixel 8 Pro".into())).as_deref(),
+            Some("Pixel 8 Pro")
+        );
     }
 }

@@ -412,6 +412,7 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
         "return_upload_links": {"BOOL": profile.return_upload_links},
         "return_category_links": {"BOOL": profile.return_category_links},
         "return_missing_category_links": {"BOOL": profile.return_missing_category_links},
+        "return_upload_metadata": {"BOOL": profile.return_upload_metadata},
         "return_archive_file_list": {"BOOL": profile.return_archive_file_list},
         "archive_confirm": {"BOOL": profile.archive_confirm},
         "dng_mode": {"S": profile.dng_mode.as_key()},
@@ -470,6 +471,8 @@ fn item_to_profile(item: &Value) -> Profile {
         return_category_links: attr_bool(item, "return_category_links").unwrap_or(false),
         return_missing_category_links: attr_bool(item, "return_missing_category_links")
             .unwrap_or(false),
+        return_upload_metadata: attr_bool(item, "return_upload_metadata")
+            .unwrap_or_else(|| Profile::default().return_upload_metadata),
         return_archive_file_list: attr_bool(item, "return_archive_file_list").unwrap_or(false),
         archive_confirm: attr_bool(item, "archive_confirm").unwrap_or(true),
         dng_mode: attr_string(item, "dng_mode")
@@ -532,6 +535,7 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             return_upload_links INTEGER NOT NULL DEFAULT 1,
             return_category_links INTEGER NOT NULL DEFAULT 0,
             return_missing_category_links INTEGER NOT NULL DEFAULT 0,
+            return_upload_metadata INTEGER NOT NULL DEFAULT 1,
             return_archive_file_list INTEGER NOT NULL DEFAULT 0,
             archive_confirm INTEGER NOT NULL DEFAULT 1,
             dng_mode TEXT NOT NULL DEFAULT 'convert-to-webp',
@@ -573,6 +577,15 @@ fn run_sqlite_migrations(connection: &mut rusqlite::Connection) -> Result<()> {
             [],
         )?;
     }
+    if !columns
+        .iter()
+        .any(|column| column == "return_upload_metadata")
+    {
+        transaction.execute(
+            "ALTER TABLE profiles ADD COLUMN return_upload_metadata INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES ('return_upload_links_default_on', strftime('%s', 'now'))",
         [],
@@ -592,7 +605,7 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
@@ -608,6 +621,7 @@ fn sqlite_load_profile(
                 return_upload_links: row.get::<_, i64>(6)? != 0,
                 return_category_links: row.get::<_, i64>(7)? != 0,
                 return_missing_category_links: row.get::<_, i64>(8)? != 0,
+                return_upload_metadata: row.get::<_, i64>(21)? != 0,
                 uploads_count: row.get::<_, i64>(9)?.max(0) as u64,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
@@ -638,7 +652,7 @@ fn sqlite_put_profile(
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -662,6 +676,7 @@ fn sqlite_put_profile(
             profile.oauth_ciphertext,
             profile.oauth_pending_ciphertext,
             profile.dng_mode.as_key(),
+            profile.return_upload_metadata as i64,
         ],
     )?;
     Ok(())
@@ -790,6 +805,7 @@ mod tests {
             return_upload_links: true,
             return_category_links: true,
             return_missing_category_links: false,
+            return_upload_metadata: true,
             return_archive_file_list: false,
             archive_confirm: true,
             dng_mode: DngMode::ExtractEmbeddedJpeg,
@@ -818,6 +834,12 @@ mod tests {
             .remove("return_upload_links");
         let legacy_profile = item_to_profile(&legacy_item);
         assert!(legacy_profile.return_upload_links);
+        legacy_item
+            .as_object_mut()
+            .expect("profile item is an object")
+            .remove("return_upload_metadata");
+        let legacy_profile = item_to_profile(&legacy_item);
+        assert!(legacy_profile.return_upload_metadata);
     }
 
     #[tokio::test]
@@ -867,6 +889,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(enabled, 1);
+        let metadata_enabled: i64 = connection
+            .query_row(
+                "SELECT return_upload_metadata FROM profiles WHERE user_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(metadata_enabled, 1);
 
         connection
             .execute(
@@ -905,6 +935,7 @@ mod tests {
             return_upload_links: true,
             return_category_links: false,
             return_missing_category_links: true,
+            return_upload_metadata: false,
             return_archive_file_list: true,
             archive_confirm: false,
             dng_mode: DngMode::ExtractEmbeddedJpeg,

@@ -223,6 +223,8 @@ pub struct Profile {
     pub return_category_links: bool,
     /// Whether to reply with links to categories that do not yet exist on Commons.
     pub return_missing_category_links: bool,
+    /// Whether upload success replies include resolution, EXIF camera model, and EXIF date.
+    pub return_upload_metadata: bool,
     /// Whether to reply with the file list found inside an archive (off by default).
     pub return_archive_file_list: bool,
     /// Whether to show archive thumbnails and require a Confirm tap (on by default).
@@ -255,6 +257,7 @@ impl Default for Profile {
             return_upload_links: true,
             return_category_links: false,
             return_missing_category_links: false,
+            return_upload_metadata: true,
             return_archive_file_list: false,
             archive_confirm: true,
             dng_mode: DngMode::default(),
