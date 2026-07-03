@@ -83,6 +83,12 @@ pub struct Config {
     pub oauth_consumer_key: Option<String>,
     /// OAuth 1.0a consumer secret.
     pub oauth_consumer_secret: Option<String>,
+    /// OAuth2 client id / consumer key.
+    pub oauth2_client_id: Option<String>,
+    /// OAuth2 client secret.
+    pub oauth2_client_secret: Option<String>,
+    /// OAuth2 redirect URL registered for this consumer.
+    pub oauth2_redirect_url: Option<String>,
     /// yt-dlp executable used for YouTube/VK/RuTube/Apple Podcasts links.
     pub ytdlp_path: String,
     /// Optional Netscape cookies file passed to yt-dlp.
@@ -153,6 +159,14 @@ impl Config {
             .or_else(|| existing_file(DEFAULT_TOOLFORGE_YTDLP_COOKIES_PATH))
             .or_else(|| existing_file(DEFAULT_PACKAGED_YTDLP_COOKIES_PATH));
         let github_url = lookup("GITHUB_URL").unwrap_or_else(|| DEFAULT_GITHUB_URL.into());
+        let toolforge_tool = lookup("TOOLFORGE_TOOL").filter(|value| !value.trim().is_empty());
+        let oauth2_redirect_url = lookup("OAUTH2_REDIRECT_URL")
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                toolforge_tool
+                    .as_ref()
+                    .map(|tool| format!("https://{tool}.toolforge.org/oauth2/callback"))
+            });
         let user_agent = lookup("COMMONS_USER_AGENT").unwrap_or_else(|| {
             format!(
                 "{project_name}/{} ({github_url})",
@@ -191,6 +205,10 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             oauth_consumer_secret: lookup("OAUTH_CONSUMER_SECRET")
                 .filter(|value| !value.trim().is_empty()),
+            oauth2_client_id: lookup("OAUTH2_CLIENT_ID").filter(|value| !value.trim().is_empty()),
+            oauth2_client_secret: lookup("OAUTH2_CLIENT_SECRET")
+                .filter(|value| !value.trim().is_empty()),
+            oauth2_redirect_url,
             ytdlp_path: lookup("YTDLP_PATH")
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_YTDLP_PATH.into()),
@@ -292,6 +310,9 @@ mod tests {
             config.commons_ignore_exists_normalized_warning,
             DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING
         );
+        assert_eq!(config.oauth2_client_id, None);
+        assert_eq!(config.oauth2_client_secret, None);
+        assert_eq!(config.oauth2_redirect_url, None);
         assert_eq!(config.ytdlp_path, DEFAULT_YTDLP_PATH);
         assert_eq!(config.ffmpeg_path, DEFAULT_FFMPEG_PATH);
         assert_eq!(config.ffprobe_path, DEFAULT_FFPROBE_PATH);
@@ -314,6 +335,9 @@ mod tests {
             ("MAX_ARCHIVE_FILE_MB", "2048"),
             ("ARCHIVE_THUMBNAIL_RESIZE", "false"),
             ("COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING", "false"),
+            ("OAUTH2_CLIENT_ID", "client-id"),
+            ("OAUTH2_CLIENT_SECRET", "client-secret"),
+            ("OAUTH2_REDIRECT_URL", "https://example.org/oauth2/callback"),
             ("YTDLP_PATH", "/opt/bin/yt-dlp"),
             ("YTDLP_COOKIES_PATH", "/cookies/youtube.txt"),
             ("FFMPEG_PATH", "/opt/bin/ffmpeg"),
@@ -342,6 +366,15 @@ mod tests {
             config.ytdlp_cookies_path.as_deref(),
             Some("/cookies/youtube.txt")
         );
+        assert_eq!(config.oauth2_client_id.as_deref(), Some("client-id"));
+        assert_eq!(
+            config.oauth2_client_secret.as_deref(),
+            Some("client-secret")
+        );
+        assert_eq!(
+            config.oauth2_redirect_url.as_deref(),
+            Some("https://example.org/oauth2/callback")
+        );
         assert_eq!(config.ffmpeg_path, "/opt/bin/ffmpeg");
         assert_eq!(config.ffprobe_path, "/opt/bin/ffprobe");
         assert!(config.is_admin(42));
@@ -358,6 +391,20 @@ mod tests {
             3072 * 1024 * 1024
         );
         assert_eq!(config.max_archive_file_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn derives_oauth2_redirect_url_from_toolforge_tool() {
+        let config = config_from_pairs(&[
+            ("OAUTH2_CLIENT_ID", "client-id"),
+            ("OAUTH2_CLIENT_SECRET", "client-secret"),
+            ("TOOLFORGE_TOOL", "bot-telegram-commons-uploader"),
+        ]);
+
+        assert_eq!(
+            config.oauth2_redirect_url.as_deref(),
+            Some("https://bot-telegram-commons-uploader.toolforge.org/oauth2/callback")
+        );
     }
 
     #[test]

@@ -16,5 +16,6 @@ pub mod geo;
 pub mod metadata;
 pub mod models;
 pub mod oauth;
+pub mod oauth2;
 pub mod store;
 pub mod telegram;

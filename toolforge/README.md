@@ -11,12 +11,12 @@ long-polling job (`BOT_MODE=polling`) remains available as a fallback.
 ## TL;DR — first-deploy checklist
 
 **Prerequisites:** a Wikimedia developer (LDAP) account with an **SSH key** uploaded, approved
-**Toolforge membership**, and (optional) an **OAuth 1.0a consumer** — the bot works on a bot
-password without it. Nothing to install locally; the `toolforge` CLI lives on the bastion.
+**Toolforge membership**, and optional OAuth consumers — the bot works on a bot password
+without them. Nothing to install locally; the `toolforge` CLI lives on the bastion.
 
 1. **SSH in:** `ssh vitaly-zdanevich@login.toolforge.org` (§1).
 2. **Create/enter the tool:** make it at [toolsadmin](https://toolsadmin.wikimedia.org/), then `become YOURTOOL`.
-3. **Set secrets** as envvars: `BOT_MODE=webhook`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `CREDENTIAL_ENC_KEY`, `SQLITE_PATH`, optional `OAUTH_CONSUMER_KEY`/`OAUTH_CONSUMER_SECRET` and local Bot API credentials (§2, §5).
+3. **Set secrets** as envvars: `BOT_MODE=webhook`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `CREDENTIAL_ENC_KEY`, `SQLITE_PATH`, optional `OAUTH2_CLIENT_ID`/`OAUTH2_CLIENT_SECRET`, optional `OAUTH_CONSUMER_KEY`/`OAUTH_CONSUMER_SECRET`, and local Bot API credentials (§2, §5).
 4. **Build** from Git: `toolforge build start <repo>` → `toolforge build show` (§3).
 5. **Run:** `cp toolforge/service.template ~/service.template`, then `toolforge webservice buildservice start --mount=all --health-check-path=/healthz` (§4).
 6. **Register webhook:** locally run `TOOLFORGE_TOOL=YOURTOOL ./scripts/set-webhook.sh`.
@@ -47,6 +47,19 @@ toolforge envvars create TELEGRAM_BOT_TOKEN        # from @BotFather
 toolforge envvars create TELEGRAM_WEBHOOK_SECRET   # random secret, also used by set-webhook.sh
 toolforge envvars create CREDENTIAL_ENC_KEY        # openssl rand -base64 32
 toolforge envvars create SQLITE_PATH               # e.g. /data/project/YOURTOOL/bot.sqlite
+# OAuth2 consumer (recommended). Register at Special:OAuthConsumerRegistration:
+#   - choose OAuth2,
+#   - leave "This consumer is for use only by ..." unchecked for the public bot,
+#   - set callback URL to https://YOURTOOL.toolforge.org/oauth2/callback,
+#   - set Applicable project to commonswiki,
+#   - keep "Client is confidential" checked,
+#   - allow "Authorization code" and "Refresh token"; leave "Client credentials" unchecked,
+#   - choose "Request authorization for specific permissions",
+#   - grant BOTH "Upload new files" AND "Create, edit, and move pages";
+#     do not add "Edit existing pages" or "Upload, replace, and move files".
+toolforge envvars create OAUTH2_CLIENT_ID          # client id / consumer key
+toolforge envvars create OAUTH2_CLIENT_SECRET      # client secret
+toolforge envvars create OAUTH2_REDIRECT_URL       # https://YOURTOOL.toolforge.org/oauth2/callback
 # OAuth 1.0a consumer (Special:OAuthConsumerRegistration). When registering, you MUST:
 #   - choose OAuth 1.0a (not 2.0),
 #   - tick "Allow consumer to specify a callback in requests" (enables the 'oob' flow),

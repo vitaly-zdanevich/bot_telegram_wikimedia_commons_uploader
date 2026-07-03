@@ -19,12 +19,13 @@ and [Commons uploads category](https://commons.wikimedia.org/wiki/Category:Uploa
 
 ## How it works (for users)
 
-1. Send `/start`. The bot asks you to create a **scoped Bot Password** at
+1. Send `/start`. Choose **OAuth2** (recommended browser authorization), **OAuth1**
+   (legacy wiki authorization with a pasted verification code), or a **scoped Bot Password**.
+2. OAuth2 opens a browser link and returns to the bot automatically. OAuth1 asks you to paste
+   the verification code. For bot passwords, create one at
    <https://commons.wikimedia.org/wiki/Special:BotPasswords> — tick **Upload new files** and
-   **Create, edit, and move pages** (the second is needed to write each file's description
-   page), never your real password. You get a username like `YourName@telegram` and a password.
-2. Send the bot-password **username**, then the **bot password** (the bot deletes your
-   message immediately and stores it **AES-256-GCM encrypted**).
+   **Create, edit, and move pages** — then send the generated username/password; the password
+   message is deleted and the token is stored **AES-256-GCM encrypted**.
 3. Pick a **license** (default **CC BY 4.0**; also CC BY-SA 4.0, CC0,
    PD-Russia-expired, PD-Russia, or PD-RusEmpire) and an optional **filename prefix**.
 4. Send a photo or file. It is uploaded to Commons with a generated `{{Information}}`
@@ -148,9 +149,9 @@ VPS / Toolforge**, whose IPs are not blocked. Then `terraform apply` to update t
 
 ### Archives (zip / rar) — server build only
 
-On the long-living server build (not Lambda), send a **`.zip`** and the bot uploads the
-images inside it, sharing one caption/categories/license across them. Two `/settings`
-toggles control the flow:
+On the long-living server build (not Lambda), send a **`.zip`** or **`.rar`** and the bot
+uploads the images inside it, sharing one caption/categories/license across them. Two
+`/settings` toggles control the flow:
 
 - **Show file list** (off by default) — reply with the names of the images found.
 - **Confirm before upload** (on by default) — send thumbnails of all previewable images and
@@ -244,6 +245,38 @@ cargo build --release --features sqlite,archive,rar
 
 HEIC support is included by default in these builds.
 
+For OAuth2 on Toolforge, register an OAuth2 consumer at
+[Special:OAuthConsumerRegistration](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration)
+with the callback URL `https://<tool>.toolforge.org/oauth2/callback`. Use these registration
+choices:
+
+- Leave **This consumer is for use only by ...** unchecked for the public bot; that owner-only
+  mode is only for self-testing.
+- Set **Applicable project** to `commonswiki`.
+- Keep **Client is confidential** checked.
+- Under **Allowed OAuth2 grant types**, check **Authorization code** and **Refresh token**;
+  leave **Client credentials** unchecked.
+- Under **Types of grants being requested**, choose **Request authorization for specific
+  permissions**.
+- Under **Applicable grants**, keep **Basic rights** selected, and additionally select only
+  **Create, edit, and move pages** plus **Upload new files**. The page grant is needed to
+  write the `File:` description page and already includes the normal `edit` right, so the
+  separate **Edit existing pages** grant is not needed. Leave **Upload, replace, and move
+  files** unchecked; the bot does not overwrite existing files.
+
+Then set the consumer credentials as Toolforge envvars:
+
+```bash
+toolforge envvars create OAUTH2_CLIENT_ID 'your-client-id'
+toolforge envvars create OAUTH2_CLIENT_SECRET 'your-client-secret'
+toolforge envvars create OAUTH2_REDIRECT_URL 'https://YOURTOOL.toolforge.org/oauth2/callback'
+toolforge webservice restart
+```
+
+`OAUTH2_REDIRECT_URL` can be omitted when `TOOLFORGE_TOOL` is set and the callback is exactly
+`https://<tool>.toolforge.org/oauth2/callback`, but setting it explicitly makes the deployment
+match the registered consumer.
+
 Operate it with `scripts/server-logs.sh` (journald logs) and `scripts/server-status.sh`
 (service state, memory, recent errors, Telegram `getMe`); both take the systemd unit name
 via the `SERVICE` env var (default `commons-uploader-bot`).
@@ -280,16 +313,18 @@ datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
 
 ## Security
 
-- **Two ways to connect** (the bot offers both at `/start`):
-  - **OAuth** (recommended) — authorize on-wiki and paste back a short verification code; no
-    password is shared. Uses MediaWiki OAuth 1.0a out-of-band, so there's **no callback
-    endpoint** to host (works on Lambda and Toolforge alike). Set `OAUTH_CONSUMER_KEY` /
-    `OAUTH_CONSUMER_SECRET` from
+- **Three ways to connect** (the bot offers configured methods at `/start`):
+  - **OAuth2** (recommended) — authorize in the browser; no password is shared. Set
+    `OAUTH2_CLIENT_ID`, `OAUTH2_CLIENT_SECRET`, and `OAUTH2_REDIRECT_URL` from
     [Special:OAuthConsumerRegistration](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration)
-    (Upload grant) to enable it.
+    (Upload grant) to enable it. Toolforge can derive
+    `https://<tool>.toolforge.org/oauth2/callback` from `TOOLFORGE_TOOL`; Lambda needs the
+    Function URL plus `/oauth2/callback`.
+  - **OAuth1** — legacy out-of-band flow: authorize on-wiki and paste back a short
+    verification code. Set `OAUTH_CONSUMER_KEY` / `OAUTH_CONSUMER_SECRET` to enable it.
   - **Bot password** — a **scoped** [Bot Password](https://commons.wikimedia.org/wiki/Special:BotPasswords)
     (grants: “Upload new files” + “Create, edit, and move pages”), revocable any time.
-- Stored credentials (the bot-password token, or the OAuth token+secret) are **AES-256-GCM
+- Stored credentials (the bot-password token, OAuth1 token+secret, or OAuth2 token set) are **AES-256-GCM
   encrypted** before storage and decrypted only in memory per upload; the bot deletes the
   Telegram message containing a bot password.
 - The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.

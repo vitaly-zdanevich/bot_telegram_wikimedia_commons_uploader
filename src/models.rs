@@ -147,6 +147,8 @@ pub enum OnboardingStep {
     AwaitingPassword,
     /// Waiting for the pasted OAuth verifier code (out-of-band flow).
     AwaitingOAuthVerifier,
+    /// Waiting for the OAuth2 browser callback to complete.
+    AwaitingOAuth2Callback,
     /// Waiting for the license selection.
     AwaitingLicense,
     /// Waiting for the filename prefix.
@@ -166,6 +168,7 @@ impl OnboardingStep {
             "awaiting_username" => Some(OnboardingStep::AwaitingUsername),
             "awaiting_password" => Some(OnboardingStep::AwaitingPassword),
             "awaiting_oauth_verifier" => Some(OnboardingStep::AwaitingOAuthVerifier),
+            "awaiting_oauth2_callback" => Some(OnboardingStep::AwaitingOAuth2Callback),
             "awaiting_license" => Some(OnboardingStep::AwaitingLicense),
             "awaiting_prefix" => Some(OnboardingStep::AwaitingPrefix),
             "awaiting_settings_prefix" => Some(OnboardingStep::AwaitingSettingsPrefix),
@@ -181,6 +184,7 @@ impl OnboardingStep {
             OnboardingStep::AwaitingUsername => "awaiting_username",
             OnboardingStep::AwaitingPassword => "awaiting_password",
             OnboardingStep::AwaitingOAuthVerifier => "awaiting_oauth_verifier",
+            OnboardingStep::AwaitingOAuth2Callback => "awaiting_oauth2_callback",
             OnboardingStep::AwaitingLicense => "awaiting_license",
             OnboardingStep::AwaitingPrefix => "awaiting_prefix",
             OnboardingStep::AwaitingSettingsPrefix => "awaiting_settings_prefix",
@@ -197,10 +201,12 @@ pub struct Profile {
     pub commons_username: Option<String>,
     /// AES-GCM ciphertext (base64) of the bot-password token.
     pub credential_ciphertext: Option<String>,
-    /// AES-GCM ciphertext of the OAuth access token+secret (`token\nsecret`), when OAuth is used.
+    /// AES-GCM ciphertext of the OAuth 1.0a access token+secret (`token\nsecret`).
     pub oauth_ciphertext: Option<String>,
     /// AES-GCM ciphertext of the transient OAuth request token+secret during onboarding.
     pub oauth_pending_ciphertext: Option<String>,
+    /// AES-GCM ciphertext of OAuth2 access/refresh tokens as JSON.
+    pub oauth2_ciphertext: Option<String>,
     /// License applied to uploads.
     pub license: License,
     /// Prefix prepended to generated Commons filenames.
@@ -246,6 +252,7 @@ impl Default for Profile {
             credential_ciphertext: None,
             oauth_ciphertext: None,
             oauth_pending_ciphertext: None,
+            oauth2_ciphertext: None,
             license: License::default(),
             filename_prefix: String::new(),
             onboarding_step: OnboardingStep::default(),
@@ -273,7 +280,8 @@ impl Profile {
     /// (an OAuth token, or a bot-password token with its username).
     pub fn is_ready(&self) -> bool {
         self.onboarding_step == OnboardingStep::Done
-            && (self.oauth_ciphertext.is_some()
+            && (self.oauth2_ciphertext.is_some()
+                || self.oauth_ciphertext.is_some()
                 || (self.commons_username.is_some() && self.credential_ciphertext.is_some()))
     }
 }
@@ -485,6 +493,7 @@ mod tests {
             OnboardingStep::AwaitingUsername,
             OnboardingStep::AwaitingPassword,
             OnboardingStep::AwaitingOAuthVerifier,
+            OnboardingStep::AwaitingOAuth2Callback,
             OnboardingStep::AwaitingLicense,
             OnboardingStep::AwaitingPrefix,
             OnboardingStep::AwaitingSettingsPrefix,

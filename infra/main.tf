@@ -31,6 +31,9 @@ locals {
     COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING = tostring(var.commons_ignore_exists_normalized_warning)
     OAUTH_CONSUMER_KEY                       = var.oauth_consumer_key
     OAUTH_CONSUMER_SECRET                    = var.oauth_consumer_secret
+    OAUTH2_CLIENT_ID                         = var.oauth2_client_id
+    OAUTH2_CLIENT_SECRET                     = var.oauth2_client_secret
+    OAUTH2_REDIRECT_URL                      = var.oauth2_redirect_url
     RUST_LOG                                 = "info"
   }
 }

@@ -6,7 +6,11 @@ credential_enc_key      = "replace-with-base64-32-bytes"
 admin_telegram_user_ids = "123456789"
 # Optional: set true to resize archive preview images to small JPEG thumbnails.
 # archive_thumbnail_resize = false
-# Optional: let users connect via OAuth (Special:OAuthConsumerRegistration, Upload grant)
-# instead of a bot password. Leave unset to offer bot password only.
+# Optional: let users connect via OAuth2 (recommended browser callback).
+# Register the callback as <Lambda function URL>/oauth2/callback.
+# oauth2_client_id     = ""
+# oauth2_client_secret = ""
+# oauth2_redirect_url  = ""
+# Optional: legacy OAuth1 fallback (Special:OAuthConsumerRegistration, Upload grant).
 # oauth_consumer_key    = ""
 # oauth_consumer_secret = ""

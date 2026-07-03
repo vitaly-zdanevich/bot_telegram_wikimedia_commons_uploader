@@ -48,11 +48,16 @@ pub enum UploadAuth {
         password: String,
     },
     /// OAuth 1.0a access token + secret, signed per request.
-    OAuth {
+    OAuth1 {
         /// OAuth access token.
         token: String,
         /// OAuth access token secret.
         secret: String,
+    },
+    /// OAuth2 bearer access token.
+    OAuth2 {
+        /// Bearer access token.
+        access_token: String,
     },
 }
 
@@ -151,7 +156,10 @@ impl CommonsClient {
             UploadAuth::BotPassword { username, password } => {
                 self.upload_bot_password(request, username, password).await
             }
-            UploadAuth::OAuth { token, secret } => self.upload_oauth(request, token, secret).await,
+            UploadAuth::OAuth1 { token, secret } => {
+                self.upload_oauth1(request, token, secret).await
+            }
+            UploadAuth::OAuth2 { access_token } => self.upload_oauth2(request, access_token).await,
         }
     }
 
@@ -231,7 +239,7 @@ impl CommonsClient {
     }
 
     /// Uploads using an OAuth 1.0a access token, signing each request.
-    async fn upload_oauth(
+    async fn upload_oauth1(
         &self,
         request: &UploadRequest,
         token: &str,
@@ -275,6 +283,47 @@ impl CommonsClient {
             let retry_auth = oauth.api_authorization("POST", &self.api_url, token, secret, &[]);
             let response = self
                 .post_upload_form(&client, request, &csrf_token, Some(&retry_auth), true)
+                .await?;
+            return Ok(interpret_upload_response(&response, &request.filename));
+        }
+        Ok(interpret_upload_response(&response, &request.filename))
+    }
+
+    /// Uploads using an OAuth2 bearer access token.
+    async fn upload_oauth2(
+        &self,
+        request: &UploadRequest,
+        access_token: &str,
+    ) -> Result<UploadOutcome> {
+        let client = self.session_client()?;
+        let authorization = format!("Bearer {access_token}");
+        let csrf_url = format!(
+            "{}?action=query&meta=tokens&type=csrf&format=json",
+            self.api_url
+        );
+        let csrf_response: Value = client
+            .get(&csrf_url)
+            .header("Authorization", &authorization)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons token response was not valid JSON")?;
+        let csrf_token = csrf_response
+            .get("query")
+            .and_then(|query| query.get("tokens"))
+            .and_then(|tokens| tokens.get("csrftoken"))
+            .and_then(Value::as_str)
+            .context("Commons response is missing csrftoken")?
+            .to_string();
+
+        let response = self
+            .post_upload_form(&client, request, &csrf_token, Some(&authorization), false)
+            .await?;
+        if self.should_retry_exists_normalized_warning(&response, &request.filename) {
+            let response = self
+                .post_upload_form(&client, request, &csrf_token, Some(&authorization), true)
                 .await?;
             return Ok(interpret_upload_response(&response, &request.filename));
         }

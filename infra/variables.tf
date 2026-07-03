@@ -54,7 +54,7 @@ variable "commons_proxy" {
 
 variable "oauth_consumer_key" {
   type        = string
-  description = "Optional OAuth 1.0a consumer key (Special:OAuthConsumerRegistration) so users can connect via OAuth instead of a bot password."
+  description = "Optional OAuth 1.0a consumer key (Special:OAuthConsumerRegistration) so users can connect through the legacy verifier-code flow."
   default     = ""
 }
 
@@ -63,6 +63,25 @@ variable "oauth_consumer_secret" {
   description = "OAuth 1.0a consumer secret paired with oauth_consumer_key."
   default     = ""
   sensitive   = true
+}
+
+variable "oauth2_client_id" {
+  type        = string
+  description = "Optional OAuth2 client id / consumer key (Special:OAuthConsumerRegistration) so users can connect through a browser callback."
+  default     = ""
+}
+
+variable "oauth2_client_secret" {
+  type        = string
+  description = "OAuth2 client secret paired with oauth2_client_id."
+  default     = ""
+  sensitive   = true
+}
+
+variable "oauth2_redirect_url" {
+  type        = string
+  description = "OAuth2 redirect URL registered for this consumer. For Lambda, use the function URL plus /oauth2/callback."
+  default     = ""
 }
 
 variable "default_license" {

@@ -10,6 +10,7 @@ use crate::models::{
     CallbackQuery, DngMode, License, Message, OnboardingStep, Profile, Update, UploadProvenance,
 };
 use crate::oauth::{Consumer, OAuthClient, OAuthEndpoints};
+use crate::oauth2::{OAuth2Client, OAuth2Consumer, OAuth2Endpoints, OAuth2Token};
 use crate::store::Store;
 use crate::telegram::{
     InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, TelegramFile, escape_html,
@@ -44,6 +45,8 @@ const BOT_USERNAME: &str = "@wikimedia_commons_uploader_bot";
 /// Author's Telegram bot for browsing/reading Commons media.
 const RELATED_BROWSE_BOT: &str =
     "https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons";
+/// Author's Telegram bot that helps understand where a photo was taken.
+const RELATED_PHOTO_LOCATION_BOT: &str = "https://t.me/photos_and_location_to_links_bot";
 /// Author's gThumb extension for Commons.
 const RELATED_GTHUMB: &str =
     "https://gitlab.com/vitaly_zdanevich_wikimedia/gthumb-wikimedia-commons-extension";
@@ -64,6 +67,8 @@ const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 const UPDATE_IN_PROGRESS_SECONDS: i64 = 10 * 60;
 /// Error marker used to make duplicate in-flight webhooks retryable by Telegram.
 const UPDATE_ALREADY_IN_PROGRESS_ERROR: &str = "telegram update is already being processed";
+/// Maximum age of an OAuth2 callback state token.
+const OAUTH2_STATE_TTL_SECONDS: i64 = 30 * 60;
 /// Message shown once onboarding is complete.
 const ONBOARDING_DONE_MSG: &str = "✅ All set! Send me a photo or file and I'll upload it to Wikimedia Commons. Tip: a caption becomes the file's <b>description</b> and its <b>filename prefix</b>; add a line like <code>Categories: Minsk, Belarus</code> to set categories.";
 /// Bytes needed to identify HEIC/BMP/archive magic without loading the full file.
@@ -584,6 +589,18 @@ fn should_send_original_archive_preview(resize: bool, bytes_len: usize) -> bool 
 
 /// Handles one AWS Lambda HTTP request from the Telegram webhook.
 pub async fn handle_lambda_request(request: LambdaRequest) -> Result<LambdaResponse<Body>> {
+    if request.method() == Method::GET && request.uri().path() == "/oauth2/callback" {
+        return match handle_oauth2_callback_query(request.uri().query()).await {
+            Ok(text) => lambda_text_response(StatusCode::OK, &text),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "OAuth2 callback failed");
+                lambda_text_response(
+                    StatusCode::BAD_REQUEST,
+                    "OAuth2 authorization failed. Return to Telegram and run /start.",
+                )
+            }
+        };
+    }
     handle_webhook_payload(request.headers(), request.body().as_ref()).await?;
     ok_response()
 }
@@ -620,6 +637,18 @@ async fn handle_http_request(
 ) -> std::result::Result<HyperResponse<Full<Bytes>>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/healthz") => text_response(StatusCode::OK, "ok"),
+        (&Method::GET, "/oauth2/callback") => {
+            match handle_oauth2_callback_query(request.uri().query()).await {
+                Ok(text) => text_response(StatusCode::OK, &text),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "OAuth2 callback failed");
+                    text_response(
+                        StatusCode::BAD_REQUEST,
+                        "OAuth2 authorization failed. Return to Telegram and run /start.",
+                    )
+                }
+            }
+        }
         (&Method::POST, "/") | (&Method::POST, "/telegram") => {
             let headers = request.headers().clone();
             match request.into_body().collect().await {
@@ -650,6 +679,13 @@ fn text_response(status: StatusCode, text: &str) -> HyperResponse<Full<Bytes>> {
         .header("content-type", "text/plain; charset=utf-8")
         .body(Full::new(Bytes::copy_from_slice(text.as_bytes())))
         .expect("valid HTTP response")
+}
+
+/// Builds a plain-text AWS Lambda Function URL response.
+fn lambda_text_response(status: StatusCode, text: &str) -> Result<LambdaResponse<Body>> {
+    Ok(LambdaResponse::builder()
+        .status(status.as_u16())
+        .body(Body::Text(text.to_string()))?)
 }
 
 fn status_for_webhook_error(error: &anyhow::Error) -> StatusCode {
@@ -731,6 +767,13 @@ async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> 
     Ok(())
 }
 
+/// Completes an OAuth2 browser callback using the runtime bot configuration.
+async fn handle_oauth2_callback_query(query: Option<&str>) -> Result<String> {
+    let config = Config::from_env();
+    let bot = Bot::from_config(config);
+    bot.finish_oauth2_callback(query.unwrap_or_default()).await
+}
+
 /// Runs the bot as a long-living server using Telegram long polling.
 ///
 /// Used for non-Lambda deployments (e.g. Toolforge / Cloud VPS). Paired with a self-hosted
@@ -789,6 +832,7 @@ struct Bot {
     commons: CommonsClient,
     cipher: Option<Cipher>,
     oauth: Option<OAuthClient>,
+    oauth2: Option<OAuth2Client>,
 }
 
 /// A file attachment extracted from a Telegram message.
@@ -1011,6 +1055,7 @@ impl Bot {
         );
         let store = Store::new(&config);
         let oauth = build_oauth_client(&config);
+        let oauth2 = build_oauth2_client(&config);
         let commons = CommonsClient::new(
             config.commons_api_url.clone(),
             config.user_agent.clone(),
@@ -1029,6 +1074,7 @@ impl Bot {
             commons,
             cipher,
             oauth,
+            oauth2,
         }
     }
 
@@ -1144,14 +1190,30 @@ impl Bot {
     async fn prompt_step(&self, chat_id: i64, step: OnboardingStep) -> Result<()> {
         match step {
             OnboardingStep::AwaitingUsername => {
-                if self.oauth.is_some() {
-                    let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nChoose how to connect your account:\n• <b>OAuth</b> (recommended) — authorize on the wiki and paste back a short code; you never share a password.\n• <b>Bot password</b> — create a scoped token yourself.";
+                if self.oauth2.is_some() || self.oauth.is_some() {
+                    let text = "👋 I upload your photos and files to <b>Wikimedia Commons</b> under <b>your</b> account.\n\nChoose how to connect your account:\n• <b>OAuth2</b> (recommended) — authorize in the browser; you never share a password.\n• <b>OAuth1</b> — legacy wiki authorization with a pasted verification code.\n• <b>Bot password</b> — create a scoped token yourself.";
                     self.telegram
-                        .send_message(chat_id, text, Some(connect_method_keyboard()))
+                        .send_message(
+                            chat_id,
+                            text,
+                            Some(connect_method_keyboard(
+                                self.oauth2.is_some(),
+                                self.oauth.is_some(),
+                            )),
+                        )
                         .await
                 } else {
                     self.send_botpassword_prompt(chat_id).await
                 }
+            }
+            OnboardingStep::AwaitingOAuth2Callback => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        "Finish authorization in your browser. If the link expired, run /start and choose OAuth2 again.",
+                        None,
+                    )
+                    .await
             }
             OnboardingStep::AwaitingOAuthVerifier => {
                 self.telegram
@@ -1225,6 +1287,73 @@ impl Bot {
         self.telegram.send_message(chat_id, text, None).await
     }
 
+    /// Starts OAuth2 authorization: sends a browser authorization link to the user.
+    async fn start_oauth2(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        let Some(oauth2) = &self.oauth2 else {
+            return self.start_oauth(chat_id, user_id).await;
+        };
+        let Some(cipher) = &self.cipher else {
+            return self
+                .telegram
+                .send_message(chat_id, "⚠️ The bot is missing its encryption key.", None)
+                .await;
+        };
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        let state = encode_oauth2_state(cipher, chat_id, user_id)?;
+        let authorize_url = oauth2.authorize_url(&state)?;
+        let mut profile = self.store.get_profile(user_id).await;
+        profile.onboarding_step = OnboardingStep::AwaitingOAuth2Callback;
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await?;
+
+        let text = format!(
+            "🔐 Open this link and authorize the app. I will message you here when Wikimedia redirects back to the bot:\n\n{}",
+            escape_html(&authorize_url)
+        );
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Completes OAuth2 after Wikimedia redirects the browser back to the bot.
+    async fn finish_oauth2_callback(&self, query: &str) -> Result<String> {
+        let Some(oauth2) = &self.oauth2 else {
+            anyhow::bail!("OAuth2 is not configured");
+        };
+        let Some(cipher) = &self.cipher else {
+            anyhow::bail!("the bot is missing its encryption key");
+        };
+        if let Some(error) = query_param(query, "error") {
+            anyhow::bail!("OAuth2 authorization failed: {error}");
+        }
+        let code = query_param(query, "code").context("OAuth2 callback is missing code")?;
+        let state = query_param(query, "state").context("OAuth2 callback is missing state")?;
+        let state = decode_oauth2_state(cipher, &state)?;
+
+        let token = oauth2.exchange_code(&code).await?;
+        let username = oauth2
+            .username(&token.access_token)
+            .await
+            .context("failed to identify OAuth2 user")?;
+        let mut profile = self.store.get_profile(state.user_id).await;
+        profile.oauth2_ciphertext = Some(cipher.encrypt(&serde_json::to_string(&token)?)?);
+        profile.oauth_ciphertext = None;
+        profile.oauth_pending_ciphertext = None;
+        profile.credential_ciphertext = None;
+        profile.commons_username = Some(username);
+        profile.onboarding_step = OnboardingStep::AwaitingLicense;
+        touch(&mut profile);
+        self.store.put_profile(state.user_id, &profile).await?;
+
+        self.telegram
+            .send_message(
+                state.chat_id,
+                "✅ Connected with OAuth2. Choose a license for your uploads:",
+                Some(license_keyboard()),
+            )
+            .await
+            .ok();
+        Ok("OAuth2 connected. Return to Telegram to finish setup.".to_string())
+    }
+
     /// Starts the OAuth out-of-band flow: gets a request token and sends the authorize link.
     async fn start_oauth(&self, chat_id: i64, user_id: i64) -> Result<()> {
         let Some(oauth) = &self.oauth else {
@@ -1241,7 +1370,7 @@ impl Bot {
             Ok(tokens) => tokens,
             Err(error) => {
                 let text = format!(
-                    "❌ Couldn't start OAuth: {}\n\nYou can use a bot password instead — /start.",
+                    "❌ Couldn't start OAuth1: {}\n\nYou can use OAuth2 or a bot password instead — /start.",
                     escape_html(&format!("{error}"))
                 );
                 return self.telegram.send_message(chat_id, &text, None).await;
@@ -1255,7 +1384,7 @@ impl Bot {
         self.store.put_profile(user_id, &profile).await?;
 
         let text = format!(
-            "🔐 Open this link, authorize the app, then paste the <b>verification code</b> it shows back here:\n\n{}",
+            "🔐 Open this OAuth1 link, authorize the app, then paste the <b>verification code</b> it shows back here:\n\n{}",
             oauth.authorize_url(&request_token)
         );
         self.telegram.send_message(chat_id, &text, None).await
@@ -1266,7 +1395,7 @@ impl Bot {
         let (Some(oauth), Some(cipher)) = (&self.oauth, &self.cipher) else {
             return self
                 .telegram
-                .send_message(chat_id, "⚠️ OAuth is not available right now.", None)
+                .send_message(chat_id, "⚠️ OAuth1 is not available right now.", None)
                 .await;
         };
         let mut profile = self.store.get_profile(user_id).await;
@@ -1297,7 +1426,7 @@ impl Bot {
             Ok(tokens) => tokens,
             Err(error) => {
                 let text = format!(
-                    "❌ That code didn't work: {}\n\nOpen the link again and paste the new code, or use a bot password with /start.",
+                    "❌ That code didn't work: {}\n\nOpen the OAuth1 link again and paste the new code, or use OAuth2/bot password with /start.",
                     escape_html(&format!("{error}"))
                 );
                 return self.telegram.send_message(chat_id, &text, None).await;
@@ -1311,7 +1440,9 @@ impl Bot {
 
         profile.oauth_ciphertext =
             Some(cipher.encrypt(&format!("{access_token}\n{access_secret}"))?);
+        profile.oauth2_ciphertext = None;
         profile.oauth_pending_ciphertext = None;
+        profile.credential_ciphertext = None;
         if !username.is_empty() {
             profile.commons_username = Some(username);
         }
@@ -1364,6 +1495,9 @@ impl Bot {
                 match self.commons.validate_credentials(&username, text).await {
                     Ok(()) => {
                         profile.credential_ciphertext = Some(cipher.encrypt(text)?);
+                        profile.oauth2_ciphertext = None;
+                        profile.oauth_ciphertext = None;
+                        profile.oauth_pending_ciphertext = None;
                         profile.onboarding_step = OnboardingStep::AwaitingLicense;
                         touch(&mut profile);
                         self.store.put_profile(user_id, &profile).await?;
@@ -1380,6 +1514,10 @@ impl Bot {
                             .await
                     }
                 }
+            }
+            OnboardingStep::AwaitingOAuth2Callback => {
+                self.prompt_step(chat_id, OnboardingStep::AwaitingOAuth2Callback)
+                    .await
             }
             OnboardingStep::AwaitingOAuthVerifier => {
                 if text.is_empty() {
@@ -1652,7 +1790,11 @@ impl Bot {
                 .await;
         }
 
-        if data == "onb:oauth" {
+        if data == "onb:oauth2" {
+            return self.start_oauth2(chat_id, user_id).await;
+        }
+
+        if data == "onb:oauth" || data == "onb:oauth1" {
             return self.start_oauth(chat_id, user_id).await;
         }
 
@@ -2030,19 +2172,20 @@ impl Bot {
         let video_audio_conversion_limit =
             format_size_limit(self.config.max_video_audio_conversion_file_bytes);
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
+        let commons_link_limit = format_size_limit(COMMONS_MAX_FILE_BYTES);
         let commands = if self.config.is_admin(user_id) {
             "/start, /settings, /forget, /help, /admin"
         } else {
             "/start, /settings, /forget, /help"
         };
         let mut text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth</b> (recommended) or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n<b>Max size</b>: {max_upload_size} for accepted files; image conversions are limited to {image_conversion_limit}; video/audio conversions are limited to {video_audio_conversion_limit}; archives are limited to {archive_limit}.\n\n<b>Commands</b>: {commands}\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth2</b> (recommended), <b>OAuth1</b>, or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n\n<b>Limits</b>:\n• Telegram-uploaded files: {max_upload_size}\n• Direct links to Commons-supported files: {commons_link_limit}\n• Image conversions: {image_conversion_limit}\n• Video/audio conversions: {video_audio_conversion_limit}\n• Archives: {archive_limit}\n\n<b>Commands</b>: {commands}\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• Understand where a photo was taken: {RELATED_PHOTO_LOCATION_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
         {
             text.push_str(
-                "\n\n📦 <b>Archives</b>: send a <b>.zip</b> (or .rar) and I upload the images inside under one caption/categories. In /settings you can show the archive's file list and require a thumbnail + <b>Confirm</b> step before uploading.",
+                "\n\n📦 <b>Archives</b>: send a <b>.zip</b> or <b>.rar</b> and I upload the images inside under one caption/categories. In /settings you can show the archive's file list and require a thumbnail + <b>Confirm</b> step before uploading.",
             );
         }
         text.push_str(&uploads_line);
@@ -2062,12 +2205,54 @@ impl Bot {
 
     /// Resolves how to authenticate uploads for a profile, plus the author username.
     ///
-    /// Prefers a stored OAuth token; falls back to the bot-password credentials.
-    fn resolve_auth(&self, profile: &Profile) -> Result<(UploadAuth, String)> {
+    /// Prefers OAuth2, then OAuth1, then bot-password credentials.
+    async fn resolve_auth(
+        &self,
+        user_id: i64,
+        profile: &mut Profile,
+    ) -> Result<(UploadAuth, String)> {
         let cipher = self
             .cipher
             .as_ref()
             .context("the bot is missing its encryption key; cannot read your credentials")?;
+        if let Some(ciphertext) = &profile.oauth2_ciphertext {
+            let oauth2 = self
+                .oauth2
+                .as_ref()
+                .context("OAuth2 is not configured on this bot")?;
+            let decoded = cipher
+                .decrypt(ciphertext)
+                .context("failed to decrypt stored OAuth2 token")?;
+            let mut token: OAuth2Token =
+                serde_json::from_str(&decoded).context("stored OAuth2 token is malformed")?;
+            if token.expires_at <= now_ts().saturating_add(60) {
+                token = oauth2
+                    .refresh(&token.refresh_token)
+                    .await
+                    .context("failed to refresh OAuth2 token")?;
+                profile.oauth2_ciphertext = Some(cipher.encrypt(&serde_json::to_string(&token)?)?);
+                touch(profile);
+                self.store.put_profile(user_id, profile).await?;
+            }
+            if profile
+                .commons_username
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                && let Ok(username) = oauth2.username(&token.access_token).await
+            {
+                profile.commons_username = Some(username);
+                touch(profile);
+                self.store.put_profile(user_id, profile).await?;
+            }
+            let author = profile.commons_username.clone().unwrap_or_default();
+            return Ok((
+                UploadAuth::OAuth2 {
+                    access_token: token.access_token,
+                },
+                author,
+            ));
+        }
         if let Some(ciphertext) = &profile.oauth_ciphertext {
             let decoded = cipher
                 .decrypt(ciphertext)
@@ -2077,7 +2262,7 @@ impl Bot {
                 .context("stored OAuth token is malformed")?;
             let author = profile.commons_username.clone().unwrap_or_default();
             return Ok((
-                UploadAuth::OAuth {
+                UploadAuth::OAuth1 {
                     token: token.to_string(),
                     secret: secret.to_string(),
                 },
@@ -2558,7 +2743,7 @@ impl Bot {
                 .await;
         }
 
-        let (auth, author_username) = match self.resolve_auth(&profile) {
+        let (auth, author_username) = match self.resolve_auth(user_id, &mut profile).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 return self
@@ -2726,7 +2911,7 @@ impl Bot {
                 .await;
         }
 
-        let (auth, author_username) = match self.resolve_auth(&profile) {
+        let (auth, author_username) = match self.resolve_auth(user_id, &mut profile).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 return self
@@ -4063,7 +4248,7 @@ impl Bot {
         entries: Vec<crate::archive::ArchiveEntry>,
     ) -> Result<()> {
         let entry_count = entries.len();
-        let (auth, author_username) = match self.resolve_auth(profile) {
+        let (auth, author_username) = match self.resolve_auth(user_id, profile).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 return self
@@ -4084,7 +4269,7 @@ impl Bot {
                     }
                 }
             }
-            UploadAuth::OAuth { .. } => None,
+            UploadAuth::OAuth1 { .. } | UploadAuth::OAuth2 { .. } => None,
         };
 
         send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
@@ -5014,21 +5199,30 @@ fn settings_license_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
     }
 }
 
-/// Builds the keyboard offering OAuth or bot-password onboarding.
-fn connect_method_keyboard() -> InlineKeyboardMarkup {
+/// Builds the keyboard offering configured OAuth methods and bot-password onboarding.
+fn connect_method_keyboard(oauth2_enabled: bool, oauth1_enabled: bool) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    if oauth2_enabled {
+        rows.push(vec![InlineKeyboardButton {
+            text: "🔐 Connect with OAuth2 (recommended)".to_string(),
+            callback_data: Some("onb:oauth2".to_string()),
+            url: None,
+        }]);
+    }
+    if oauth1_enabled {
+        rows.push(vec![InlineKeyboardButton {
+            text: "🔐 Connect with OAuth1".to_string(),
+            callback_data: Some("onb:oauth1".to_string()),
+            url: None,
+        }]);
+    }
+    rows.push(vec![InlineKeyboardButton {
+        text: "🔑 Use a bot password".to_string(),
+        callback_data: Some("onb:botpass".to_string()),
+        url: None,
+    }]);
     InlineKeyboardMarkup {
-        inline_keyboard: vec![
-            vec![InlineKeyboardButton {
-                text: "🔐 Connect with OAuth (recommended)".to_string(),
-                callback_data: Some("onb:oauth".to_string()),
-                url: None,
-            }],
-            vec![InlineKeyboardButton {
-                text: "🔑 Use a bot password".to_string(),
-                callback_data: Some("onb:botpass".to_string()),
-                url: None,
-            }],
-        ],
+        inline_keyboard: rows,
     }
 }
 
@@ -5241,6 +5435,23 @@ fn build_oauth_client(config: &Config) -> Option<OAuthClient> {
     .ok()
 }
 
+/// Builds the OAuth2 client when a consumer is configured.
+fn build_oauth2_client(config: &Config) -> Option<OAuth2Client> {
+    let client_id = config.oauth2_client_id.clone()?;
+    let client_secret = config.oauth2_client_secret.clone()?;
+    let redirect_url = config.oauth2_redirect_url.clone()?;
+    OAuth2Client::new(
+        OAuth2Consumer {
+            client_id,
+            client_secret,
+            redirect_url,
+        },
+        OAuth2Endpoints::wikimedia(),
+        &config.user_agent,
+    )
+    .ok()
+}
+
 /// Updates the profile timestamps before a save.
 fn touch(profile: &mut Profile) {
     let now = now_ts();
@@ -5336,6 +5547,44 @@ fn text_context_is_older_than_message_window(context: &TextContext, message: &Me
         }
         _ => false,
     }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct OAuth2State {
+    chat_id: i64,
+    user_id: i64,
+    created_at: i64,
+    nonce: String,
+}
+
+/// Encrypts browser callback context into the OAuth2 `state` parameter.
+fn encode_oauth2_state(cipher: &Cipher, chat_id: i64, user_id: i64) -> Result<String> {
+    let state = OAuth2State {
+        chat_id,
+        user_id,
+        created_at: now_ts(),
+        nonce: format!("{:032x}", rand::random::<u128>()),
+    };
+    cipher.encrypt(&serde_json::to_string(&state)?)
+}
+
+/// Decrypts and validates OAuth2 callback context.
+fn decode_oauth2_state(cipher: &Cipher, state: &str) -> Result<OAuth2State> {
+    let decoded = cipher.decrypt(state).context("invalid OAuth2 state")?;
+    let state: OAuth2State = serde_json::from_str(&decoded).context("invalid OAuth2 state JSON")?;
+    let age = now_ts().saturating_sub(state.created_at);
+    anyhow::ensure!(
+        (0..=OAUTH2_STATE_TTL_SECONDS).contains(&age),
+        "OAuth2 state expired"
+    );
+    Ok(state)
+}
+
+/// Returns one query parameter from a URL query string.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
 }
 
 /// Returns the system load averages as `1m / 5m / 15m` text.
@@ -6662,6 +6911,19 @@ mod tests {
         assert_eq!(super::format_duration(60), "1m");
         assert_eq!(super::format_duration(3_900), "1h 5m");
         assert_eq!(super::parse_uptime("bad"), None);
+    }
+
+    #[test]
+    fn parses_oauth2_callback_query_params() {
+        assert_eq!(
+            super::query_param("code=a%2Bb&state=hello+world", "code").as_deref(),
+            Some("a+b")
+        );
+        assert_eq!(
+            super::query_param("code=a%2Bb&state=hello+world", "state").as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(super::query_param("code=a", "missing"), None);
     }
 
     #[test]
