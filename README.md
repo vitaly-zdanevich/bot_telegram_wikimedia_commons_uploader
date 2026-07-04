@@ -14,7 +14,7 @@ that uploads images and media you send straight to **Wikimedia Commons, under yo
 account**. Written in Rust, it runs on AWS Lambda (arm64) behind a Telegram webhook,
 with DynamoDB for per-user settings. Designed to stay within the AWS free tier.
 
-Metadata and tracking links: [Commons project page](https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader),
+Metadata and tracking links: [similar Commons Telegram uploader exists](https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader),
 [Wikidata item Q140382791](https://www.wikidata.org/wiki/Q140382791), and
 [Commons uploads category](https://commons.wikimedia.org/wiki/Category:Uploaded_with_Telegram_bot_@wikimedia_commons_uploader_bot_by_Vitaly_Zdanevich).
 
