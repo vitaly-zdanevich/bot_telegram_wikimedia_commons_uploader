@@ -18,6 +18,7 @@ Metadata and tracking links:
 
 - Wikidata item for this bot: [Q140382791](https://www.wikidata.org/wiki/Q140382791)
 - Commons category tracking uploads by this bot: [Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich](https://commons.wikimedia.org/wiki/Category:Uploaded_with_Telegram_bot_@wikimedia_commons_uploader_bot_by_Vitaly_Zdanevich)
+
 - Similar Commons Telegram uploader exists: [Commons:Telegram Commons Uploader](https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader)
 
 ## How it works (for users)
