@@ -2,7 +2,7 @@ use crate::models::{License, UploadProvenance};
 use crate::oauth::OAuthClient;
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, multipart};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// Attribution category added to every file uploaded by this bot.
@@ -10,6 +10,24 @@ const BOT_CATEGORY: &str =
     "Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich";
 /// Maximum filename stem length in bytes, leaving room for `File:` and the extension.
 const MAX_FILENAME_STEM_BYTES: usize = 200;
+/// Wikidata Action API endpoint used for exact camera-model lookup.
+const WIKIDATA_API_URL: &str = "https://www.wikidata.org/w/api.php";
+/// SDC `source of file` value: original creation by uploader.
+const Q_ORIGINAL_CREATION_BY_UPLOADER: &str = "Q66458942";
+/// SDC `copyright license` value: Creative Commons Attribution 4.0 International.
+const Q_CC_BY_4_0: &str = "Q20007257";
+/// SDC `copyright license` value: Creative Commons Attribution-ShareAlike 4.0 International.
+const Q_CC_BY_SA_4_0: &str = "Q18199165";
+/// SDC `copyright license` value: Creative Commons CC0.
+const Q_CC0: &str = "Q6938433";
+/// SDC `copyright status` value: copyrighted.
+const Q_COPYRIGHTED: &str = "Q50423863";
+/// SDC `copyright status` value: public domain.
+const Q_PUBLIC_DOMAIN: &str = "Q19652";
+/// Wikibase globe URI for Earth coordinates.
+const EARTH_GLOBE: &str = "http://www.wikidata.org/entity/Q2";
+/// Edit summary used for best-effort MediaInfo updates.
+const SDC_EDIT_SUMMARY: &str = "Add upload structured data";
 
 /// Client for the Wikimedia Commons Action API.
 ///
@@ -78,6 +96,29 @@ pub struct UploadRequest {
     pub wikitext: String,
     /// Upload comment / edit summary.
     pub comment: String,
+    /// Structured Data on Commons statements to add after a successful upload.
+    pub structured_data: Option<StructuredDataRequest>,
+}
+
+/// Structured Data on Commons statements derived from the upload metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructuredDataRequest {
+    /// Whether the upload source is the uploader's own work.
+    pub source_is_own_work: bool,
+    /// Commons username of the uploading account.
+    pub author_username: String,
+    /// Optional author override from a caption/default; skips uploader-as-creator SDC.
+    pub author_override: Option<String>,
+    /// Chosen built-in license.
+    pub license: License,
+    /// Optional custom license template/key overriding `license`.
+    pub license_override: Option<String>,
+    /// Optional GPS latitude in decimal degrees.
+    pub latitude: Option<f64>,
+    /// Optional GPS longitude in decimal degrees.
+    pub longitude: Option<f64>,
+    /// Optional EXIF camera model string.
+    pub camera_model: Option<String>,
 }
 
 /// File content for a Commons upload.
@@ -86,6 +127,21 @@ pub enum UploadData {
     Bytes(Vec<u8>),
     /// Large local file streamed from disk.
     File { path: PathBuf, len: u64 },
+}
+
+/// Authentication header strategy for regular form-encoded Action API edits.
+#[derive(Clone, Copy)]
+enum ApiAuthorization<'a> {
+    /// Cookie-authenticated bot-password session.
+    None,
+    /// Prebuilt bearer-style header (OAuth2).
+    Header(&'a str),
+    /// OAuth1 must sign form body parameters for non-multipart requests.
+    OAuth1 {
+        oauth: &'a OAuthClient,
+        token: &'a str,
+        secret: &'a str,
+    },
 }
 
 impl UploadData {
@@ -233,9 +289,27 @@ impl CommonsClient {
             let response = self
                 .post_upload_form(client, request, &csrf_token, None, true)
                 .await?;
-            return Ok(interpret_upload_response(&response, &request.filename));
+            let outcome = interpret_upload_response(&response, &request.filename);
+            self.add_structured_data_best_effort(
+                client,
+                request,
+                &csrf_token,
+                ApiAuthorization::None,
+                &outcome,
+            )
+            .await;
+            return Ok(outcome);
         }
-        Ok(interpret_upload_response(&response, &request.filename))
+        let outcome = interpret_upload_response(&response, &request.filename);
+        self.add_structured_data_best_effort(
+            client,
+            request,
+            &csrf_token,
+            ApiAuthorization::None,
+            &outcome,
+        )
+        .await;
+        Ok(outcome)
     }
 
     /// Uploads using an OAuth 1.0a access token, signing each request.
@@ -284,9 +358,35 @@ impl CommonsClient {
             let response = self
                 .post_upload_form(&client, request, &csrf_token, Some(&retry_auth), true)
                 .await?;
-            return Ok(interpret_upload_response(&response, &request.filename));
+            let outcome = interpret_upload_response(&response, &request.filename);
+            self.add_structured_data_best_effort(
+                &client,
+                request,
+                &csrf_token,
+                ApiAuthorization::OAuth1 {
+                    oauth,
+                    token,
+                    secret,
+                },
+                &outcome,
+            )
+            .await;
+            return Ok(outcome);
         }
-        Ok(interpret_upload_response(&response, &request.filename))
+        let outcome = interpret_upload_response(&response, &request.filename);
+        self.add_structured_data_best_effort(
+            &client,
+            request,
+            &csrf_token,
+            ApiAuthorization::OAuth1 {
+                oauth,
+                token,
+                secret,
+            },
+            &outcome,
+        )
+        .await;
+        Ok(outcome)
     }
 
     /// Uploads using an OAuth2 bearer access token.
@@ -325,9 +425,27 @@ impl CommonsClient {
             let response = self
                 .post_upload_form(&client, request, &csrf_token, Some(&authorization), true)
                 .await?;
-            return Ok(interpret_upload_response(&response, &request.filename));
+            let outcome = interpret_upload_response(&response, &request.filename);
+            self.add_structured_data_best_effort(
+                &client,
+                request,
+                &csrf_token,
+                ApiAuthorization::Header(&authorization),
+                &outcome,
+            )
+            .await;
+            return Ok(outcome);
         }
-        Ok(interpret_upload_response(&response, &request.filename))
+        let outcome = interpret_upload_response(&response, &request.filename);
+        self.add_structured_data_best_effort(
+            &client,
+            request,
+            &csrf_token,
+            ApiAuthorization::Header(&authorization),
+            &outcome,
+        )
+        .await;
+        Ok(outcome)
     }
 
     /// Posts one multipart upload form, optionally signed for OAuth and with warning override.
@@ -351,6 +469,307 @@ impl CommonsClient {
             .json()
             .await
             .context("Commons upload response was not valid JSON")
+    }
+
+    /// Adds SDC after a successful upload; logs failures because the file upload already worked.
+    async fn add_structured_data_best_effort(
+        &self,
+        client: &Client,
+        request: &UploadRequest,
+        csrf_token: &str,
+        authorization: ApiAuthorization<'_>,
+        outcome: &UploadOutcome,
+    ) {
+        let Some(structured_data) = &request.structured_data else {
+            return;
+        };
+        let UploadOutcome::Success { title, .. } = outcome else {
+            return;
+        };
+        if let Err(error) = self
+            .add_structured_data(client, title, structured_data, csrf_token, authorization)
+            .await
+        {
+            tracing::warn!(
+                target_filename = title,
+                error = %format!("{error:#}"),
+                "failed to add Structured Data on Commons"
+            );
+        }
+    }
+
+    /// Adds upload-derived Structured Data on Commons in one MediaInfo edit.
+    async fn add_structured_data(
+        &self,
+        client: &Client,
+        title: &str,
+        structured_data: &StructuredDataRequest,
+        csrf_token: &str,
+        authorization: ApiAuthorization<'_>,
+    ) -> Result<()> {
+        let claims = self.structured_data_claims(client, structured_data).await;
+        if claims.is_empty() {
+            return Ok(());
+        }
+        let file_title = file_title(title);
+        let entity_id = self.file_mediainfo_id(client, &file_title).await?;
+        let data = json!({ "claims": claims }).to_string();
+        let response = self
+            .post_wbeditentity(
+                client,
+                &[
+                    ("action", "wbeditentity"),
+                    ("id", entity_id.as_str()),
+                    ("data", data.as_str()),
+                    ("summary", SDC_EDIT_SUMMARY),
+                    ("token", csrf_token),
+                    ("format", "json"),
+                ],
+                authorization,
+            )
+            .await?;
+        if api_error_code(&response) == Some("no-such-entity") {
+            let response = self
+                .post_wbeditentity(
+                    client,
+                    &[
+                        ("action", "wbeditentity"),
+                        ("new", "mediainfo"),
+                        ("site", "commonswiki"),
+                        ("title", file_title.as_str()),
+                        ("data", data.as_str()),
+                        ("summary", SDC_EDIT_SUMMARY),
+                        ("token", csrf_token),
+                        ("format", "json"),
+                    ],
+                    authorization,
+                )
+                .await?;
+            ensure_api_success(&response, "Commons SDC create response")?;
+            return Ok(());
+        }
+        ensure_api_success(&response, "Commons SDC edit response")
+    }
+
+    /// Builds SDC statements that can be inferred without guessing.
+    async fn structured_data_claims(
+        &self,
+        client: &Client,
+        structured_data: &StructuredDataRequest,
+    ) -> Vec<Value> {
+        let mut claims = Vec::new();
+        if structured_data.source_is_own_work {
+            claims.push(item_statement("P7482", Q_ORIGINAL_CREATION_BY_UPLOADER));
+        }
+        if let Some(license) = resolved_structured_data_license(
+            structured_data.license,
+            structured_data.license_override.as_deref(),
+        ) {
+            if let Some(qid) = license_qid(license) {
+                claims.push(item_statement("P275", qid));
+            }
+            claims.push(item_statement("P6216", copyright_status_qid(license)));
+        }
+        if structured_data.source_is_own_work
+            && structured_data.author_override.is_none()
+            && let Some(qid) = self
+                .commons_user_wikidata_item(client, &structured_data.author_username)
+                .await
+        {
+            claims.push(item_statement("P170", &qid));
+        }
+        if let (Some(latitude), Some(longitude)) =
+            (structured_data.latitude, structured_data.longitude)
+            && valid_coordinates(latitude, longitude)
+        {
+            claims.push(coordinate_statement("P1259", latitude, longitude));
+        }
+        if let Some(camera_model) = structured_data
+            .camera_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            && let Some(qid) = self.wikidata_exact_item(client, camera_model).await
+        {
+            claims.push(item_statement("P4082", &qid));
+        }
+        claims
+    }
+
+    /// Returns the Commons MediaInfo entity ID (`M<pageid>`) for an uploaded file.
+    async fn file_mediainfo_id(&self, client: &Client, file_title: &str) -> Result<String> {
+        let response: Value = client
+            .get(&self.api_url)
+            .query(&[
+                ("action", "query"),
+                ("prop", "info"),
+                ("titles", file_title),
+                ("format", "json"),
+                ("formatversion", "2"),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons page-info response was not valid JSON")?;
+        let page_id = response
+            .get("query")
+            .and_then(|query| query.get("pages"))
+            .and_then(Value::as_array)
+            .and_then(|pages| pages.first())
+            .and_then(|page| page.get("pageid"))
+            .and_then(Value::as_i64)
+            .with_context(|| {
+                format!("Commons page-info response is missing pageid for {file_title}")
+            })?;
+        Ok(format!("M{page_id}"))
+    }
+
+    /// Looks up the Wikidata item linked from `User:<account>`, if the user page has one.
+    async fn commons_user_wikidata_item(&self, client: &Client, username: &str) -> Option<String> {
+        let account = account_name(username);
+        let title = format!("User:{account}");
+        let response: Value = match client
+            .get(&self.api_url)
+            .query(&[
+                ("action", "query"),
+                ("prop", "pageprops"),
+                ("titles", &title),
+                ("format", "json"),
+                ("formatversion", "2"),
+            ])
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => match response.json().await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        username = account,
+                        error = %error,
+                        "Commons user-page Wikidata lookup returned invalid JSON"
+                    );
+                    return None;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    username = account,
+                    error = %error,
+                    "Commons user-page Wikidata lookup failed"
+                );
+                return None;
+            }
+        };
+        response
+            .get("query")
+            .and_then(|query| query.get("pages"))
+            .and_then(Value::as_array)
+            .and_then(|pages| pages.first())
+            .and_then(|page| page.get("pageprops"))
+            .and_then(|props| props.get("wikibase_item"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Searches Wikidata and returns a QID only for an exact label or alias match.
+    async fn wikidata_exact_item(&self, client: &Client, search: &str) -> Option<String> {
+        let response: Value = match client
+            .get(WIKIDATA_API_URL)
+            .query(&[
+                ("action", "wbsearchentities"),
+                ("search", search),
+                ("language", "en"),
+                ("type", "item"),
+                ("limit", "5"),
+                ("format", "json"),
+            ])
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => match response.json().await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        search,
+                        error = %error,
+                        "Wikidata exact-item lookup returned invalid JSON"
+                    );
+                    return None;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    search,
+                    error = %error,
+                    "Wikidata exact-item lookup failed"
+                );
+                return None;
+            }
+        };
+        let needle = search.trim().to_ascii_lowercase();
+        response
+            .get("search")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|result| {
+                result
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .is_some_and(|label| label.eq_ignore_ascii_case(&needle))
+                    || result
+                        .get("aliases")
+                        .and_then(Value::as_array)
+                        .is_some_and(|aliases| {
+                            aliases
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .any(|alias| alias.trim().eq_ignore_ascii_case(needle.as_str()))
+                        })
+            })
+            .and_then(|result| result.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Posts a `wbeditentity` form, optionally authenticated by OAuth.
+    async fn post_wbeditentity(
+        &self,
+        client: &Client,
+        form: &[(&str, &str)],
+        authorization: ApiAuthorization<'_>,
+    ) -> Result<Value> {
+        let mut builder = client.post(&self.api_url);
+        match authorization {
+            ApiAuthorization::None => {}
+            ApiAuthorization::Header(authorization) => {
+                builder = builder.header("Authorization", authorization);
+            }
+            ApiAuthorization::OAuth1 {
+                oauth,
+                token,
+                secret,
+            } => {
+                let body_params = form
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect::<Vec<_>>();
+                let authorization =
+                    oauth.api_authorization("POST", &self.api_url, token, secret, &body_params);
+                builder = builder.header("Authorization", authorization);
+            }
+        }
+        builder
+            .form(form)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons SDC response was not valid JSON")
     }
 
     /// Returns true when a retry with `ignorewarnings=1` is allowed for this warning only.
@@ -532,6 +951,24 @@ impl CommonsClient {
     }
 }
 
+/// Extracts a Commons API error code from a JSON response.
+fn api_error_code(response: &Value) -> Option<&str> {
+    response
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+}
+
+/// Converts an unexpected API error response into a regular `anyhow` error.
+fn ensure_api_success(response: &Value, context: &str) -> Result<()> {
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
+        let info = error.get("info").and_then(Value::as_str).unwrap_or("");
+        bail!("{context}: {code}: {info}");
+    }
+    Ok(())
+}
+
 /// Extracts a human-readable reason from a failed login response.
 fn login_failure_reason(login: Option<&Value>, fallback: &str) -> String {
     let Some(login) = login else {
@@ -557,6 +994,117 @@ fn is_transient_login_failure(message: &str) -> bool {
     lower.contains("unable to continue login")
         || lower.contains("session most likely timed out")
         || lower.contains("session timed out")
+}
+
+/// Resolves a built-in or known custom license override for SDC mapping.
+fn resolved_structured_data_license(
+    license: License,
+    license_override: Option<&str>,
+) -> Option<License> {
+    let Some(override_value) = license_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(license);
+    };
+    License::parse(&license_override_key(override_value))
+}
+
+/// Normalizes a user-provided license key/template enough to match known built-in licenses.
+fn license_override_key(value: &str) -> String {
+    let mut value = value.trim();
+    if let Some(inner) = value
+        .strip_prefix("{{")
+        .and_then(|inner| inner.strip_suffix("}}"))
+    {
+        value = inner.trim();
+    }
+    if let Some(rest) = value.strip_prefix("self|") {
+        value = rest.trim();
+    }
+    value.split('|').next().unwrap_or(value).trim().to_string()
+}
+
+/// Maps built-in licenses to Wikidata license items for SDC P275.
+fn license_qid(license: License) -> Option<&'static str> {
+    match license {
+        License::CcBy40 => Some(Q_CC_BY_4_0),
+        License::CcBySa40 => Some(Q_CC_BY_SA_4_0),
+        License::Cc0 => Some(Q_CC0),
+        License::PdRussiaExpired | License::PdRussia | License::PdRusEmpire => None,
+    }
+}
+
+/// Maps built-in licenses to Wikidata copyright-status items for SDC P6216.
+fn copyright_status_qid(license: License) -> &'static str {
+    match license {
+        License::CcBy40 | License::CcBySa40 => Q_COPYRIGHTED,
+        License::Cc0 | License::PdRussiaExpired | License::PdRussia | License::PdRusEmpire => {
+            Q_PUBLIC_DOMAIN
+        }
+    }
+}
+
+/// Builds the canonical file page title expected by `wbeditentity`.
+fn file_title(title: &str) -> String {
+    if title.starts_with("File:") {
+        title.to_string()
+    } else {
+        format!("File:{title}")
+    }
+}
+
+/// Returns true when decimal coordinates are inside real latitude/longitude ranges.
+fn valid_coordinates(latitude: f64, longitude: f64) -> bool {
+    latitude.is_finite()
+        && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude)
+}
+
+/// Builds one normal-rank Wikibase item statement.
+fn item_statement(property: &str, qid: &str) -> Value {
+    let numeric_id = qid
+        .strip_prefix('Q')
+        .and_then(|id| id.parse::<u64>().ok())
+        .expect("hard-coded Wikidata item IDs must be Q-prefixed numbers");
+    json!({
+        "mainsnak": {
+            "snaktype": "value",
+            "property": property,
+            "datavalue": {
+                "value": {
+                    "entity-type": "item",
+                    "numeric-id": numeric_id,
+                    "id": qid,
+                },
+                "type": "wikibase-entityid",
+            },
+        },
+        "type": "statement",
+        "rank": "normal",
+    })
+}
+
+/// Builds one normal-rank globe-coordinate statement.
+fn coordinate_statement(property: &str, latitude: f64, longitude: f64) -> Value {
+    json!({
+        "mainsnak": {
+            "snaktype": "value",
+            "property": property,
+            "datavalue": {
+                "value": {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "precision": 0.000001,
+                    "globe": EARTH_GLOBE,
+                },
+                "type": "globecoordinate",
+            },
+        },
+        "type": "statement",
+        "rank": "normal",
+    })
 }
 
 /// Builds the user-facing message for a failed bot-password login, including recovery steps.
@@ -1265,8 +1813,10 @@ fn account_name(username: &str) -> &str {
 mod tests {
     use super::{
         DescriptionParams, ParsedCaption, account_name, build_filename, build_wikitext,
-        describe_warnings, interpret_upload_response, parse_caption, sanitize_title,
-        truncate_bytes,
+        coordinate_statement, copyright_status_qid, describe_warnings, file_title,
+        interpret_upload_response, item_statement, license_override_key, license_qid,
+        parse_caption, resolved_structured_data_license, sanitize_title, truncate_bytes,
+        valid_coordinates,
     };
     use crate::models::{License, UploadProvenance};
     use serde_json::json;
@@ -1357,6 +1907,68 @@ mod tests {
     fn account_name_strips_bot_password_label() {
         assert_eq!(account_name("Example@uploader"), "Example");
         assert_eq!(account_name("Example"), "Example");
+    }
+
+    #[test]
+    fn structured_data_license_mapping_handles_known_templates() {
+        assert_eq!(
+            license_override_key("{{self|cc-by-sa-4.0|migration=relicense}}"),
+            "cc-by-sa-4.0"
+        );
+        assert_eq!(
+            resolved_structured_data_license(License::CcBy40, Some("{{self|cc-by-sa-4.0}}")),
+            Some(License::CcBySa40)
+        );
+        assert_eq!(
+            resolved_structured_data_license(License::CcBy40, Some("{{PD-Russia}}")),
+            Some(License::PdRussia)
+        );
+        assert_eq!(
+            resolved_structured_data_license(License::CcBy40, Some("{{PD-RU-exempt}}")),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_data_license_status_mapping_is_conservative() {
+        assert_eq!(license_qid(License::CcBy40), Some("Q20007257"));
+        assert_eq!(license_qid(License::CcBySa40), Some("Q18199165"));
+        assert_eq!(license_qid(License::Cc0), Some("Q6938433"));
+        assert_eq!(license_qid(License::PdRussia), None);
+        assert_eq!(copyright_status_qid(License::CcBy40), "Q50423863");
+        assert_eq!(copyright_status_qid(License::PdRussia), "Q19652");
+    }
+
+    #[test]
+    fn structured_data_statement_builders_match_wikibase_json_shape() {
+        let item = item_statement("P275", "Q20007257");
+        assert_eq!(
+            item["mainsnak"]["datavalue"]["value"]["numeric-id"],
+            json!(20007257)
+        );
+        assert_eq!(
+            item["mainsnak"]["datavalue"]["type"],
+            json!("wikibase-entityid")
+        );
+
+        let coordinate = coordinate_statement("P1259", 50.45, 30.523333);
+        assert_eq!(
+            coordinate["mainsnak"]["datavalue"]["type"],
+            json!("globecoordinate")
+        );
+        assert_eq!(
+            coordinate["mainsnak"]["datavalue"]["value"]["globe"],
+            json!("http://www.wikidata.org/entity/Q2")
+        );
+    }
+
+    #[test]
+    fn structured_data_helpers_normalize_titles_and_coordinates() {
+        assert_eq!(file_title("Example.jpg"), "File:Example.jpg");
+        assert_eq!(file_title("File:Example.jpg"), "File:Example.jpg");
+        assert!(valid_coordinates(50.45, 30.52));
+        assert!(!valid_coordinates(91.0, 30.52));
+        assert!(!valid_coordinates(50.45, f64::NAN));
     }
 
     #[test]

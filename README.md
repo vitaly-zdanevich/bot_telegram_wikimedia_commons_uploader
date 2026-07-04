@@ -33,7 +33,7 @@ Metadata and tracking links:
 3. Pick a **license** (default **CC BY 4.0**; also CC BY-SA 4.0, CC0,
    PD-Russia-expired, PD-Russia, or PD-RusEmpire) and an optional **filename prefix**.
 4. Send a photo or file. It is uploaded to Commons with a generated `{{Information}}`
-   page, license, categories, geotag, and provenance.
+   page, license, categories, geotag, provenance, and Structured Data on Commons statements.
 
 ### Captions
 
@@ -262,10 +262,10 @@ choices:
   leave **Client credentials** unchecked.
 - Under **Types of grants being requested**, choose **Request authorization for specific
   permissions**.
-- Under **Applicable grants**, keep **Basic rights** selected, and additionally select only
-  **Create, edit, and move pages** plus **Upload new files**. The page grant is needed to
-  write the `File:` description page and already includes the normal `edit` right, so the
-  separate **Edit existing pages** grant is not needed. Leave **Upload, replace, and move
+- Under **Applicable grants**, keep **Basic rights** selected, and additionally select
+  **Edit existing pages**, **Create, edit, and move pages**, and **Upload new files**.
+  The edit grants are needed to write the `File:` description page and the post-upload
+  Structured Data on Commons `MediaInfo` statements. Leave **Upload, replace, and move
   files** unchecked; the bot does not overwrite existing files.
 
 Then set the consumer credentials as Toolforge envvars:

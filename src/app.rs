@@ -1,6 +1,7 @@
 use crate::commons::{
-    CommonsBotPasswordSession, CommonsClient, DescriptionParams, UploadAuth, UploadData,
-    UploadOutcome, UploadRequest, build_filename, build_wikitext, category_url, parse_caption,
+    CommonsBotPasswordSession, CommonsClient, DescriptionParams, StructuredDataRequest, UploadAuth,
+    UploadData, UploadOutcome, UploadRequest, build_filename, build_wikitext, category_url,
+    parse_caption,
 };
 use crate::config::Config;
 use crate::convert;
@@ -2552,13 +2553,24 @@ impl Bot {
         } else {
             parsed.description.clone()
         };
+        let author_override = parsed
+            .author
+            .clone()
+            .or_else(|| profile.default_author.clone());
+        let structured_data = StructuredDataRequest {
+            source_is_own_work: source.is_none(),
+            author_username: author_username.to_string(),
+            author_override: author_override.clone(),
+            license: profile.license,
+            license_override: profile.license_override.clone(),
+            latitude,
+            longitude,
+            camera_model: metadata.camera_model.clone(),
+        };
         let wikitext = build_wikitext(&DescriptionParams {
             description: &description,
             author_username,
-            author_override: parsed
-                .author
-                .as_deref()
-                .or(profile.default_author.as_deref()),
+            author_override: author_override.as_deref(),
             source,
             license: profile.license,
             license_override: profile.license_override.as_deref(),
@@ -2576,6 +2588,7 @@ impl Bot {
             data: upload_data,
             wikitext,
             comment: format!("Uploaded via Telegram bot {BOT_USERNAME}"),
+            structured_data: Some(structured_data),
         };
         let outcome = if let Some(session) = bot_password_session {
             self.commons
