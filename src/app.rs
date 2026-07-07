@@ -3916,15 +3916,12 @@ impl Bot {
             Some(progress) => format!("Uploaded {}/{}", progress.current, progress.total),
             None => "Uploaded".to_string(),
         };
-        let mut text = if profile.return_upload_links {
-            format!(
-                "✅ {label}: <a href=\"{}\">{}</a>",
-                reply.url,
-                escape_html(reply.filename)
-            )
-        } else {
-            format!("✅ {label} <code>{}</code>", escape_html(reply.filename))
-        };
+        let mut text = format_upload_success_intro(
+            &label,
+            reply.filename,
+            reply.url,
+            profile.return_upload_links,
+        );
         if reply.compressed_photo {
             text.push_str("\nℹ️ This was a compressed photo; send it as a file for full quality.");
         }
@@ -4466,9 +4463,11 @@ impl Bot {
                 }) => {
                     uploaded += 1;
                     if profile.return_upload_links {
-                        let mut text = format!(
-                            "✅ Uploaded {member_index}/{entry_count}: <a href=\"{url}\">{}</a>",
-                            escape_html(&filename)
+                        let mut text = format_upload_success_intro(
+                            &format!("Uploaded {member_index}/{entry_count}"),
+                            &filename,
+                            &url,
+                            true,
                         );
                         if let Some(report_metadata) = &report_metadata {
                             text.push_str(&format_upload_report_metadata(report_metadata));
@@ -5888,6 +5887,29 @@ fn upload_data_from_telegram_file(file: TelegramFile) -> UploadData {
     match file {
         TelegramFile::Bytes(bytes) => UploadData::Bytes(bytes),
         TelegramFile::LocalPath { path, size } => UploadData::File { path, len: size },
+    }
+}
+
+/// Formats the first lines of a successful upload reply for narrow Telegram screens.
+fn format_upload_success_intro(
+    label: &str,
+    filename: &str,
+    url: &str,
+    return_upload_link: bool,
+) -> String {
+    if return_upload_link {
+        format!(
+            "✅ {}\n<a href=\"{}\">{}</a>",
+            escape_html(label),
+            html_attribute(url),
+            escape_html(filename)
+        )
+    } else {
+        format!(
+            "✅ {}\n<code>{}</code>",
+            escape_html(label),
+            escape_html(filename)
+        )
     }
 }
 
@@ -7571,6 +7593,30 @@ mod tests {
 
         assert!(text.contains("Extracted embedded JPEG without conversion"));
         assert!(text.contains("Size: 512.0 KB"));
+    }
+
+    #[test]
+    fn upload_success_intro_keeps_file_link_on_dedicated_line() {
+        let text = super::format_upload_success_intro(
+            "Uploaded 5/10",
+            "Minsk <old>.jpg",
+            "https://commons.wikimedia.org/wiki/File:Minsk_old.jpg?x=\"y\"",
+            true,
+        );
+
+        assert_eq!(
+            text,
+            "✅ Uploaded 5/10\n<a href=\"https://commons.wikimedia.org/wiki/File:Minsk_old.jpg?x=&quot;y&quot;\">Minsk &lt;old&gt;.jpg</a>"
+        );
+        assert!(!text.contains("Uploaded 5/10:"));
+    }
+
+    #[test]
+    fn upload_success_intro_uses_second_line_without_links_too() {
+        let text =
+            super::format_upload_success_intro("Uploaded", "Minsk <old>.jpg", "unused", false);
+
+        assert_eq!(text, "✅ Uploaded\n<code>Minsk &lt;old&gt;.jpg</code>");
     }
 
     #[test]
