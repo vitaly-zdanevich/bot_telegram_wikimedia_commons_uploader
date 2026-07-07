@@ -7839,11 +7839,12 @@ mod tests {
 #[cfg(all(test, feature = "archive"))]
 mod archive_tests {
     use super::{
-        PENDING_TTL_SECS, PendingArchiveManifest, TELEGRAM_PHOTO_PREVIEW_MAX_BYTES,
+        PENDING_TTL_SECS, PendingArchive, PendingArchiveManifest, TELEGRAM_PHOTO_PREVIEW_MAX_BYTES,
         archive_confirmation_buttons, archive_entry_needs_filename_prefix, archive_name_category,
         archive_name_prefix, archive_needs_filename_prefix, archive_prefix_keyboard, is_low_memory,
-        parse_mem_available_kb, pending_is_expired, short_id, should_send_original_archive_preview,
-        upload_categories,
+        load_pending_archive, now_ts, parse_mem_available_kb, pending_is_expired,
+        persist_pending_archive, remove_pending_archive_files, set_pending_archive_filename_prefix,
+        short_id, should_send_original_archive_preview, upload_categories,
     };
 
     #[test]
@@ -8027,5 +8028,46 @@ mod archive_tests {
         .unwrap();
         assert_eq!(manifest.filename_prefix, None);
         assert_eq!(manifest.archive_file_name, None);
+        assert_eq!(manifest.source_message_id, None);
+    }
+
+    #[test]
+    fn persisted_pending_archive_keeps_source_message_id_after_prefix_update() {
+        let token = format!(
+            "test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        remove_pending_archive_files(&token).ok();
+
+        let pending = PendingArchive {
+            user_id: 42,
+            caption: "Archive caption".into(),
+            filename_prefix: None,
+            archive_file_name: Some("Photos.rar".into()),
+            source_message_id: Some(1234),
+            entries: vec![crate::archive::ArchiveEntry {
+                name: "IMG_0001.jpg".into(),
+                bytes: b"jpeg bytes".to_vec(),
+            }],
+            confirm_before_upload: true,
+            created_at: now_ts(),
+        };
+        persist_pending_archive(&token, &pending).unwrap();
+        set_pending_archive_filename_prefix(&token, "Photos_".into()).unwrap();
+
+        let loaded = load_pending_archive(&token).unwrap();
+        remove_pending_archive_files(&token).unwrap();
+
+        assert_eq!(loaded.user_id, 42);
+        assert_eq!(loaded.filename_prefix.as_deref(), Some("Photos_"));
+        assert_eq!(loaded.archive_file_name.as_deref(), Some("Photos.rar"));
+        assert_eq!(loaded.source_message_id, Some(1234));
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].name, "IMG_0001.jpg");
+        assert_eq!(loaded.entries[0].bytes, b"jpeg bytes");
     }
 }

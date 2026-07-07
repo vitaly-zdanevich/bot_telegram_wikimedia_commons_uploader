@@ -1864,6 +1864,7 @@ mod tests {
     };
     use crate::models::{License, UploadProvenance};
     use serde_json::json;
+    use std::io::{Read, Write};
 
     #[test]
     fn parses_categories_and_description() {
@@ -2218,6 +2219,86 @@ mod tests {
         assert_eq!(
             super::strip_wikitext("'''Bold''' and [[m:Help|help page]] here"),
             "Bold and help page here"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_count_by_user_follows_commons_continue_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut targets = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0, "client closed before request headers");
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(buffer).unwrap();
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                targets.push(target);
+
+                let body = if index == 0 {
+                    json!({
+                        "query": {"allimages": [{"name": "A.jpg"}, {"name": "B.jpg"}]},
+                        "continue": {"aicontinue": "next-token"}
+                    })
+                } else {
+                    json!({"query": {"allimages": [{"name": "C.jpg"}]}})
+                }
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            targets
+        });
+
+        let client = super::CommonsClient::new(api_url, "test-agent", None, None, false);
+        let count = client.upload_count_by_user("Example User").await.unwrap();
+        assert_eq!(count, 3);
+
+        let targets = server.join().unwrap();
+        assert_eq!(targets.len(), 2);
+        let first = url::Url::parse(&format!("http://localhost{}", targets[0])).unwrap();
+        assert_eq!(
+            first
+                .query_pairs()
+                .find(|(key, _)| key == "aiuser")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("Example User")
+        );
+        assert!(
+            first
+                .query_pairs()
+                .all(|(key, _)| key.as_ref() != "aicontinue")
+        );
+        let second = url::Url::parse(&format!("http://localhost{}", targets[1])).unwrap();
+        assert_eq!(
+            second
+                .query_pairs()
+                .find(|(key, _)| key == "aicontinue")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("next-token")
         );
     }
 }

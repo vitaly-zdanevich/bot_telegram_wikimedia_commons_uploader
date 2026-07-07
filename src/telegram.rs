@@ -428,6 +428,39 @@ mod tests {
         TelegramClient, TelegramFile, escape_html, license_keyboard, split_for_telegram, utf16_len,
     };
     use crate::models::License;
+    use std::io::{Read, Write};
+
+    fn read_http_request(mut stream: std::net::TcpStream) -> (String, serde_json::Value) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "client closed before request headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8(buffer[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while buffer.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "client closed before request body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let first_line = headers.lines().next().unwrap().to_string();
+        let body = serde_json::from_slice(&buffer[header_end..header_end + content_length])
+            .unwrap_or(serde_json::Value::Null);
+        (first_line, body)
+    }
 
     #[tokio::test]
     async fn download_file_reads_absolute_local_path() {
@@ -480,6 +513,37 @@ mod tests {
             }
             TelegramFile::Bytes(_) => panic!("absolute local path was copied into memory"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_message_reaction_posts_expected_payload() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(stream.try_clone().unwrap());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{{\"ok\":true,\"result\":true}}"
+            )
+            .unwrap();
+            request
+        });
+
+        let client = TelegramClient::new("secret-token", base_url);
+        client.set_message_reaction(42, 1001, "👍").await.unwrap();
+
+        let (first_line, body) = server.join().unwrap();
+        assert_eq!(
+            first_line,
+            "POST /botsecret-token/setMessageReaction HTTP/1.1"
+        );
+        assert_eq!(body["chat_id"], serde_json::json!(42));
+        assert_eq!(body["message_id"], serde_json::json!(1001));
+        assert_eq!(
+            body["reaction"],
+            serde_json::json!([{"type": "emoji", "emoji": "👍"}])
+        );
     }
 
     #[test]
