@@ -5901,12 +5901,24 @@ fn format_upload_report_metadata(report: &UploadReportMetadata) -> String {
         ));
     }
     if let Some(camera_model) = report.camera_model.as_deref() {
-        text.push_str(&format!("\nℹ️ Camera: {}.", escape_html(camera_model)));
+        text.push_str(&format!(
+            "\nℹ️ Camera: <a href=\"{}\">{}</a>.",
+            html_attribute(&camera_model_google_url(camera_model)),
+            escape_html(camera_model)
+        ));
     }
     if let Some(date) = report.date.as_deref() {
         text.push_str(&format!("\nℹ️ Date: {}.", escape_html(date)));
     }
     text
+}
+
+/// Builds a Google search URL for a camera model shown in the upload report.
+fn camera_model_google_url(camera_model: &str) -> String {
+    format!(
+        "https://www.google.com/search?q={}",
+        urlencoding::encode(camera_model)
+    )
 }
 
 /// Formats pre-upload processing details for the success message.
@@ -7573,7 +7585,9 @@ mod tests {
         });
 
         assert!(text.contains("Resolution: 4032 × 3024"));
-        assert!(text.contains("Camera: Canon &lt;EOS&gt;"));
+        assert!(text.contains(
+            "Camera: <a href=\"https://www.google.com/search?q=Canon%20%3CEOS%3E\">Canon &lt;EOS&gt;</a>"
+        ));
         assert!(text.contains("Date: 2026-06-20"));
     }
 
