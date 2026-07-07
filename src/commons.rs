@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// Attribution category added to every file uploaded by this bot.
-const BOT_CATEGORY: &str =
+pub const BOT_CATEGORY: &str =
     "Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich";
 /// Maximum filename stem length in bytes, leaving room for `File:` and the extension.
 const MAX_FILENAME_STEM_BYTES: usize = 200;
@@ -890,6 +890,50 @@ impl CommonsClient {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Counts public files uploaded by a Commons user.
+    pub async fn upload_count_by_user(&self, username: &str) -> Result<u64> {
+        let client = self.session_client()?;
+        let mut count = 0_u64;
+        let mut continue_token: Option<String> = None;
+        loop {
+            let mut query = vec![
+                ("action".to_string(), "query".to_string()),
+                ("list".to_string(), "allimages".to_string()),
+                ("aiuser".to_string(), username.to_string()),
+                ("ailimit".to_string(), "500".to_string()),
+                ("format".to_string(), "json".to_string()),
+                ("formatversion".to_string(), "2".to_string()),
+            ];
+            if let Some(token) = &continue_token {
+                query.push(("aicontinue".to_string(), token.clone()));
+            }
+            let response: Value = client
+                .get(&self.api_url)
+                .query(&query)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+                .context("Commons allimages response was not valid JSON")?;
+            count = count.saturating_add(
+                response
+                    .get("query")
+                    .and_then(|query| query.get("allimages"))
+                    .and_then(Value::as_array)
+                    .map_or(0, |images| images.len() as u64),
+            );
+            continue_token = response
+                .get("continue")
+                .and_then(|value| value.get("aicontinue"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if continue_token.is_none() {
+                return Ok(count);
+            }
+        }
     }
 
     /// Logs in with a bot password (legacy `action=login`, which bot passwords use).

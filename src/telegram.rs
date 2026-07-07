@@ -174,6 +174,25 @@ impl TelegramClient {
         Ok(())
     }
 
+    /// Sets a simple emoji reaction on a message.
+    pub async fn set_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<()> {
+        self.post_json(
+            "setMessageReaction",
+            &json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reaction": [{"type": "emoji", "emoji": emoji}],
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Resolves a Telegram `file_id` to its temporary download path via `getFile`.
     pub async fn get_file_path(&self, file_id: &str) -> Result<String> {
         let value = self

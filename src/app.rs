@@ -1,7 +1,7 @@
 use crate::commons::{
-    CommonsBotPasswordSession, CommonsClient, DescriptionParams, StructuredDataRequest, UploadAuth,
-    UploadData, UploadOutcome, UploadRequest, build_filename, build_wikitext, category_url,
-    parse_caption,
+    BOT_CATEGORY, CommonsBotPasswordSession, CommonsClient, DescriptionParams,
+    StructuredDataRequest, UploadAuth, UploadData, UploadOutcome, UploadRequest, build_filename,
+    build_wikitext, category_url, parse_caption,
 };
 use crate::config::Config;
 use crate::convert;
@@ -211,6 +211,39 @@ async fn send_chat_action_best_effort(telegram: &TelegramClient, chat_id: i64, a
     }
 }
 
+/// Logs and suppresses failures when setting a Telegram message reaction.
+async fn set_reaction_best_effort(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    emoji: &str,
+) {
+    if let Err(error) = telegram
+        .set_message_reaction(chat_id, message_id, emoji)
+        .await
+    {
+        tracing::warn!(
+            chat_id,
+            message_id,
+            emoji,
+            error = %format!("{error:#}"),
+            "failed to set Telegram message reaction"
+        );
+    }
+}
+
+/// Reacts to a source message when Telegram supplied a message id.
+async fn react_to_message_best_effort(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message: &Message,
+    emoji: &str,
+) {
+    if let Some(message_id) = message.message_id {
+        set_reaction_best_effort(telegram, chat_id, message_id, emoji).await;
+    }
+}
+
 /// Returns true when updates can be acknowledged before deferred upload work starts.
 fn defer_uploads_after_ack() -> bool {
     std::env::var("AWS_LAMBDA_RUNTIME_API").is_err()
@@ -314,10 +347,13 @@ fn retain_fresh_media_group_progress(
 }
 
 #[cfg(feature = "archive")]
+/// Spawns archive upload work after the webhook update has been acknowledged.
+#[allow(clippy::too_many_arguments)]
 fn spawn_archive_upload(
     config: Config,
     chat_id: i64,
     user_id: i64,
+    source_message_id: Option<i64>,
     caption: String,
     filename_prefix: Option<String>,
     extra_categories: Vec<String>,
@@ -330,6 +366,7 @@ fn spawn_archive_upload(
             .upload_entries(
                 chat_id,
                 user_id,
+                source_message_id,
                 &mut profile,
                 &caption,
                 filename_prefix.as_deref(),
@@ -1149,6 +1186,7 @@ impl Bot {
         match command {
             "/start" => self.cmd_start(chat_id, user_id).await,
             "/help" => self.send_help(chat_id, user_id).await,
+            "/status" => self.cmd_status(chat_id, user_id).await,
             "/admin" => self.cmd_admin(chat_id, user_id).await,
             "/stat" | "/stats" => self.cmd_stat(chat_id, user_id).await,
             "/settings" | "/prefs" | "/preferences" => {
@@ -1632,6 +1670,7 @@ impl Bot {
                         .upload_entries(
                             chat_id,
                             user_id,
+                            pending_archive.source_message_id,
                             &mut profile,
                             &pending_archive.caption,
                             Some(&filename_prefix),
@@ -2133,6 +2172,58 @@ impl Bot {
         self.telegram.send_message(chat_id, &text, None).await
     }
 
+    /// Shows the current user's Commons connection and upload counters.
+    async fn cmd_status(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        let mut profile = self.store.get_profile(user_id).await;
+        if profile.is_ready()
+            && profile
+                .commons_username
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            self.resolve_auth(user_id, &mut profile).await.ok();
+        }
+        let auth_method = auth_method_label(&profile);
+        let Some(account) = profile
+            .commons_username
+            .as_deref()
+            .map(commons_account_name)
+            .filter(|account| !account.trim().is_empty())
+        else {
+            let text = format!(
+                "📊 <b>Status</b>\nCommons account: <b>not connected</b>\nAuth method: <b>{auth_method}</b>\n\nRun /start to connect your Commons account."
+            );
+            return self.telegram.send_message(chat_id, &text, None).await;
+        };
+
+        let total_uploads = match self.commons.upload_count_by_user(account).await {
+            Ok(count) => format_count(count),
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    account,
+                    error = %format!("{error:#}"),
+                    "failed to count Commons uploads for status"
+                );
+                "unavailable".to_string()
+            }
+        };
+        let bot_uploads = format_count(profile.uploads_count);
+        let text = format!(
+            "📊 <b>Status</b>\nCommons account: <a href=\"{}\">{}</a>\nAuth method: <b>{}</b>\nUploads by this Commons account: <b>{}</b>\nUploads through this bot: <b>{}</b>\nUploads through this bot for this account: <a href=\"{}\">open Commons search</a>",
+            html_attribute(&commons_user_url(account)),
+            escape_html(account),
+            escape_html(auth_method),
+            escape_html(&total_uploads),
+            escape_html(&bot_uploads),
+            html_attribute(&commons_bot_uploads_for_user_url(account)),
+        );
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
     /// Shows operational status to administrators.
     async fn cmd_admin(&self, chat_id: i64, user_id: i64) -> Result<()> {
         if !self.config.is_admin(user_id) {
@@ -2175,12 +2266,12 @@ impl Bot {
         let archive_limit = format_size_limit(self.config.max_archive_file_bytes);
         let commons_link_limit = format_size_limit(COMMONS_MAX_FILE_BYTES);
         let commands = if self.config.is_admin(user_id) {
-            "/start, /settings, /forget, /help, /admin"
+            "/start, /status, /settings, /forget, /help, /admin"
         } else {
-            "/start, /settings, /forget, /help"
+            "/start, /status, /settings, /forget, /help"
         };
         let mut text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth2</b> (recommended), <b>OAuth1</b>, or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n\n<b>Limits</b>:\n• Telegram-uploaded files: {max_upload_size}\n• Direct links to Commons-supported files: {commons_link_limit}\n• Image conversions: {image_conversion_limit}\n• Video/audio conversions: {video_audio_conversion_limit}\n• Archives: {archive_limit}\n\n<b>Commands</b>: {commands}\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• Understand where a photo was taken: {RELATED_PHOTO_LOCATION_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSimilar Commons Telegram uploader exists: https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader\nSource: {}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth2</b> (recommended), <b>OAuth1</b>, or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n\n<b>Limits</b>:\n• Telegram-uploaded files: {max_upload_size}\n• Direct links to Commons-supported files: {commons_link_limit}\n• Image conversions: {image_conversion_limit}\n• Video/audio conversions: {video_audio_conversion_limit}\n• Archives: {archive_limit}\n\n<b>Privacy</b>: hosted on <a href=\"https://wikitech.wikimedia.org/wiki/Help:Toolforge\">Wikimedia Toolforge</a>; stores your Telegram user id, Commons username, encrypted credentials, settings, and upload count. Local files are temporary and removed after processing.\n\n<b>Commands</b>: {commands}\n\nMade by {CONTACT} — message me for help or uploading assistance.\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• Understand where a photo was taken: {RELATED_PHOTO_LOCATION_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSimilar Commons Telegram uploader exists: https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader — Python bot by Multichill and Siebrand\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -2717,6 +2808,7 @@ impl Bot {
                         &mut profile,
                         caption.clone(),
                         file.file_name.clone(),
+                        message.message_id,
                         original,
                     )
                     .await;
@@ -2797,6 +2889,7 @@ impl Bot {
                 report_metadata,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👍").await;
                 self.send_success(
                     chat_id,
                     &profile,
@@ -2813,6 +2906,7 @@ impl Bot {
                 .await
             }
             FileResult::Duplicate { titles } => {
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
                 let links = titles
                     .iter()
                     .map(|title| format!("• {}", commons_title_url(title)))
@@ -2824,14 +2918,23 @@ impl Bot {
                 self.telegram.send_message(chat_id, &text, None).await
             }
             FileResult::Rejected { reason } => {
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
                 let text = format!(
                     "❌ {}.\n\nAccepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). HEIC and BMP are converted automatically. DNG handling is configurable in /settings.",
                     escape_html(&reason)
                 );
                 self.telegram.send_message(chat_id, &text, None).await
             }
-            FileResult::Failed { message, html } => {
-                let text = if html { message } else { escape_html(&message) };
+            FileResult::Failed {
+                message: failure_message,
+                html,
+            } => {
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
+                let text = if html {
+                    failure_message
+                } else {
+                    escape_html(&failure_message)
+                };
                 self.telegram.send_message(chat_id, &text, None).await
             }
         }
@@ -2875,6 +2978,7 @@ impl Bot {
                     error = %format!("{error:#}"),
                     "failed to resolve linked file"
                 );
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
                 let text = format!(
                     "❌ Couldn't download that link: {}",
                     escape_html(&format!("{error}"))
@@ -2900,6 +3004,7 @@ impl Bot {
                         &mut profile,
                         caption,
                         linked.file_name,
+                        message.message_id,
                         original,
                     )
                     .await;
@@ -2966,6 +3071,7 @@ impl Bot {
                 report_metadata,
             } => {
                 self.record_successful_uploads(user_id, 1).await.ok();
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👍").await;
                 self.send_success(
                     chat_id,
                     &profile,
@@ -2982,6 +3088,7 @@ impl Bot {
                 .await
             }
             FileResult::Duplicate { titles } => {
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
                 let links = titles
                     .iter()
                     .map(|title| format!("• {}", commons_title_url(title)))
@@ -2993,14 +3100,23 @@ impl Bot {
                 self.telegram.send_message(chat_id, &text, None).await
             }
             FileResult::Rejected { reason } => {
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
                 let text = format!(
                     "❌ {}.\n\nAccepted: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV/MP3/OGG/Opus/FLAC), video (WebM/OGV). HEIC and BMP are converted automatically. DNG handling is configurable in /settings.",
                     escape_html(&reason)
                 );
                 self.telegram.send_message(chat_id, &text, None).await
             }
-            FileResult::Failed { message, html } => {
-                let text = if html { message } else { escape_html(&message) };
+            FileResult::Failed {
+                message: failure_message,
+                html,
+            } => {
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
+                let text = if html {
+                    failure_message
+                } else {
+                    escape_html(&failure_message)
+                };
                 self.telegram.send_message(chat_id, &text, None).await
             }
         }
@@ -3785,6 +3901,7 @@ impl Bot {
             "❌ <code>{}</code> is a generic camera filename that Commons rejects. Send the album again with a caption, or set a filename prefix in /settings.",
             escape_html(sample)
         );
+        react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
         self.telegram.send_message(chat_id, &text, None).await
     }
 
@@ -3869,6 +3986,7 @@ impl Bot {
 #[cfg(feature = "archive")]
 impl Bot {
     /// Expands an archive and either previews it (confirm flow) or uploads every image.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_archive(
         &self,
         chat_id: i64,
@@ -3876,6 +3994,7 @@ impl Bot {
         profile: &mut Profile,
         caption: String,
         file_name: Option<String>,
+        source_message_id: Option<i64>,
         original: Vec<u8>,
     ) -> Result<()> {
         // Evict expired or memory-pressuring staged archives before unpacking another.
@@ -3949,6 +4068,7 @@ impl Bot {
                 caption: caption.clone(),
                 filename_prefix: None,
                 archive_file_name: file_name.clone(),
+                source_message_id,
                 entries,
                 confirm_before_upload: profile.archive_confirm,
                 created_at: now_ts(),
@@ -4024,8 +4144,17 @@ impl Bot {
                 .await;
         }
 
-        self.upload_entries(chat_id, user_id, profile, &caption, None, &[], entries)
-            .await
+        self.upload_entries(
+            chat_id,
+            user_id,
+            source_message_id,
+            profile,
+            &caption,
+            None,
+            &[],
+            entries,
+        )
+        .await
     }
 
     /// Re-prompts for the current user's staged archive prefix, including any archive-name actions.
@@ -4240,6 +4369,7 @@ impl Bot {
             self.config.clone(),
             chat_id,
             user_id,
+            pending.source_message_id,
             caption,
             filename_prefix,
             extra_categories,
@@ -4254,6 +4384,7 @@ impl Bot {
         &self,
         chat_id: i64,
         user_id: i64,
+        source_message_id: Option<i64>,
         profile: &mut Profile,
         caption: &str,
         filename_prefix: Option<&str>,
@@ -4428,6 +4559,14 @@ impl Bot {
             failed,
             "finished archive upload"
         );
+        if let Some(message_id) = source_message_id {
+            let emoji = if uploaded > 0 && failed == 0 && rejected == 0 {
+                "👍"
+            } else {
+                "👎"
+            };
+            set_reaction_best_effort(&self.telegram, chat_id, message_id, emoji).await;
+        }
         self.telegram.send_message(chat_id, &text, None).await
     }
 }
@@ -4439,6 +4578,7 @@ struct PendingArchive {
     caption: String,
     filename_prefix: Option<String>,
     archive_file_name: Option<String>,
+    source_message_id: Option<i64>,
     entries: Vec<crate::archive::ArchiveEntry>,
     confirm_before_upload: bool,
     /// Unix timestamp when staged, for TTL eviction.
@@ -4464,6 +4604,8 @@ struct PendingArchiveManifest {
     filename_prefix: Option<String>,
     #[serde(default)]
     archive_file_name: Option<String>,
+    #[serde(default)]
+    source_message_id: Option<i64>,
     confirm_before_upload: bool,
     created_at: i64,
     entries: Vec<PendingArchiveManifestEntry>,
@@ -4619,6 +4761,7 @@ fn persist_pending_archive(token: &str, pending: &PendingArchive) -> Result<()> 
         caption: pending.caption.clone(),
         filename_prefix: pending.filename_prefix.clone(),
         archive_file_name: pending.archive_file_name.clone(),
+        source_message_id: pending.source_message_id,
         confirm_before_upload: pending.confirm_before_upload,
         created_at: pending.created_at,
         entries: manifest_entries,
@@ -4659,6 +4802,7 @@ fn load_pending_archive(token: &str) -> Result<PendingArchive> {
         caption: manifest.caption,
         filename_prefix: manifest.filename_prefix,
         archive_file_name: manifest.archive_file_name,
+        source_message_id: manifest.source_message_id,
         entries,
         confirm_before_upload: manifest.confirm_before_upload,
         created_at: manifest.created_at,
@@ -6854,6 +6998,59 @@ fn commons_title_url(title: &str) -> String {
     )
 }
 
+/// Returns the Commons account name from a stored username or bot-password username.
+fn commons_account_name(username: &str) -> &str {
+    username.split('@').next().unwrap_or(username).trim()
+}
+
+/// Labels the strongest configured auth method for user-facing status.
+fn auth_method_label(profile: &Profile) -> &'static str {
+    if profile.oauth2_ciphertext.is_some() {
+        "OAuth2"
+    } else if profile.oauth_ciphertext.is_some() {
+        "OAuth1"
+    } else if profile.credential_ciphertext.is_some() {
+        "Bot password"
+    } else {
+        "none"
+    }
+}
+
+/// Formats a non-negative counter with thin grouping for status messages.
+fn format_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+/// Escapes text for a Telegram HTML quoted attribute.
+fn html_attribute(text: &str) -> String {
+    escape_html(text).replace('"', "&quot;")
+}
+
+/// Builds a Commons user-page URL.
+fn commons_user_url(account: &str) -> String {
+    format!(
+        "https://commons.wikimedia.org/wiki/User:{}",
+        account.replace(' ', "_")
+    )
+}
+
+/// Builds a Commons search for files attributed to this account and tracked in this bot category.
+fn commons_bot_uploads_for_user_url(account: &str) -> String {
+    let query = format!("incategory:\"{BOT_CATEGORY}\" insource:\"[[User:{account}\"");
+    format!(
+        "https://commons.wikimedia.org/w/index.php?title=Special:Search&profile=advanced&fulltext=1&ns6=1&search={}",
+        urlencoding::encode(&query)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6954,6 +7151,70 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
+    }
+
+    #[test]
+    fn formats_status_counters_and_links() {
+        assert_eq!(super::format_count(0), "0");
+        assert_eq!(super::format_count(999), "999");
+        assert_eq!(super::format_count(1_234_567), "1,234,567");
+        assert_eq!(
+            super::commons_account_name("Example@BotPassword"),
+            "Example"
+        );
+        assert_eq!(
+            super::commons_account_name(" Example User "),
+            "Example User"
+        );
+        assert_eq!(
+            super::commons_user_url("Example User"),
+            "https://commons.wikimedia.org/wiki/User:Example_User"
+        );
+        assert_eq!(
+            super::html_attribute("A \"B\" & <C>"),
+            "A &quot;B&quot; &amp; &lt;C&gt;"
+        );
+
+        let url = super::commons_bot_uploads_for_user_url("Example User");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("commons.wikimedia.org"));
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "ns6")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "search")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some(
+                format!(
+                    "incategory:\"{}\" insource:\"[[User:Example User\"",
+                    crate::commons::BOT_CATEGORY
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn labels_status_auth_method() {
+        let mut profile = Profile::default();
+        assert_eq!(super::auth_method_label(&profile), "none");
+
+        profile.credential_ciphertext = Some("bot-password".into());
+        assert_eq!(super::auth_method_label(&profile), "Bot password");
+
+        profile.oauth_ciphertext = Some("oauth1".into());
+        assert_eq!(super::auth_method_label(&profile), "OAuth1");
+
+        profile.oauth2_ciphertext = Some("oauth2".into());
+        assert_eq!(super::auth_method_label(&profile), "OAuth2");
     }
 
     #[test]

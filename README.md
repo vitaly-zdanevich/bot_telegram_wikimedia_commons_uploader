@@ -19,7 +19,7 @@ Metadata and tracking links:
 - Wikidata item for this bot: [Q140382791](https://www.wikidata.org/wiki/Q140382791)
 - Commons category tracking uploads by this bot: [Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich](https://commons.wikimedia.org/wiki/Category:Uploaded_with_Telegram_bot_@wikimedia_commons_uploader_bot_by_Vitaly_Zdanevich)
 
-- Similar Commons Telegram uploader exists: [Commons:Telegram Commons Uploader](https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader)
+- Similar Commons Telegram uploader exists: [Commons:Telegram Commons Uploader](https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader) — Python bot by Multichill and Siebrand
 
 ## How it works (for users)
 
@@ -174,6 +174,7 @@ add it to the build `Aptfile`). Archives are disabled on the Lambda build becaus
 ### Commands & settings
 
 - `/start` — connect your account / resume setup
+- `/status` — connected Commons account, auth method, Commons upload count, and uploads through this bot
 - `/help` — usage, your uploads link, related projects, contact
 - `/settings` — license, filename prefix, default categories, DNG handling, and toggles:
   return upload links (**on** by default), return upload metadata — resolution, EXIF camera
@@ -331,6 +332,9 @@ datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
 - Stored credentials (the bot-password token, OAuth1 token+secret, or OAuth2 token set) are **AES-256-GCM
   encrypted** before storage and decrypted only in memory per upload; the bot deletes the
   Telegram message containing a bot password.
+- The bot stores your Telegram user ID, Commons username, encrypted credentials, settings,
+  and aggregate upload count. It does not keep uploaded files after processing. The public
+  instance runs on [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge).
 - The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.
 - Each upload is your own work under your own account, with the attribution category
   `Uploaded with Telegram bot @wikimedia_commons_uploader_bot by Vitaly Zdanevich`.
