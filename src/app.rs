@@ -1322,7 +1322,7 @@ impl Bot {
 
     /// Sends the bot-password username prompt (the bot-password onboarding path).
     async fn send_botpassword_prompt(&self, chat_id: i64) -> Result<()> {
-        let text = "🔑 Create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick <b>Upload new files</b> and <b>Create, edit, and move pages</b> (needed to write each file's page).\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
+        let text = "🔑 Create a <b>Bot Password</b> so you never share your real password:\n1. Open https://commons.wikimedia.org/wiki/Special:BotPasswords\n2. Use a label like <code>telegram</code> and tick these permissions:\n<code>Upload new files</code>\n<code>Create, edit, and move pages</code>\n3. You'll get a username like <code>YourName@telegram</code> and a password.\n\nNow send me your bot-password <b>username</b> (e.g. <code>YourName@telegram</code>).";
         self.telegram.send_message(chat_id, text, None).await
     }
 
