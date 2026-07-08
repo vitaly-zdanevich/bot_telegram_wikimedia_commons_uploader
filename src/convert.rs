@@ -273,11 +273,11 @@ fn develop_dng_with_imagemagick(bytes: &[u8], quality: f32) -> Result<Vec<u8>> {
     bail!("{}", errors.join("; "))
 }
 
-/// Returns the bytes of the largest embedded JPEG that decodes cleanly.
+/// Returns the bytes of the largest embedded JPEG that looks like a usable color preview.
 fn extract_largest_valid_jpeg(bytes: &[u8]) -> Option<&[u8]> {
     jpeg_spans_largest_first(bytes)
         .into_iter()
-        .find(|span| image::load_from_memory_with_format(span, image::ImageFormat::Jpeg).is_ok())
+        .find(|span| embedded_jpeg_is_usable_preview(span))
 }
 
 /// Returns byte ranges that look like complete JPEG streams (SOI...EOI), largest first.
@@ -285,21 +285,14 @@ fn jpeg_spans_largest_first(bytes: &[u8]) -> Vec<&[u8]> {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i + 2 < bytes.len() {
-        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF {
-            let mut end = None;
-            let mut j = i + 2;
-            while j + 1 < bytes.len() {
-                if bytes[j] == 0xFF && bytes[j + 1] == 0xD9 {
-                    end = Some(j + 2);
-                    break;
-                }
-                j += 1;
-            }
-            if let Some(found) = end {
-                spans.push((i, found));
-                i = found;
-                continue;
-            }
+        if bytes[i] == 0xFF
+            && bytes[i + 1] == 0xD8
+            && bytes[i + 2] == 0xFF
+            && let Some(found) = jpeg_span_end(bytes, i)
+        {
+            spans.push((i, found));
+            i = found;
+            continue;
         }
         i += 1;
     }
@@ -308,6 +301,125 @@ fn jpeg_spans_largest_first(bytes: &[u8]) -> Vec<&[u8]> {
         .into_iter()
         .map(|(start, end)| &bytes[start..end])
         .collect()
+}
+
+/// Returns true when an embedded JPEG is a real color preview, not an auxiliary gain map.
+fn embedded_jpeg_is_usable_preview(bytes: &[u8]) -> bool {
+    matches!(jpeg_color_components(bytes), Some(components) if components >= 3)
+        && !contains_ascii_ignore_case(bytes, b"hdrgainmap")
+}
+
+/// Finds the end of a JPEG stream by parsing markers instead of byte-searching for `FF D9`.
+fn jpeg_span_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start..start + 2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut pos = start + 2;
+    while pos < bytes.len() {
+        let marker = next_jpeg_marker(bytes, &mut pos)?;
+        if marker == 0xD9 {
+            return Some(pos);
+        }
+        if marker == 0xDA {
+            let length = read_jpeg_segment_length(bytes, pos)?;
+            pos = pos.checked_add(length)?;
+            return scan_jpeg_entropy_for_eoi(bytes, pos);
+        }
+        if jpeg_marker_has_length(marker) {
+            let length = read_jpeg_segment_length(bytes, pos)?;
+            pos = pos.checked_add(length)?;
+        }
+    }
+    None
+}
+
+/// Returns the JPEG component count from the first Start Of Frame marker.
+fn jpeg_color_components(bytes: &[u8]) -> Option<u8> {
+    if bytes.get(0..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut pos = 2;
+    while pos < bytes.len() {
+        let marker = next_jpeg_marker(bytes, &mut pos)?;
+        if marker == 0xD9 || marker == 0xDA {
+            return None;
+        }
+        if !jpeg_marker_has_length(marker) {
+            continue;
+        }
+        let length = read_jpeg_segment_length(bytes, pos)?;
+        if jpeg_marker_is_sof(marker) {
+            return bytes.get(pos + 7).copied();
+        }
+        pos = pos.checked_add(length)?;
+    }
+    None
+}
+
+/// Moves `pos` past a JPEG marker prefix and returns the marker byte.
+fn next_jpeg_marker(bytes: &[u8], pos: &mut usize) -> Option<u8> {
+    while *pos < bytes.len() && bytes[*pos] != 0xFF {
+        *pos += 1;
+    }
+    while *pos < bytes.len() && bytes[*pos] == 0xFF {
+        *pos += 1;
+    }
+    bytes.get(*pos).copied().inspect(|_| *pos += 1)
+}
+
+/// Reads a JPEG segment length at `pos`, where `pos` points at the two length bytes.
+fn read_jpeg_segment_length(bytes: &[u8], pos: usize) -> Option<usize> {
+    let length = u16::from_be_bytes(bytes.get(pos..pos + 2)?.try_into().ok()?) as usize;
+    if length < 2 || pos.checked_add(length)? > bytes.len() {
+        return None;
+    }
+    Some(length)
+}
+
+/// Scans entropy-coded JPEG data for a real EOI marker.
+fn scan_jpeg_entropy_for_eoi(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    while pos + 1 < bytes.len() {
+        if bytes[pos] != 0xFF {
+            pos += 1;
+            continue;
+        }
+        while pos < bytes.len() && bytes[pos] == 0xFF {
+            pos += 1;
+        }
+        let marker = *bytes.get(pos)?;
+        match marker {
+            0x00 | 0xD0..=0xD7 => pos += 1,
+            0xD9 => return Some(pos + 1),
+            _ if jpeg_marker_has_length(marker) => {
+                pos += 1;
+                let length = read_jpeg_segment_length(bytes, pos)?;
+                pos = pos.checked_add(length)?;
+            }
+            _ => pos += 1,
+        }
+    }
+    None
+}
+
+/// Returns true for JPEG markers followed by a two-byte segment length.
+fn jpeg_marker_has_length(marker: u8) -> bool {
+    !matches!(marker, 0x01 | 0xD0..=0xD9)
+}
+
+/// Returns true for JPEG Start Of Frame markers that carry dimensions/components.
+fn jpeg_marker_is_sof(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+    )
+}
+
+/// ASCII case-insensitive byte search for metadata markers.
+fn contains_ascii_ignore_case(bytes: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && bytes
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// Decodes a HEIC/HEIF image into an sRGB 8-bit buffer via libheif.
@@ -476,6 +588,37 @@ mod tests {
     };
     use crate::models::DngMode;
 
+    fn rgb_jpeg(width: u32, height: u32, color: image::Rgb<u8>) -> Vec<u8> {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(width, height, color))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        jpeg.into_inner()
+    }
+
+    fn noisy_grayscale_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        let image = image::GrayImage::from_fn(width, height, |x, y| {
+            image::Luma([((x.wrapping_mul(31) + y.wrapping_mul(17)) % 256) as u8])
+        });
+        image::DynamicImage::ImageLuma8(image)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        jpeg.into_inner()
+    }
+
+    fn inject_app1_after_soi(jpeg: &[u8], payload: &[u8]) -> Vec<u8> {
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+        let length = u16::try_from(payload.len() + 2).unwrap();
+        let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
     #[test]
     fn classifies_dng() {
         assert_eq!(classify(Some("IMG_1.DNG"), None, &[]), SourceFormat::Dng);
@@ -573,12 +716,50 @@ mod tests {
     #[test]
     fn finds_largest_jpeg_span_first() {
         let mut data = vec![0x49, 0x49]; // TIFF-ish leading bytes
-        data.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0x10, 0xFF, 0xD9]); // small span
-        data.extend_from_slice(&[0xFF, 0xD8, 0xFF, 1, 2, 3, 4, 5, 6, 0xFF, 0xD9]); // larger span
+        let small = rgb_jpeg(1, 1, image::Rgb([255, 0, 0]));
+        let large = rgb_jpeg(128, 128, image::Rgb([0, 0, 255]));
+        data.extend_from_slice(&small);
+        data.extend_from_slice(&large);
         let spans = super::jpeg_spans_largest_first(&data);
         assert_eq!(spans.len(), 2);
         assert!(spans[0].len() > spans[1].len());
-        assert_eq!(&spans[0][0..3], &[0xFF, 0xD8, 0xFF]);
+        assert_eq!(spans[0], large.as_slice());
+        assert_eq!(spans[1], small.as_slice());
+    }
+
+    #[test]
+    fn jpeg_span_parser_ignores_false_eoi_inside_metadata_segment() {
+        let jpeg = rgb_jpeg(4, 4, image::Rgb([255, 0, 0]));
+        let with_false_eoi =
+            inject_app1_after_soi(&jpeg, b"metadata can contain \xff\xd9 before scan data");
+        let mut data = b"II*\0".to_vec();
+        data.extend_from_slice(&with_false_eoi);
+
+        let spans = super::jpeg_spans_largest_first(&data);
+
+        assert_eq!(spans, vec![with_false_eoi.as_slice()]);
+        assert_eq!(super::jpeg_color_components(spans[0]), Some(3));
+    }
+
+    #[test]
+    fn embedded_jpeg_preview_skips_grayscale_auxiliary_gain_map() {
+        let primary = rgb_jpeg(4, 4, image::Rgb([0, 0, 255]));
+        let grayscale_gain_map = inject_app1_after_soi(
+            &noisy_grayscale_jpeg(256, 256),
+            b"urn:com:apple:photo:2020:aux:hdrgainmap",
+        );
+        assert!(grayscale_gain_map.len() > primary.len());
+
+        let mut dng_like = b"II*\0".to_vec();
+        dng_like.extend_from_slice(&primary);
+        dng_like.extend_from_slice(&grayscale_gain_map);
+
+        assert_eq!(
+            super::extract_largest_valid_jpeg(&dng_like),
+            Some(primary.as_slice())
+        );
+        assert!(dng_has_embedded_jpeg(&dng_like));
+        assert!(!dng_has_embedded_jpeg(&grayscale_gain_map));
     }
 
     #[test]
