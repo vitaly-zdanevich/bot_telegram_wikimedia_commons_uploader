@@ -102,6 +102,10 @@ const TEXT_CONTEXT_MATCH_SECONDS: i64 = 60;
 const TEXT_CONTEXT_WAIT_ATTEMPTS: usize = 20;
 /// Delay between adjacent-text context checks.
 const TEXT_CONTEXT_WAIT_MS: u64 = 300;
+/// Maximum number of remembered categories per user profile.
+const MAX_USED_CATEGORIES: usize = 80;
+/// Maximum number of category rows shown in the settings picker.
+const MAX_CATEGORY_PICKER_CATEGORIES: usize = 35;
 /// Recently seen text-only messages keyed by `(chat_id, user_id)`.
 static TEXT_CONTEXTS: Lazy<RwLock<HashMap<(i64, i64), TextContext>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -1965,6 +1969,51 @@ impl Bot {
                 .await;
         }
 
+        if data == "set:categories" {
+            return self
+                .replace_message_text_or_send(
+                    chat_id,
+                    callback_message_id,
+                    &settings_categories_overview(&profile),
+                    Some(settings_categories_keyboard(&profile)),
+                )
+                .await;
+        }
+
+        if data == "set:categories:clear" {
+            profile.default_categories.clear();
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .replace_message_text_or_send(
+                    chat_id,
+                    callback_message_id,
+                    &settings_categories_overview(&profile),
+                    Some(settings_categories_keyboard(&profile)),
+                )
+                .await;
+        }
+
+        if let Some(index) = data.strip_prefix("set:category:") {
+            if let Ok(index) = index.parse::<usize>() {
+                let categories = category_picker_entries(&profile);
+                if let Some(category) = categories.get(index) {
+                    toggle_selected_category(&mut profile, category);
+                    touch(&mut profile);
+                    self.store.put_profile(user_id, &profile).await?;
+                    return self
+                        .replace_message_text_or_send(
+                            chat_id,
+                            callback_message_id,
+                            &settings_categories_overview(&profile),
+                            Some(settings_categories_keyboard(&profile)),
+                        )
+                        .await;
+                }
+            }
+            return Ok(());
+        }
+
         if data == "set:prefix:set" {
             profile.onboarding_step = OnboardingStep::AwaitingSettingsPrefix;
             touch(&mut profile);
@@ -2131,7 +2180,9 @@ impl Bot {
                 self.telegram.send_message(chat_id, &text, None).await
             }
             "categories" => {
-                profile.default_categories = parse_category_list(rest);
+                let categories = parse_category_list(rest);
+                remember_used_categories(&mut profile, &categories);
+                profile.default_categories = categories;
                 touch(&mut profile);
                 self.store.put_profile(user_id, &profile).await?;
                 let text = format!(
@@ -2383,13 +2434,19 @@ impl Bot {
         self.telegram.send_message(chat_id, &text, None).await
     }
 
-    /// Adds successful uploads to the latest profile without overwriting newer settings.
-    async fn record_successful_uploads(&self, user_id: i64, uploaded: u64) -> Result<()> {
-        if uploaded == 0 {
+    /// Adds successful uploads and their categories without overwriting newer settings.
+    async fn record_successful_uploads(
+        &self,
+        user_id: i64,
+        uploaded: u64,
+        categories: &[String],
+    ) -> Result<()> {
+        if uploaded == 0 && categories.is_empty() {
             return Ok(());
         }
         let mut profile = self.store.get_profile(user_id).await;
         profile.uploads_count = profile.uploads_count.saturating_add(uploaded);
+        remember_used_categories(&mut profile, categories);
         touch(&mut profile);
         self.store.put_profile(user_id, &profile).await
     }
@@ -2987,7 +3044,9 @@ impl Bot {
                 processing,
                 report_metadata,
             } => {
-                self.record_successful_uploads(user_id, 1).await.ok();
+                self.record_successful_uploads(user_id, 1, &categories)
+                    .await
+                    .ok();
                 react_to_message_best_effort(&self.telegram, chat_id, message, "👍").await;
                 self.send_success(
                     chat_id,
@@ -3169,7 +3228,9 @@ impl Bot {
                 processing,
                 report_metadata,
             } => {
-                self.record_successful_uploads(user_id, 1).await.ok();
+                self.record_successful_uploads(user_id, 1, &categories)
+                    .await
+                    .ok();
                 react_to_message_best_effort(&self.telegram, chat_id, message, "👍").await;
                 self.send_success(
                     chat_id,
@@ -4521,6 +4582,7 @@ impl Bot {
             "starting archive upload"
         );
         let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
+        let mut uploaded_categories = Vec::new();
         let mut rejected_reasons: Vec<(String, u32)> = Vec::new();
         let mut failed_reasons: Vec<(String, u32)> = Vec::new();
         for (index, entry) in entries.into_iter().enumerate() {
@@ -4557,10 +4619,12 @@ impl Bot {
                 Ok(FileResult::Uploaded {
                     filename,
                     url,
+                    categories,
                     report_metadata,
                     ..
                 }) => {
                     uploaded += 1;
+                    append_unique_categories(&mut uploaded_categories, &categories);
                     if profile.return_upload_links {
                         let mut text = format_upload_success_intro(
                             &format!("Uploaded {member_index}/{entry_count}"),
@@ -4631,7 +4695,7 @@ impl Bot {
                 }
             }
         }
-        self.record_successful_uploads(user_id, uploaded.into())
+        self.record_successful_uploads(user_id, uploaded.into(), &uploaded_categories)
             .await
             .ok();
 
@@ -5190,6 +5254,28 @@ fn upload_categories(
     merge_categories(&explicit_categories, default_categories)
 }
 
+/// Appends categories to a list without duplicates, preserving order.
+fn append_unique_categories(target: &mut Vec<String>, categories: &[String]) {
+    for category in categories {
+        if !category.is_empty() && !target.contains(category) {
+            target.push(category.clone());
+        }
+    }
+}
+
+/// Remembers categories from accepted uploads so they can be selected in settings later.
+fn remember_used_categories(profile: &mut Profile, categories: &[String]) {
+    for category in categories.iter().rev() {
+        let category = crate::commons::sanitize_title(category);
+        if category.is_empty() {
+            continue;
+        }
+        profile.used_categories.retain(|stored| stored != &category);
+        profile.used_categories.insert(0, category);
+    }
+    profile.used_categories.truncate(MAX_USED_CATEGORIES);
+}
+
 /// Parses a comma-separated category list from a settings command.
 fn parse_category_list(value: &str) -> Vec<String> {
     value
@@ -5235,7 +5321,7 @@ fn settings_overview(profile: &Profile) -> String {
         profile.default_categories.join(", ")
     };
     let mut text = format!(
-        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nStored accounts: <b>{}</b>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn upload metadata: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
+        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nStored accounts: <b>{}</b>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nCategories for uploading: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn upload metadata: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
         escape_html(&account),
         stored_account_count(profile),
         escape_html(profile.license.label()),
@@ -5256,7 +5342,7 @@ fn settings_overview(profile: &Profile) -> String {
         ));
     }
     text.push_str(
-        "\n\nButtons below toggle options; Commons account, Filename prefix, and License open submenus.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
+        "\n\nButtons below toggle options; Commons account, Filename prefix, Categories for uploading, and License open submenus.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
     );
     text
 }
@@ -5286,6 +5372,7 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
         )],
         vec![settings_account_button(profile)],
         vec![settings_prefix_button(profile)],
+        vec![settings_categories_button(profile)],
         vec![dng_mode_button(profile.dng_mode)],
     ];
     #[cfg(feature = "archive")]
@@ -5492,6 +5579,103 @@ fn settings_prefix_input_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
                 url: None,
             }],
         ],
+    }
+}
+
+/// Builds the settings entry point for selecting categories used on future uploads.
+fn settings_categories_button(profile: &Profile) -> InlineKeyboardButton {
+    let value = match profile.default_categories.len() {
+        0 => "(none)".to_string(),
+        1 => compact_button_value(&profile.default_categories[0]),
+        count => format!("{count} selected"),
+    };
+    InlineKeyboardButton {
+        text: format!("Categories for uploading: {value}"),
+        callback_data: Some("set:categories".to_string()),
+        url: None,
+    }
+}
+
+/// Text shown above the category multi-select keyboard.
+fn settings_categories_overview(profile: &Profile) -> String {
+    let selected = if profile.default_categories.is_empty() {
+        "(none)".to_string()
+    } else {
+        profile.default_categories.join(", ")
+    };
+    let remembered = profile.used_categories.len();
+    format!(
+        "🏷 <b>Categories for uploading</b>\nSelected: <code>{}</code>\nRemembered categories: <b>{}</b>\n\nTap categories to select or unselect them. Selected categories are added to future uploads unless a caption supplies its own categories too.",
+        escape_html(&selected),
+        remembered
+    )
+}
+
+/// Builds the multi-select keyboard for remembered upload categories.
+fn settings_categories_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    let categories = category_picker_entries(profile);
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| {
+            let selected = if profile.default_categories.contains(category) {
+                "✅ "
+            } else {
+                ""
+            };
+            vec![InlineKeyboardButton {
+                text: format!("{selected}{}", compact_button_value(category)),
+                callback_data: Some(format!("set:category:{index}")),
+                url: None,
+            }]
+        })
+        .collect();
+    if rows.is_empty() {
+        rows.push(vec![InlineKeyboardButton {
+            text: "No remembered categories yet".to_string(),
+            callback_data: Some("set:categories".to_string()),
+            url: None,
+        }]);
+    }
+    rows.push(vec![InlineKeyboardButton {
+        text: if profile.default_categories.is_empty() {
+            "Select none (already none)"
+        } else {
+            "Select none"
+        }
+        .to_string(),
+        callback_data: Some("set:categories:clear".to_string()),
+        url: None,
+    }]);
+    rows.push(vec![InlineKeyboardButton {
+        text: "← Back to settings".to_string(),
+        callback_data: Some("set:main".to_string()),
+        url: None,
+    }]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+/// Returns selected and remembered categories in picker order, bounded for Telegram keyboards.
+fn category_picker_entries(profile: &Profile) -> Vec<String> {
+    let mut entries = Vec::new();
+    append_unique_categories(&mut entries, &profile.default_categories);
+    append_unique_categories(&mut entries, &profile.used_categories);
+    entries.truncate(MAX_CATEGORY_PICKER_CATEGORIES);
+    entries
+}
+
+/// Selects or unselects one upload category.
+fn toggle_selected_category(profile: &mut Profile, category: &str) {
+    if let Some(index) = profile
+        .default_categories
+        .iter()
+        .position(|selected| selected == category)
+    {
+        profile.default_categories.remove(index);
+    } else {
+        profile.default_categories.push(category.to_string());
     }
 }
 

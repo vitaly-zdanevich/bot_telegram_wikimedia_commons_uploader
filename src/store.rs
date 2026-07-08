@@ -412,6 +412,7 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
         "filename_prefix": {"S": profile.filename_prefix},
         "onboarding_step": {"S": profile.onboarding_step.as_str()},
         "default_categories": {"L": profile.default_categories.iter().map(|category| json!({"S": category})).collect::<Vec<_>>()},
+        "used_categories": {"L": profile.used_categories.iter().map(|category| json!({"S": category})).collect::<Vec<_>>()},
         "return_upload_links": {"BOOL": profile.return_upload_links},
         "return_category_links": {"BOOL": profile.return_category_links},
         "return_missing_category_links": {"BOOL": profile.return_missing_category_links},
@@ -475,6 +476,7 @@ fn item_to_profile(item: &Value) -> Profile {
             .and_then(|value| OnboardingStep::parse(&value))
             .unwrap_or_default(),
         default_categories: attr_string_list(item, "default_categories"),
+        used_categories: attr_string_list(item, "used_categories"),
         default_author: attr_string(item, "default_author"),
         default_description: attr_string(item, "default_description"),
         default_lang: attr_string(item, "default_lang"),
@@ -553,6 +555,7 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             filename_prefix TEXT NOT NULL DEFAULT '',
             onboarding_step TEXT NOT NULL DEFAULT 'awaiting_username',
             default_categories TEXT NOT NULL DEFAULT '[]',
+            used_categories TEXT NOT NULL DEFAULT '[]',
             return_upload_links INTEGER NOT NULL DEFAULT 1,
             return_category_links INTEGER NOT NULL DEFAULT 0,
             return_missing_category_links INTEGER NOT NULL DEFAULT 0,
@@ -612,6 +615,12 @@ fn run_sqlite_migrations(connection: &mut rusqlite::Connection) -> Result<()> {
     if !columns.iter().any(|column| column == "oauth2_ciphertext") {
         transaction.execute("ALTER TABLE profiles ADD COLUMN oauth2_ciphertext TEXT", [])?;
     }
+    if !columns.iter().any(|column| column == "used_categories") {
+        transaction.execute(
+            "ALTER TABLE profiles ADD COLUMN used_categories TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES ('return_upload_links_default_on', strftime('%s', 'now'))",
         [],
@@ -631,11 +640,12 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext, accounts_json, active_account_id FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext, accounts_json, active_account_id, used_categories FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
             let accounts_json: String = row.get(23)?;
+            let used_categories: String = row.get(25)?;
             Ok(Profile {
                 commons_username: row.get(0)?,
                 credential_ciphertext: row.get(1)?,
@@ -648,6 +658,7 @@ fn sqlite_load_profile(
                 filename_prefix: row.get(3)?,
                 onboarding_step: OnboardingStep::parse(&row.get::<_, String>(4)?).unwrap_or_default(),
                 default_categories: serde_json::from_str(&categories).unwrap_or_default(),
+                used_categories: serde_json::from_str(&used_categories).unwrap_or_default(),
                 return_upload_links: row.get::<_, i64>(6)? != 0,
                 return_category_links: row.get::<_, i64>(7)? != 0,
                 return_missing_category_links: row.get::<_, i64>(8)? != 0,
@@ -681,9 +692,11 @@ fn sqlite_put_profile(
 ) -> Result<()> {
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
+    let used_categories =
+        serde_json::to_string(&profile.used_categories).unwrap_or_else(|_| "[]".into());
     let accounts = serde_json::to_string(&profile.accounts).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext, accounts_json, active_account_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext, accounts_json, active_account_id, used_categories) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -711,6 +724,7 @@ fn sqlite_put_profile(
             profile.oauth2_ciphertext,
             accounts,
             profile.active_account_id,
+            used_categories,
         ],
     )?;
     Ok(())
@@ -843,6 +857,7 @@ mod tests {
             filename_prefix: "Minsk trip".into(),
             onboarding_step: OnboardingStep::Done,
             default_categories: vec!["Minsk".into(), "Belarus".into()],
+            used_categories: vec!["Minsk".into(), "Architecture".into()],
             default_author: Some("Jane Doe".into()),
             default_description: Some("A trip".into()),
             default_lang: Some("en".into()),
@@ -984,6 +999,7 @@ mod tests {
             filename_prefix: "Trip".into(),
             onboarding_step: OnboardingStep::Done,
             default_categories: vec!["Minsk".into()],
+            used_categories: vec!["Minsk".into(), "Churches".into()],
             default_author: Some("Jane".into()),
             default_description: Some("Trip".into()),
             default_lang: None,

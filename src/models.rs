@@ -261,6 +261,8 @@ pub struct Profile {
     pub onboarding_step: OnboardingStep,
     /// Categories added to every upload (user-configured default).
     pub default_categories: Vec<String>,
+    /// Categories previously used in successful uploads, shown as quick picks in settings.
+    pub used_categories: Vec<String>,
     /// Default author override applied when an upload's caption sets none.
     pub default_author: Option<String>,
     /// Default description used when an upload has no caption text.
@@ -305,6 +307,7 @@ impl Default for Profile {
             filename_prefix: String::new(),
             onboarding_step: OnboardingStep::default(),
             default_categories: Vec::new(),
+            used_categories: Vec::new(),
             default_author: None,
             default_description: None,
             default_lang: None,
