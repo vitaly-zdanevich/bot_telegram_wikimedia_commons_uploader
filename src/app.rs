@@ -1926,11 +1926,12 @@ impl Bot {
             };
             profile.license = license;
             if profile.onboarding_step == OnboardingStep::AwaitingLicense {
-                profile.onboarding_step = OnboardingStep::AwaitingPrefix;
+                profile.onboarding_step = OnboardingStep::Done;
                 touch(&mut profile);
                 self.store.put_profile(user_id, &profile).await?;
                 return self
-                    .prompt_step(chat_id, OnboardingStep::AwaitingPrefix)
+                    .telegram
+                    .send_message(chat_id, ONBOARDING_DONE_MSG, None)
                     .await;
             }
             touch(&mut profile);
