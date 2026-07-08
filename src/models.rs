@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 /// Creative Commons license a user can pick for their uploads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -194,6 +195,47 @@ impl OnboardingStep {
     }
 }
 
+/// One connected Wikimedia Commons account that can be selected for uploads.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CommonsAccount {
+    /// Stable short id used in Telegram callback data.
+    pub id: String,
+    /// Commons username, or bot-password username (`User@label`) for bot-password auth.
+    pub commons_username: Option<String>,
+    /// AES-GCM ciphertext (base64) of the bot-password token.
+    pub credential_ciphertext: Option<String>,
+    /// AES-GCM ciphertext of the OAuth 1.0a access token+secret (`token\nsecret`).
+    pub oauth_ciphertext: Option<String>,
+    /// AES-GCM ciphertext of OAuth2 access/refresh tokens as JSON.
+    pub oauth2_ciphertext: Option<String>,
+    /// Unix timestamp of account creation in this bot.
+    pub created_at: i64,
+    /// Unix timestamp of the last credential update.
+    pub updated_at: i64,
+}
+
+impl CommonsAccount {
+    /// Returns true when this account has enough encrypted credential material to authenticate.
+    pub fn has_credentials(&self) -> bool {
+        self.oauth2_ciphertext.is_some()
+            || self.oauth_ciphertext.is_some()
+            || (self.commons_username.is_some() && self.credential_ciphertext.is_some())
+    }
+
+    /// Labels the stored authentication method for account switcher buttons.
+    pub fn auth_method_label(&self) -> &'static str {
+        if self.oauth2_ciphertext.is_some() {
+            "OAuth2"
+        } else if self.oauth_ciphertext.is_some() {
+            "OAuth1"
+        } else if self.credential_ciphertext.is_some() {
+            "Bot password"
+        } else {
+            "none"
+        }
+    }
+}
+
 /// One user's stored profile (one DynamoDB item per Telegram user).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Profile {
@@ -207,6 +249,10 @@ pub struct Profile {
     pub oauth_pending_ciphertext: Option<String>,
     /// AES-GCM ciphertext of OAuth2 access/refresh tokens as JSON.
     pub oauth2_ciphertext: Option<String>,
+    /// Stored Commons accounts available for quick switching.
+    pub accounts: Vec<CommonsAccount>,
+    /// Id of the account copied into the active credential fields.
+    pub active_account_id: Option<String>,
     /// License applied to uploads.
     pub license: License,
     /// Prefix prepended to generated Commons filenames.
@@ -253,6 +299,8 @@ impl Default for Profile {
             oauth_ciphertext: None,
             oauth_pending_ciphertext: None,
             oauth2_ciphertext: None,
+            accounts: Vec::new(),
+            active_account_id: None,
             license: License::default(),
             filename_prefix: String::new(),
             onboarding_step: OnboardingStep::default(),
@@ -284,6 +332,118 @@ impl Profile {
                 || self.oauth_ciphertext.is_some()
                 || (self.commons_username.is_some() && self.credential_ciphertext.is_some()))
     }
+
+    /// Returns true when the active credential fields contain usable auth material.
+    pub fn has_active_credentials(&self) -> bool {
+        self.oauth2_ciphertext.is_some()
+            || self.oauth_ciphertext.is_some()
+            || (self.commons_username.is_some() && self.credential_ciphertext.is_some())
+    }
+
+    /// Removes active credential material while leaving stored accounts and selection untouched.
+    ///
+    /// Keeping the selected account id lets callers restore the previous account if a new
+    /// account connection is cancelled before credentials are completed.
+    pub fn clear_active_credentials(&mut self) {
+        self.commons_username = None;
+        self.credential_ciphertext = None;
+        self.oauth_ciphertext = None;
+        self.oauth_pending_ciphertext = None;
+        self.oauth2_ciphertext = None;
+    }
+
+    /// Adds or updates the active credential set in the stored account list.
+    pub fn upsert_active_account(&mut self, now: i64) -> bool {
+        if !self.has_active_credentials() {
+            return false;
+        }
+        let Some(id) = self.active_account_id.clone().or_else(|| {
+            active_account_id(
+                self.commons_username.as_deref(),
+                self.credential_ciphertext.as_deref(),
+                self.oauth_ciphertext.as_deref(),
+                self.oauth2_ciphertext.as_deref(),
+            )
+        }) else {
+            return false;
+        };
+        let account = CommonsAccount {
+            id: id.clone(),
+            commons_username: self.commons_username.clone(),
+            credential_ciphertext: self.credential_ciphertext.clone(),
+            oauth_ciphertext: self.oauth_ciphertext.clone(),
+            oauth2_ciphertext: self.oauth2_ciphertext.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.active_account_id = Some(id.clone());
+        if let Some(existing) = self.accounts.iter_mut().find(|account| account.id == id) {
+            let created_at = existing.created_at;
+            *existing = CommonsAccount {
+                created_at,
+                ..account
+            };
+            true
+        } else {
+            self.accounts.push(account);
+            true
+        }
+    }
+
+    /// Copies one stored account into the active credential fields.
+    pub fn switch_account(&mut self, account_id: &str) -> bool {
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id && account.has_credentials())
+            .cloned()
+        else {
+            return false;
+        };
+        self.commons_username = account.commons_username;
+        self.credential_ciphertext = account.credential_ciphertext;
+        self.oauth_ciphertext = account.oauth_ciphertext;
+        self.oauth2_ciphertext = account.oauth2_ciphertext;
+        self.oauth_pending_ciphertext = None;
+        self.active_account_id = Some(account.id);
+        true
+    }
+
+    /// Restores the selected stored account into the active credential fields.
+    pub fn restore_active_account(&mut self) -> bool {
+        let Some(id) = self.active_account_id.clone() else {
+            return false;
+        };
+        self.switch_account(&id)
+    }
+
+    /// Returns the stored account currently selected for uploads, if present.
+    pub fn active_account(&self) -> Option<&CommonsAccount> {
+        let id = self.active_account_id.as_deref()?;
+        self.accounts.iter().find(|account| account.id == id)
+    }
+}
+
+/// Builds a stable account id from a username when possible, otherwise from credentials.
+fn active_account_id(
+    username: Option<&str>,
+    bot_password_ciphertext: Option<&str>,
+    oauth_ciphertext: Option<&str>,
+    oauth2_ciphertext: Option<&str>,
+) -> Option<String> {
+    let source = username
+        .and_then(|value| {
+            let account = value.split('@').next().unwrap_or(value).trim();
+            (!account.is_empty()).then(|| format!("user:{}", account.to_ascii_lowercase()))
+        })
+        .or_else(|| oauth2_ciphertext.map(|value| format!("oauth2:{value}")))
+        .or_else(|| oauth_ciphertext.map(|value| format!("oauth1:{value}")))
+        .or_else(|| bot_password_ciphertext.map(|value| format!("botpass:{value}")))?;
+    let digest = Sha1::digest(source.as_bytes());
+    Some(format!(
+        "acct{:016x}",
+        u64::from_be_bytes(digest[..8].try_into().ok()?)
+    ))
 }
 
 /// Provenance of an upload, recorded on the Commons file page.
@@ -545,6 +705,38 @@ mod tests {
         profile.commons_username = Some("Example@uploader".into());
         profile.credential_ciphertext = Some("ciphertext".into());
         assert!(profile.is_ready());
+    }
+
+    #[test]
+    fn profile_stores_and_switches_multiple_accounts() {
+        let mut profile = Profile {
+            commons_username: Some("Example@bot".into()),
+            credential_ciphertext: Some("bot-secret".into()),
+            onboarding_step: OnboardingStep::Done,
+            ..Profile::default()
+        };
+
+        assert!(profile.upsert_active_account(10));
+        let first_id = profile.active_account_id.clone().unwrap();
+        assert_eq!(profile.accounts.len(), 1);
+        assert_eq!(
+            profile.active_account().unwrap().auth_method_label(),
+            "Bot password"
+        );
+
+        profile.active_account_id = None;
+        profile.commons_username = Some("Second".into());
+        profile.credential_ciphertext = None;
+        profile.oauth2_ciphertext = Some("oauth2-secret".into());
+        assert!(profile.upsert_active_account(20));
+        let second_id = profile.active_account_id.clone().unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(profile.accounts.len(), 2);
+
+        assert!(profile.switch_account(&first_id));
+        assert_eq!(profile.commons_username.as_deref(), Some("Example@bot"));
+        assert_eq!(profile.credential_ciphertext.as_deref(), Some("bot-secret"));
+        assert_eq!(profile.oauth2_ciphertext, None);
     }
 
     #[test]

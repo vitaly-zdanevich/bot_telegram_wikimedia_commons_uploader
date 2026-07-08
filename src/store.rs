@@ -1,6 +1,6 @@
 use crate::aws::AwsJsonClient;
 use crate::config::Config;
-use crate::models::{DngMode, License, OnboardingStep, Profile};
+use crate::models::{CommonsAccount, DngMode, License, OnboardingStep, Profile};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde_json::{Value, json};
@@ -82,7 +82,8 @@ impl Store {
         if let Some(cached) = PROFILE_CACHE.read().await.get(&user_id).cloned() {
             return cached;
         }
-        let loaded = self.load_profile(user_id).await.unwrap_or_default();
+        let mut loaded = self.load_profile(user_id).await.unwrap_or_default();
+        loaded.upsert_active_account(now());
         PROFILE_CACHE.write().await.insert(user_id, loaded.clone());
         loaded
     }
@@ -114,6 +115,8 @@ impl Store {
 
     /// Saves a user profile and refreshes the RAM cache.
     pub async fn put_profile(&self, user_id: i64, profile: &Profile) -> Result<()> {
+        let mut profile = profile.clone();
+        profile.upsert_active_account(now());
         PROFILE_CACHE.write().await.insert(user_id, profile.clone());
         match &self.backend {
             Backend::Memory => Ok(()),
@@ -121,13 +124,13 @@ impl Store {
                 aws.post_json(
                     "dynamodb",
                     "DynamoDB_20120810.PutItem",
-                    json!({"TableName": table, "Item": profile_to_item(user_id, profile)}),
+                    json!({"TableName": table, "Item": profile_to_item(user_id, &profile)}),
                 )
                 .await?;
                 Ok(())
             }
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(connection) => sqlite_put_profile(connection, user_id, profile),
+            Backend::Sqlite(connection) => sqlite_put_profile(connection, user_id, &profile),
         }
     }
 
@@ -416,10 +419,14 @@ fn profile_to_item(user_id: i64, profile: &Profile) -> Value {
         "return_archive_file_list": {"BOOL": profile.return_archive_file_list},
         "archive_confirm": {"BOOL": profile.archive_confirm},
         "dng_mode": {"S": profile.dng_mode.as_key()},
+        "accounts_json": {"S": serde_json::to_string(&profile.accounts).unwrap_or_else(|_| "[]".into())},
         "uploads_count": {"N": profile.uploads_count.to_string()},
         "created_at": {"N": profile.created_at.to_string()},
         "updated_at": {"N": profile.updated_at.to_string()},
     });
+    if let Some(account_id) = &profile.active_account_id {
+        item["active_account_id"] = json!({"S": account_id});
+    }
     if let Some(username) = &profile.commons_username {
         item["commons_username"] = json!({"S": username});
     }
@@ -458,6 +465,8 @@ fn item_to_profile(item: &Value) -> Profile {
         oauth_ciphertext: attr_string(item, "oauth_ciphertext"),
         oauth_pending_ciphertext: attr_string(item, "oauth_pending_ciphertext"),
         oauth2_ciphertext: attr_string(item, "oauth2_ciphertext"),
+        accounts: attr_accounts(item),
+        active_account_id: attr_string(item, "active_account_id"),
         license: attr_string(item, "license")
             .and_then(|value| License::parse(&value))
             .unwrap_or_default(),
@@ -517,6 +526,13 @@ fn attr_string_list(item: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Reads stored Commons accounts from a DynamoDB JSON string attribute.
+fn attr_accounts(item: &Value) -> Vec<CommonsAccount> {
+    attr_string(item, "accounts_json")
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
 /// Opens (and migrates) the SQLite database.
 #[cfg(feature = "sqlite")]
 fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
@@ -544,6 +560,8 @@ fn open_sqlite(path: &str) -> Result<rusqlite::Connection> {
             return_archive_file_list INTEGER NOT NULL DEFAULT 0,
             archive_confirm INTEGER NOT NULL DEFAULT 1,
             dng_mode TEXT NOT NULL DEFAULT 'convert-to-webp',
+            accounts_json TEXT NOT NULL DEFAULT '[]',
+            active_account_id TEXT,
             uploads_count INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
@@ -613,16 +631,19 @@ fn sqlite_load_profile(
 ) -> Result<Profile> {
     let connection = connection.lock().expect("sqlite mutex poisoned");
     let result = connection.query_row(
-        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext FROM profiles WHERE user_id = ?1",
+        "SELECT commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext, accounts_json, active_account_id FROM profiles WHERE user_id = ?1",
         rusqlite::params![user_id],
         |row| {
             let categories: String = row.get(5)?;
+            let accounts_json: String = row.get(23)?;
             Ok(Profile {
                 commons_username: row.get(0)?,
                 credential_ciphertext: row.get(1)?,
                 oauth_ciphertext: row.get(18)?,
                 oauth_pending_ciphertext: row.get(19)?,
                 oauth2_ciphertext: row.get(22)?,
+                accounts: serde_json::from_str(&accounts_json).unwrap_or_default(),
+                active_account_id: row.get(24)?,
                 license: License::parse(&row.get::<_, String>(2)?).unwrap_or_default(),
                 filename_prefix: row.get(3)?,
                 onboarding_step: OnboardingStep::parse(&row.get::<_, String>(4)?).unwrap_or_default(),
@@ -660,8 +681,9 @@ fn sqlite_put_profile(
 ) -> Result<()> {
     let categories =
         serde_json::to_string(&profile.default_categories).unwrap_or_else(|_| "[]".into());
+    let accounts = serde_json::to_string(&profile.accounts).unwrap_or_else(|_| "[]".into());
     connection.lock().expect("sqlite mutex poisoned").execute(
-        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        "INSERT OR REPLACE INTO profiles (user_id, commons_username, credential_ciphertext, license, filename_prefix, onboarding_step, default_categories, return_upload_links, return_category_links, return_missing_category_links, uploads_count, created_at, updated_at, default_author, default_description, default_lang, license_override, return_archive_file_list, archive_confirm, oauth_ciphertext, oauth_pending_ciphertext, dng_mode, return_upload_metadata, oauth2_ciphertext, accounts_json, active_account_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         rusqlite::params![
             user_id,
             profile.commons_username,
@@ -687,6 +709,8 @@ fn sqlite_put_profile(
             profile.dng_mode.as_key(),
             profile.return_upload_metadata as i64,
             profile.oauth2_ciphertext,
+            accounts,
+            profile.active_account_id,
         ],
     )?;
     Ok(())
@@ -795,7 +819,7 @@ mod tests {
         IDEMPOTENCY_RAM, is_conditional_check_failed, item_to_profile, profile_to_item,
         reserve_in_ram,
     };
-    use crate::models::{DngMode, License, OnboardingStep, Profile};
+    use crate::models::{CommonsAccount, DngMode, License, OnboardingStep, Profile};
 
     #[test]
     fn profile_round_trips_through_dynamodb_json() {
@@ -805,6 +829,16 @@ mod tests {
             oauth_ciphertext: Some("oauthct".into()),
             oauth_pending_ciphertext: None,
             oauth2_ciphertext: Some("oauth2ct".into()),
+            accounts: vec![CommonsAccount {
+                id: "acct-example".into(),
+                commons_username: Some("Example@uploader".into()),
+                credential_ciphertext: Some("base64ciphertext".into()),
+                oauth_ciphertext: None,
+                oauth2_ciphertext: None,
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_500,
+            }],
+            active_account_id: Some("acct-example".into()),
             license: License::Cc0,
             filename_prefix: "Minsk trip".into(),
             onboarding_step: OnboardingStep::Done,
@@ -936,6 +970,16 @@ mod tests {
             oauth_ciphertext: None,
             oauth_pending_ciphertext: Some("pendingct".into()),
             oauth2_ciphertext: Some("oauth2ct".into()),
+            accounts: vec![CommonsAccount {
+                id: "acct-example".into(),
+                commons_username: Some("Example@uploader".into()),
+                credential_ciphertext: Some("ct".into()),
+                oauth_ciphertext: None,
+                oauth2_ciphertext: None,
+                created_at: 1,
+                updated_at: 2,
+            }],
+            active_account_id: Some("acct-example".into()),
             license: License::CcBySa40,
             filename_prefix: "Trip".into(),
             onboarding_step: OnboardingStep::Done,

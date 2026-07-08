@@ -34,6 +34,9 @@ Metadata and tracking links:
    PD-Russia-expired, PD-Russia, or PD-RusEmpire) and an optional **filename prefix**.
 4. Send a photo or file. It is uploaded to Commons with a generated `{{Information}}`
    page, license, categories, geotag, provenance, and Structured Data on Commons statements.
+5. To use another Commons account, run `/start add` or open `/settings` → **Commons
+   account**. The bot stores multiple encrypted credential sets and uploads with the
+   currently selected account.
 
 ### Captions
 
@@ -173,10 +176,10 @@ add it to the build `Aptfile`). Archives are disabled on the Lambda build becaus
 
 ### Commands & settings
 
-- `/start` — connect your account / resume setup
-- `/status` — connected Commons account, auth method, Commons upload count, and uploads through this bot
+- `/start` — connect your account / resume setup; `/start add` adds another Commons account
+- `/status` — active Commons account, auth method, stored account count, Commons upload count, and uploads through this bot
 - `/help` — usage, your uploads link, related projects, contact
-- `/settings` — license, filename prefix, default categories, DNG handling, and toggles:
+- `/settings` — active Commons account switcher, license, filename prefix, default categories, DNG handling, and toggles:
   return upload links (**on** by default), return upload metadata — resolution, EXIF camera
   model, and EXIF date (**on**), return category links (**off**), return non-existing category
   links (**off**).
@@ -329,10 +332,11 @@ datacenter. Lambda defaults to 3008 MB and the maximum 900 s (15 min) timeout.
     verification code. Set `OAUTH_CONSUMER_KEY` / `OAUTH_CONSUMER_SECRET` to enable it.
   - **Bot password** — a **scoped** [Bot Password](https://commons.wikimedia.org/wiki/Special:BotPasswords)
     (grants: “Upload new files” + “Create, edit, and move pages”), revocable any time.
-- Stored credentials (the bot-password token, OAuth1 token+secret, or OAuth2 token set) are **AES-256-GCM
-  encrypted** before storage and decrypted only in memory per upload; the bot deletes the
-  Telegram message containing a bot password.
-- The bot stores your Telegram user ID, Commons username, encrypted credentials, settings,
+- Stored credentials (bot-password tokens, OAuth1 token+secret pairs, or OAuth2 token sets) are **AES-256-GCM
+  encrypted** before storage and decrypted only in memory per upload; the bot can store
+  multiple Commons accounts and marks one as active. It deletes the Telegram message
+  containing a bot password.
+- The bot stores your Telegram user ID, Commons usernames, encrypted credentials, settings,
   and aggregate upload count. It does not keep uploaded files after processing. The public
   instance runs on [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge).
 - The webhook is protected by a secret header; IAM is scoped to the one DynamoDB table.

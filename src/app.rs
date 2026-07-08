@@ -8,7 +8,8 @@ use crate::convert;
 use crate::crypto::Cipher;
 use crate::metadata;
 use crate::models::{
-    CallbackQuery, DngMode, License, Message, OnboardingStep, Profile, Update, UploadProvenance,
+    CallbackQuery, CommonsAccount, DngMode, License, Message, OnboardingStep, Profile, Update,
+    UploadProvenance,
 };
 use crate::oauth::{Consumer, OAuthClient, OAuthEndpoints};
 use crate::oauth2::{OAuth2Client, OAuth2Consumer, OAuth2Endpoints, OAuth2Token};
@@ -1184,7 +1185,7 @@ impl Bot {
         let argument = parts.next().unwrap_or("").trim();
         let command = command.split('@').next().unwrap_or(command);
         match command {
-            "/start" => self.cmd_start(chat_id, user_id).await,
+            "/start" => self.cmd_start(chat_id, user_id, argument).await,
             "/help" => self.send_help(chat_id, user_id).await,
             "/status" => self.cmd_status(chat_id, user_id).await,
             "/admin" => self.cmd_admin(chat_id, user_id).await,
@@ -1203,17 +1204,38 @@ impl Bot {
     }
 
     /// Starts or resumes onboarding, or shows status when already configured.
-    async fn cmd_start(&self, chat_id: i64, user_id: i64) -> Result<()> {
+    async fn cmd_start(&self, chat_id: i64, user_id: i64, argument: &str) -> Result<()> {
+        if matches!(argument, "add" | "connect" | "account" | "accounts") {
+            return self.begin_account_connection(chat_id, user_id).await;
+        }
         let mut profile = self.store.get_profile(user_id).await;
         if profile.is_ready() {
-            let account = profile.commons_username.clone().unwrap_or_default();
+            let account = active_account_label(&profile);
             let text = format!(
-                "✅ You're set up as <code>{}</code>.\n\nSend me a photo or file to upload it to Wikimedia Commons. Use /settings to change options, /forget to remove your credentials, or /help.",
-                escape_html(&account)
+                "✅ You're set up as <code>{}</code>.\nStored Commons accounts: <b>{}</b>\n\nSend me a photo or file to upload it to Wikimedia Commons.",
+                escape_html(&account),
+                stored_account_count(&profile),
             );
-            return self.telegram.send_message(chat_id, &text, None).await;
+            return self
+                .telegram
+                .send_message(chat_id, &text, Some(account_management_keyboard(&profile)))
+                .await;
         }
         if profile.onboarding_step == OnboardingStep::Done {
+            if profile.restore_active_account() {
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+                let text = format!(
+                    "✅ You're set up as <code>{}</code>.\nStored Commons accounts: <b>{}</b>\n\nSend me a photo or file to upload it to Wikimedia Commons.",
+                    escape_html(&active_account_label(&profile)),
+                    stored_account_count(&profile),
+                );
+                return self
+                    .telegram
+                    .send_message(chat_id, &text, Some(account_management_keyboard(&profile)))
+                    .await;
+            }
             profile.onboarding_step = OnboardingStep::AwaitingUsername;
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
@@ -1223,6 +1245,18 @@ impl Bot {
             return self.prompt_current_archive_prefix(chat_id, user_id).await;
         }
         self.prompt_step(chat_id, profile.onboarding_step).await
+    }
+
+    /// Starts adding or reconnecting a Commons account without deleting stored accounts.
+    async fn begin_account_connection(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        let mut profile = self.store.get_profile(user_id).await;
+        profile.upsert_active_account(now_ts());
+        profile.clear_active_credentials();
+        profile.onboarding_step = OnboardingStep::AwaitingUsername;
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await?;
+        self.prompt_step(chat_id, OnboardingStep::AwaitingUsername)
+            .await
     }
 
     /// Sends the prompt for the current onboarding step.
@@ -1373,6 +1407,7 @@ impl Bot {
             .await
             .context("failed to identify OAuth2 user")?;
         let mut profile = self.store.get_profile(state.user_id).await;
+        profile.active_account_id = None;
         profile.oauth2_ciphertext = Some(cipher.encrypt(&serde_json::to_string(&token)?)?);
         profile.oauth_ciphertext = None;
         profile.oauth_pending_ciphertext = None;
@@ -1477,6 +1512,7 @@ impl Bot {
             .await
             .unwrap_or_default();
 
+        profile.active_account_id = None;
         profile.oauth_ciphertext =
             Some(cipher.encrypt(&format!("{access_token}\n{access_secret}"))?);
         profile.oauth2_ciphertext = None;
@@ -1533,6 +1569,7 @@ impl Bot {
                 self.telegram.send_chat_action(chat_id, "typing").await.ok();
                 match self.commons.validate_credentials(&username, text).await {
                     Ok(()) => {
+                        profile.active_account_id = None;
                         profile.credential_ciphertext = Some(cipher.encrypt(text)?);
                         profile.oauth2_ciphertext = None;
                         profile.oauth_ciphertext = None;
@@ -1804,6 +1841,45 @@ impl Bot {
         }
 
         let mut profile = self.store.get_profile(user_id).await;
+
+        if data == "acct:add" {
+            return self.begin_account_connection(chat_id, user_id).await;
+        }
+
+        if data == "acct:list" || data == "set:accounts" {
+            return self
+                .replace_message_text_or_send(
+                    chat_id,
+                    callback_message_id,
+                    &accounts_overview(&profile),
+                    Some(accounts_keyboard(&profile)),
+                )
+                .await;
+        }
+
+        if let Some(account_id) = data.strip_prefix("acct:use:") {
+            if profile.switch_account(account_id) {
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+                return self
+                    .replace_message_text_or_send(
+                        chat_id,
+                        callback_message_id,
+                        &accounts_overview(&profile),
+                        Some(accounts_keyboard(&profile)),
+                    )
+                    .await;
+            }
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Couldn't switch account. It may have been removed; use Add Commons account.",
+                    None,
+                )
+                .await;
+        }
 
         if let Some(key) = data.strip_prefix(crate::telegram::LICENSE_CALLBACK_PREFIX) {
             let Some(license) = License::parse(key) else {
@@ -2140,6 +2216,25 @@ impl Bot {
                 .send_message(chat_id, "✖ Archive upload cancelled.", None)
                 .await;
         }
+        if matches!(
+            profile.onboarding_step,
+            OnboardingStep::AwaitingUsername
+                | OnboardingStep::AwaitingPassword
+                | OnboardingStep::AwaitingOAuthVerifier
+                | OnboardingStep::AwaitingOAuth2Callback
+                | OnboardingStep::AwaitingLicense
+                | OnboardingStep::AwaitingPrefix
+        ) && profile.restore_active_account()
+        {
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            let text = format!(
+                "Cancelled. Active Commons account: <code>{}</code>.",
+                escape_html(&active_account_label(&profile))
+            );
+            return self.telegram.send_message(chat_id, &text, None).await;
+        }
         if profile.is_ready() {
             profile.onboarding_step = OnboardingStep::Done;
             touch(&mut profile);
@@ -2213,10 +2308,11 @@ impl Bot {
         };
         let bot_uploads = format_count(profile.uploads_count);
         let text = format!(
-            "📊 <b>Status</b>\nCommons account: <a href=\"{}\">{}</a>\nAuth method: <b>{}</b>\nUploads by this Commons account: <b>{}</b>\nUploads through this bot: <b>{}</b>\nUploads through this bot for this account: <a href=\"{}\">open Commons search</a>",
+            "📊 <b>Status</b>\nActive Commons account: <a href=\"{}\">{}</a>\nAuth method: <b>{}</b>\nStored Commons accounts: <b>{}</b>\nUploads by this Commons account: <b>{}</b>\nUploads through this bot: <b>{}</b>\nUploads through this bot for this account: <a href=\"{}\">open Commons search</a>",
             html_attribute(&commons_user_url(account)),
             escape_html(account),
             escape_html(auth_method),
+            stored_account_count(&profile),
             escape_html(&total_uploads),
             escape_html(&bot_uploads),
             html_attribute(&commons_bot_uploads_for_user_url(account)),
@@ -2271,7 +2367,7 @@ impl Bot {
             "/start, /status, /settings, /forget, /help"
         };
         let mut text = format!(
-            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth2</b> (recommended), <b>OAuth1</b>, or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords).\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n\n<b>Limits</b>:\n• Telegram-uploaded files: {max_upload_size}\n• Direct links to Commons-supported files: {commons_link_limit}\n• Image conversions: {image_conversion_limit}\n• Video/audio conversions: {video_audio_conversion_limit}\n• Archives: {archive_limit}\n\n<b>Privacy</b>: hosted on <a href=\"https://wikitech.wikimedia.org/wiki/Help:Toolforge\">Wikimedia Toolforge</a>; stores your Telegram user id, Commons username, encrypted credentials, settings, and upload count. Local files are temporary and removed after processing.\n\n<b>Commands</b>: {commands}\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• Understand where a photo was taken: {RELATED_PHOTO_LOCATION_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSimilar Commons Telegram uploader exists: https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader — Python bot by Multichill and Siebrand\nSource: {}",
+            "🖼 <b>Wikimedia Commons uploader</b> ({BOT_USERNAME})\n\nSend me a photo or file and I upload it to <b>Wikimedia Commons</b> under your own account.\n\n📎 <b>Send images as files</b> (attach → File), not as compressed photos, to preserve the original quality.\n\n⚠️ <b>Uploads are public</b> and reusable, even commercially; storage is unlimited, but files you may not share get deleted.\n• ✅ Best: <b>your own</b> photos (nature, animals, food, events) and your own art or scans.\n• ❌ Files from other sites/social media, screenshots, posters, most logos/covers — <b>usually</b> copyrighted (a few exceptions).\n• ✅ Others' work only under a free license: CC BY, CC BY-SA, CC0 or public domain — <b>not</b> NC (Non-Commercial).\n• 📚 Public domain when old: ~<a href=\"https://commons.wikimedia.org/wiki/Commons:Licensing#Ordinary_copyright\">70 years after the author's death</a> (<a href=\"https://commons.wikimedia.org/wiki/Commons:Copyright_rules_by_territory/Belarus\">50 in Belarus</a>), varies by country; photos of buildings/statues also need Freedom of Panorama.\nWhat may be uploaded: https://commons.wikimedia.org/wiki/Commons:Licensing\n\n<b>Set up</b>: run /start, then connect with <b>OAuth2</b> (recommended), <b>OAuth1</b>, or a <b>bot password</b> (tick Upload new files + Create, edit, and move pages at https://commons.wikimedia.org/wiki/Special:BotPasswords). To add another Commons account later, use /start add or the Commons account button in /settings.\n\n<b>In a caption</b> (per file, whole album too): <code>Categories: A, B</code>, <code>Source: …</code>, <code>Author: …</code>, <code>Date: 2009-12-03</code>, <code>Coord: &lt;map link or lat,lon&gt;</code>.\n\n<b>Links</b>: send or forward an HTTP(S) link to a file/archive, DropMeFiles share page, YouTube/youtu.be, VK video, Rutube, or Apple Podcasts episode. Unsupported audio/video is remuxed when possible or converted to OGG/Opus or WebM AV1/Opus; MP3 and audio OGG stay unchanged, Ogg video is handled as OGV.\n\n<b>Set your defaults</b> any time (for future uploads): <code>category …</code>, <code>author …</code>, <code>prefix …</code>, <code>description …</code>, <code>lang ru</code>, <code>license {{PD-RU-exempt}}</code> — colon optional; short aliases <code>c/a/p/d/l</code>.\n\n<b>/settings</b> also lets you switch/add Commons accounts and toggles upload links, upload metadata in the Uploaded reply (resolution, EXIF camera model, EXIF date), category links, missing-category links, and DNG handling.\n\n<b>Accepted</b>: JPEG, PNG, GIF, SVG, TIFF, WebP, PDF, DjVu, audio (WAV, MP3, OGG, Opus, FLAC), video (WebM, OGV). HEIC and BMP are converted to WebP automatically. DNG defaults to raw development → WebP with embedded JPEG fallback; /settings can force DNG embedded JPEG extraction.\n\n<b>Limits</b>:\n• Telegram-uploaded files: {max_upload_size}\n• Direct links to Commons-supported files: {commons_link_limit}\n• Image conversions: {image_conversion_limit}\n• Video/audio conversions: {video_audio_conversion_limit}\n• Archives: {archive_limit}\n\n<b>Privacy</b>: hosted on <a href=\"https://wikitech.wikimedia.org/wiki/Help:Toolforge\">Wikimedia Toolforge</a>; stores your Telegram user id, Commons username, encrypted credentials, settings, and upload count. Local files are temporary and removed after processing.\n\n<b>Commands</b>: {commands}\n\n<b>Related projects</b>:\n• Browse Commons in Telegram: {RELATED_BROWSE_BOT}\n• Understand where a photo was taken: {RELATED_PHOTO_LOCATION_BOT}\n• gThumb extension: {RELATED_GTHUMB}\n• Browser upload extension: {RELATED_WEB_EXTENSION}\n• CLI upload tool: {RELATED_CLI}\n• Dark Wikipedia theme: {RELATED_DARK_THEME}\n• Wikipedia → man pages: {RELATED_WIKI2MAN}\n\nSimilar Commons Telegram uploader exists: https://commons.wikimedia.org/wiki/Commons:Telegram_Commons_Uploader — Python bot by Multichill and Siebrand\nSource: {}",
             self.config.github_url
         );
         #[cfg(feature = "archive")]
@@ -5127,10 +5223,7 @@ fn conversion_rejection_reason(
 
 /// Builds the settings overview message.
 fn settings_overview(profile: &Profile) -> String {
-    let account = profile
-        .commons_username
-        .clone()
-        .unwrap_or_else(|| "(not set)".to_string());
+    let account = active_account_label(profile);
     let prefix = if profile.filename_prefix.is_empty() {
         "(none)".to_string()
     } else {
@@ -5142,8 +5235,9 @@ fn settings_overview(profile: &Profile) -> String {
         profile.default_categories.join(", ")
     };
     let mut text = format!(
-        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn upload metadata: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
+        "⚙️ <b>Settings</b>\nCommons account: <code>{}</code>\nStored accounts: <b>{}</b>\nLicense: <b>{}</b>\nFilename prefix: <code>{}</code>\nDefault categories: {}\nDNG handling: <b>{}</b>\nReturn upload links: <b>{}</b>\nReturn upload metadata: <b>{}</b>\nReturn category links: <b>{}</b>\nReturn non-existing category links: <b>{}</b>",
         escape_html(&account),
+        stored_account_count(profile),
         escape_html(profile.license.label()),
         escape_html(&prefix),
         escape_html(&categories),
@@ -5162,7 +5256,7 @@ fn settings_overview(profile: &Profile) -> String {
         ));
     }
     text.push_str(
-        "\n\nButtons below toggle options; Filename prefix and License open submenus.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
+        "\n\nButtons below toggle options; Commons account, Filename prefix, and License open submenus.\nText commands:\n<code>/settings prefix Your Prefix</code>\n<code>/settings categories Cat A, Cat B</code>\n<code>/settings license cc-by-4.0</code>\n<code>/settings dng webp</code> or <code>/settings dng extract</code>",
     );
     text
 }
@@ -5190,6 +5284,7 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             "set:misscat",
             profile.return_missing_category_links,
         )],
+        vec![settings_account_button(profile)],
         vec![settings_prefix_button(profile)],
         vec![dng_mode_button(profile.dng_mode)],
     ];
@@ -5209,6 +5304,118 @@ fn settings_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
     rows.push(vec![settings_license_button(profile.license)]);
     InlineKeyboardMarkup {
         inline_keyboard: rows,
+    }
+}
+
+/// Builds the settings entry point for Commons account switching.
+fn settings_account_button(profile: &Profile) -> InlineKeyboardButton {
+    InlineKeyboardButton {
+        text: format!(
+            "Commons account: {}",
+            compact_button_value(&active_account_label(profile))
+        ),
+        callback_data: Some("set:accounts".to_string()),
+        url: None,
+    }
+}
+
+/// Text shown above the account switcher keyboard.
+fn accounts_overview(profile: &Profile) -> String {
+    format!(
+        "👤 <b>Commons accounts</b>\nActive account: <code>{}</code>\nStored accounts: <b>{}</b>\n\nAdd another account or tap an existing account to make it active for future uploads.",
+        escape_html(&active_account_label(profile)),
+        stored_account_count(profile)
+    )
+}
+
+/// Builds the account management keyboard used by /start and /settings.
+fn account_management_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    rows.push(vec![InlineKeyboardButton {
+        text: "➕ Add Commons account".to_string(),
+        callback_data: Some("acct:add".to_string()),
+        url: None,
+    }]);
+    if stored_account_count(profile) > 0 {
+        rows.push(vec![InlineKeyboardButton {
+            text: "🔁 Switch Commons account".to_string(),
+            callback_data: Some("acct:list".to_string()),
+            url: None,
+        }]);
+    }
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+/// Builds the account switcher submenu.
+fn accounts_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    let active = profile.active_account_id.as_deref();
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = profile
+        .accounts
+        .iter()
+        .filter(|account| account.has_credentials())
+        .map(|account| {
+            let selected = if active == Some(account.id.as_str()) {
+                "✓ "
+            } else {
+                ""
+            };
+            vec![InlineKeyboardButton {
+                text: format!("{selected}{}", account_button_label(account)),
+                callback_data: Some(format!("acct:use:{}", account.id)),
+                url: None,
+            }]
+        })
+        .collect();
+    rows.push(vec![InlineKeyboardButton {
+        text: "➕ Add Commons account".to_string(),
+        callback_data: Some("acct:add".to_string()),
+        url: None,
+    }]);
+    rows.push(vec![InlineKeyboardButton {
+        text: "← Back to settings".to_string(),
+        callback_data: Some("set:main".to_string()),
+        url: None,
+    }]);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+/// Human-readable label for one account switcher row.
+fn account_button_label(account: &CommonsAccount) -> String {
+    let username = account
+        .commons_username
+        .as_deref()
+        .map(commons_account_name)
+        .filter(|username| !username.is_empty())
+        .unwrap_or("(unknown)");
+    compact_button_value(&format!("{} ({})", username, account.auth_method_label()))
+}
+
+/// Returns the display name of the current active account.
+fn active_account_label(profile: &Profile) -> String {
+    profile
+        .commons_username
+        .as_deref()
+        .map(commons_account_name)
+        .filter(|username| !username.is_empty())
+        .unwrap_or("(not set)")
+        .to_string()
+}
+
+/// Counts stored usable accounts, falling back to the active legacy credential set.
+fn stored_account_count(profile: &Profile) -> usize {
+    let stored = profile
+        .accounts
+        .iter()
+        .filter(|account| account.has_credentials())
+        .count();
+    if stored == 0 && profile.has_active_credentials() {
+        1
+    } else {
+        stored
     }
 }
 
@@ -7093,19 +7300,19 @@ mod tests {
     use super::{
         COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FfmpegPlan, FfmpegPlanKind, MediaProbe,
         MediaStreamInfo, TEXT_CONTEXTS, TextContext, UPDATE_ALREADY_IN_PROGRESS_ERROR,
-        caption_without_link, commons_max_file_size_message, conversion_rejection_reason,
-        direct_link_looks_like_commons_file, dropmefiles_download_url_from_page,
-        dropmefiles_file_ids, dropmefiles_upload_id, effective_filename_prefix,
-        ensure_commons_file_size_limit, ffmpeg_plan_for_probe, filename_needs_descriptive_context,
-        first_external_url, is_dropmefiles_url, media_group_upload_progress, merge_categories,
-        now_ts, parse_category_list, register_media_group_upload, remember_text_context,
-        settings_keyboard, settings_license_keyboard, settings_prefix_keyboard,
-        should_try_ffmpeg_media_conversion, status_for_webhook_error, take_text_context,
-        text_context_for_upload,
+        accounts_keyboard, caption_without_link, commons_max_file_size_message,
+        conversion_rejection_reason, direct_link_looks_like_commons_file,
+        dropmefiles_download_url_from_page, dropmefiles_file_ids, dropmefiles_upload_id,
+        effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
+        filename_needs_descriptive_context, first_external_url, is_dropmefiles_url,
+        media_group_upload_progress, merge_categories, now_ts, parse_category_list,
+        register_media_group_upload, remember_text_context, settings_keyboard,
+        settings_license_keyboard, settings_prefix_keyboard, should_try_ffmpeg_media_conversion,
+        status_for_webhook_error, take_text_context, text_context_for_upload,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
-    use crate::models::{Chat, DngMode, License, Message, Profile, User};
+    use crate::models::{Chat, CommonsAccount, DngMode, License, Message, Profile, User};
     use http::StatusCode;
 
     fn test_message(chat_id: i64, user_id: i64, forwarded: bool) -> Message {
@@ -7792,6 +7999,63 @@ mod tests {
             .expect("settings should include a filename-prefix submenu");
 
         assert!(prefix_button.text.starts_with("Filename prefix: "));
+    }
+
+    #[test]
+    fn settings_keyboard_has_account_submenu_button() {
+        let profile = Profile {
+            commons_username: Some("Example@bot".into()),
+            credential_ciphertext: Some("secret".into()),
+            ..Profile::default()
+        };
+        let keyboard = settings_keyboard(&profile);
+        let account_button = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|button| button.callback_data.as_deref() == Some("set:accounts"))
+            .expect("settings should include a Commons account submenu");
+
+        assert_eq!(account_button.text, "Commons account: Example");
+    }
+
+    #[test]
+    fn accounts_keyboard_lists_accounts_and_add_button() {
+        let profile = Profile {
+            active_account_id: Some("acct1".into()),
+            accounts: vec![
+                CommonsAccount {
+                    id: "acct1".into(),
+                    commons_username: Some("Example@bot".into()),
+                    credential_ciphertext: Some("secret".into()),
+                    oauth_ciphertext: None,
+                    oauth2_ciphertext: None,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                CommonsAccount {
+                    id: "acct2".into(),
+                    commons_username: Some("Second".into()),
+                    credential_ciphertext: None,
+                    oauth_ciphertext: None,
+                    oauth2_ciphertext: Some("oauth2".into()),
+                    created_at: 2,
+                    updated_at: 2,
+                },
+            ],
+            ..Profile::default()
+        };
+        let keyboard = accounts_keyboard(&profile);
+        let labels: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|button| button.text.as_str())
+            .collect();
+
+        assert!(labels.contains(&"✓ Example (Bot password)"));
+        assert!(labels.contains(&"Second (OAuth2)"));
+        assert!(labels.contains(&"➕ Add Commons account"));
     }
 
     #[test]
