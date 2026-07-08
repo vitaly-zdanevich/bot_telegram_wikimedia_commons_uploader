@@ -110,6 +110,8 @@ On the Toolforge/server build, the bot also accepts a pasted or forwarded **HTTP
 instead of an attached Telegram file:
 
 - Direct file links: images, audio, PDFs, videos, ZIP/RAR archives, and other supported files.
+- Internet Archive item pages (`archive.org/details/<id>`); uploadable original files in the
+  item are downloaded and unsupported audio/video is converted when possible.
 - DropMeFiles share pages (`dropmefiles.com/<id>`); links still being uploaded are rejected
   until DropMeFiles marks them ready.
 - Media pages resolved by `yt-dlp`: YouTube (`youtube.com`, `youtu.be`), VK video
@@ -179,7 +181,8 @@ add it to the build `Aptfile`). Archives are disabled on the Lambda build becaus
 - `/start` — connect your account / resume setup; `/start add` adds another Commons account
 - `/status` — active Commons account, auth method, stored account count, Commons upload count, and uploads through this bot
 - `/help` — usage, your uploads link, related projects, contact
-- `/settings` — active Commons account switcher, license, filename prefix, default categories, DNG handling, and toggles:
+- `/settings` — active Commons account switcher, license, filename prefix, categories for uploading
+  (with remembered categories from successful uploads), DNG handling, and toggles:
   return upload links (**on** by default), return upload metadata — resolution, EXIF camera
   model, and EXIF date (**on**), return category links (**off**), return non-existing category
   links (**off**).
