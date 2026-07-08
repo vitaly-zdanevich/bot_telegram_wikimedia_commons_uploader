@@ -1422,18 +1422,24 @@ fn strip_wikitext(text: &str) -> String {
 
 /// Builds a Commons file-page URL from a canonical title.
 fn file_page_url(title: &str) -> String {
+    let title = title.strip_prefix("File:").unwrap_or(title);
+    commons_page_url("File", title)
+}
+
+/// Builds a Commons page URL, percent-encoding the wiki title path segment.
+fn commons_page_url(namespace: &str, title: &str) -> String {
+    let prefix = format!("{namespace}:");
+    let title = title.strip_prefix(&prefix).unwrap_or(title);
+    let title = title.replace(' ', "_");
     format!(
-        "https://commons.wikimedia.org/wiki/File:{}",
-        title.replace(' ', "_")
+        "https://commons.wikimedia.org/wiki/{namespace}:{}",
+        urlencoding::encode(&title)
     )
 }
 
 /// Builds a Commons category-page URL from a category name.
 pub fn category_url(name: &str) -> String {
-    format!(
-        "https://commons.wikimedia.org/wiki/Category:{}",
-        name.replace(' ', "_")
-    )
+    commons_page_url("Category", name)
 }
 
 /// A caption split into a description and category names.
@@ -2126,6 +2132,26 @@ mod tests {
             }
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn commons_page_urls_percent_encode_titles_for_telegram_links() {
+        let file_url =
+            super::file_page_url("Родник «Серебрянка» 55.859992, 28.441198 IMG_0748.jpg");
+        let category = super::category_url("Родники Беларуси");
+
+        assert!(!file_url.contains(' '));
+        assert!(!file_url.contains('«'));
+        assert!(file_url.contains("%D0%A0%D0%BE%D0%B4%D0%BD%D0%B8%D0%BA"));
+        assert!(
+            file_url.contains(
+                "%C2%AB%D0%A1%D0%B5%D1%80%D0%B5%D0%B1%D1%80%D1%8F%D0%BD%D0%BA%D0%B0%C2%BB"
+            )
+        );
+        assert_eq!(
+            category,
+            "https://commons.wikimedia.org/wiki/Category:%D0%A0%D0%BE%D0%B4%D0%BD%D0%B8%D0%BA%D0%B8_%D0%91%D0%B5%D0%BB%D0%B0%D1%80%D1%83%D1%81%D0%B8"
+        );
     }
 
     #[test]

@@ -7821,10 +7821,13 @@ fn os_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
 
 /// Builds a Commons URL from a canonical `File:`/`Category:` title.
 fn commons_title_url(title: &str) -> String {
-    format!(
-        "https://commons.wikimedia.org/wiki/{}",
-        title.replace(' ', "_")
-    )
+    let title = title.replace(' ', "_");
+    let path = if let Some((namespace, page)) = title.split_once(':') {
+        format!("{}:{}", namespace, urlencoding::encode(page))
+    } else {
+        urlencoding::encode(&title).into_owned()
+    };
+    format!("https://commons.wikimedia.org/wiki/{path}")
 }
 
 /// Returns the Commons account name from a stored username or bot-password username.
@@ -7865,9 +7868,10 @@ fn html_attribute(text: &str) -> String {
 
 /// Builds a Commons user-page URL.
 fn commons_user_url(account: &str) -> String {
+    let account = account.replace(' ', "_");
     format!(
         "https://commons.wikimedia.org/wiki/User:{}",
-        account.replace(' ', "_")
+        urlencoding::encode(&account)
     )
 }
 
@@ -8066,6 +8070,10 @@ mod tests {
             super::commons_user_url("Example User"),
             "https://commons.wikimedia.org/wiki/User:Example_User"
         );
+        let file_url = super::commons_title_url("File:Родник «Серебрянка».jpg");
+        assert!(!file_url.contains(' '));
+        assert!(!file_url.contains('«'));
+        assert!(file_url.contains("File:%D0%A0%D0%BE%D0%B4%D0%BD%D0%B8%D0%BA"));
         assert_eq!(
             super::html_attribute("A \"B\" & <C>"),
             "A &quot;B&quot; &amp; &lt;C&gt;"
