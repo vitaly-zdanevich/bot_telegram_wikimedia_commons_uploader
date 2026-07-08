@@ -111,6 +111,8 @@ static TEXT_CONTEXTS: Lazy<RwLock<HashMap<(i64, i64), TextContext>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 /// Maximum time spent downloading a direct URL.
 const DIRECT_URL_DOWNLOAD_TIMEOUT_SECS: u64 = 20 * 60;
+/// Maximum time spent reading Internet Archive item metadata.
+const ARCHIVE_ORG_METADATA_TIMEOUT_SECS: u64 = 60;
 /// Maximum time spent downloading with yt-dlp.
 const YTDLP_DOWNLOAD_TIMEOUT_SECS: u64 = 45 * 60;
 /// Maximum time spent transcoding unsupported media.
@@ -897,6 +899,39 @@ struct LinkedFile {
     unique_id: String,
     processing: Option<UploadProcessingInfo>,
     cleanup_paths: Vec<PathBuf>,
+}
+
+/// One uploadable file discovered inside an archive.org item.
+struct ArchiveOrgFileCandidate {
+    file_name: String,
+    url: Url,
+}
+
+/// Uploadable files and display metadata for one archive.org item.
+struct ArchiveOrgItem {
+    title: Option<String>,
+    files: Vec<ArchiveOrgFileCandidate>,
+}
+
+/// JSON shape returned by `https://archive.org/metadata/{identifier}`.
+#[derive(serde::Deserialize)]
+struct ArchiveOrgMetadataResponse {
+    server: Option<String>,
+    d1: Option<String>,
+    d2: Option<String>,
+    dir: Option<String>,
+    #[serde(default)]
+    files: Vec<ArchiveOrgMetadataFile>,
+    metadata: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+/// One entry in the Internet Archive metadata `files` array.
+#[derive(serde::Deserialize)]
+struct ArchiveOrgMetadataFile {
+    name: String,
+    source: Option<String>,
+    format: Option<String>,
 }
 
 /// Disk-backed result of an ffmpeg conversion/remux.
@@ -3126,6 +3161,18 @@ impl Bot {
         let _typing = ChatActionGuard::start(self.telegram.clone(), chat_id, "typing");
         let caption_source = message_text_for_links(message).unwrap_or_default();
         let caption = caption_without_link(&caption_source, &link);
+        if archive_org_identifier(&link.url).is_some() {
+            return self
+                .handle_archive_org_upload(
+                    chat_id,
+                    user_id,
+                    message,
+                    &link.url,
+                    &caption,
+                    &mut profile,
+                )
+                .await;
+        }
         let linked = match self.resolve_linked_file(&link.url).await {
             Ok(file) => file,
             Err(error) => {
@@ -3280,6 +3327,267 @@ impl Bot {
                 self.telegram.send_message(chat_id, &text, None).await
             }
         }
+    }
+
+    /// Expands an archive.org item link and uploads every supported/convertible file in it.
+    async fn handle_archive_org_upload(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        message: &Message,
+        url: &Url,
+        caption: &str,
+        profile: &mut Profile,
+    ) -> Result<()> {
+        let item = match self.resolve_archive_org_item(url).await {
+            Ok(item) => item,
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    url = %url,
+                    error = %format!("{error:#}"),
+                    "failed to resolve archive.org item"
+                );
+                react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
+                let text = format!(
+                    "❌ Couldn't read that archive.org item: {}",
+                    escape_html(&format!("{error}"))
+                );
+                return self.telegram.send_message(chat_id, &text, None).await;
+            }
+        };
+        if item.files.is_empty() {
+            react_to_message_best_effort(&self.telegram, chat_id, message, "👎").await;
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "❌ This archive.org item has no supported or convertible files to upload.",
+                    None,
+                )
+                .await;
+        }
+
+        let (auth, author_username) = match self.resolve_auth(user_id, profile).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return self
+                    .telegram
+                    .send_message(chat_id, &escape_html(&format!("{error}")), None)
+                    .await;
+            }
+        };
+        let bot_password_session = match &auth {
+            UploadAuth::BotPassword { username, password } => {
+                match self.commons.bot_password_session(username, password).await {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        return self
+                            .telegram
+                            .send_message(chat_id, &escape_html(&format!("{error}")), None)
+                            .await;
+                    }
+                }
+            }
+            UploadAuth::OAuth1 { .. } | UploadAuth::OAuth2 { .. } => None,
+        };
+
+        let item_caption = if caption.trim().is_empty() {
+            item.title.as_deref().unwrap_or_default()
+        } else {
+            caption
+        };
+        let count = item.files.len();
+        self.telegram
+            .send_message(
+                chat_id,
+                &format!("📚 Found <b>{count}</b> archive.org file(s). Uploading…"),
+                None,
+            )
+            .await
+            .ok();
+
+        let (mut uploaded, mut duplicate, mut rejected, mut failed) = (0u32, 0u32, 0u32, 0u32);
+        let mut uploaded_categories = Vec::new();
+        let mut rejected_reasons: Vec<(String, u32)> = Vec::new();
+        let mut failed_reasons: Vec<(String, u32)> = Vec::new();
+        for (index, candidate) in item.files.into_iter().enumerate() {
+            let current = index + 1;
+            send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+            let result = match self.download_direct_url(&candidate.url).await {
+                Ok(mut linked) => {
+                    linked.file_name = Some(candidate.file_name.clone());
+                    linked.mime =
+                        file_extension_for_name(&candidate.file_name).and_then(mime_for_extension);
+                    linked.source_url = candidate.url.as_str().to_string();
+                    let _cleanup = TempPathCleanup::new(linked.cleanup_paths.clone());
+                    self.process_one_file(
+                        profile,
+                        item_caption,
+                        None,
+                        &[],
+                        linked.file,
+                        linked.file_name.as_deref(),
+                        linked.mime.as_deref(),
+                        &linked.unique_id,
+                        Some(&linked.source_url),
+                        &auth,
+                        bot_password_session.as_ref(),
+                        &author_username,
+                        linked.processing,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+
+            match result {
+                Ok(FileResult::Uploaded {
+                    filename,
+                    url,
+                    categories,
+                    processing,
+                    report_metadata,
+                }) => {
+                    uploaded += 1;
+                    append_unique_categories(&mut uploaded_categories, &categories);
+                    if profile.return_upload_links {
+                        self.send_success(
+                            chat_id,
+                            profile,
+                            UploadSuccessReply {
+                                filename: &filename,
+                                url: &url,
+                                categories: &categories,
+                                compressed_photo: false,
+                                progress: Some(UploadProgress {
+                                    current,
+                                    total: count,
+                                }),
+                                processing: processing.as_ref(),
+                                report_metadata: report_metadata.as_ref(),
+                            },
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+                Ok(FileResult::Duplicate { .. }) => duplicate += 1,
+                Ok(FileResult::Rejected { reason }) => {
+                    rejected += 1;
+                    record_archive_reason(
+                        &mut rejected_reasons,
+                        format!("{}: {reason}", candidate.file_name),
+                    );
+                }
+                Ok(FileResult::Failed { message, html }) => {
+                    failed += 1;
+                    record_archive_reason(
+                        &mut failed_reasons,
+                        format!(
+                            "{}: {}",
+                            candidate.file_name,
+                            if html {
+                                plain_text_from_telegram_html(&message)
+                            } else {
+                                message
+                            }
+                        ),
+                    );
+                }
+                Err(error) => {
+                    failed += 1;
+                    record_archive_reason(
+                        &mut failed_reasons,
+                        format!("{}: {error:#}", candidate.file_name),
+                    );
+                }
+            }
+        }
+        self.record_successful_uploads(user_id, uploaded.into(), &uploaded_categories)
+            .await
+            .ok();
+
+        let mut text = format!("📚 archive.org item done — ✅ {uploaded} uploaded");
+        if duplicate > 0 {
+            text.push_str(&format!(", ⚠️ {duplicate} duplicate"));
+        }
+        if rejected > 0 {
+            text.push_str(&format!(", ⛔ {rejected} skipped"));
+        }
+        if failed > 0 {
+            text.push_str(&format!(", ❌ {failed} failed"));
+        }
+        append_archive_reasons(&mut text, "Skipped reasons", &rejected_reasons);
+        append_archive_reasons(&mut text, "Failed reasons", &failed_reasons);
+        react_to_message_best_effort(
+            &self.telegram,
+            chat_id,
+            message,
+            if uploaded > 0 && failed == 0 && rejected == 0 {
+                "👍"
+            } else {
+                "👎"
+            },
+        )
+        .await;
+        self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Reads archive.org metadata and builds direct download URLs for uploadable item files.
+    async fn resolve_archive_org_item(&self, url: &Url) -> Result<ArchiveOrgItem> {
+        let identifier = archive_org_identifier(url).context("not an archive.org item URL")?;
+        let metadata_url = Url::parse(&format!(
+            "https://archive.org/metadata/{}",
+            urlencoding::encode(&identifier)
+        ))?;
+        let client = reqwest::Client::builder()
+            .user_agent(&self.config.user_agent)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(std::time::Duration::from_secs(
+                ARCHIVE_ORG_METADATA_TIMEOUT_SECS,
+            ))
+            .build()
+            .context("failed to build archive.org metadata HTTP client")?;
+        let metadata: ArchiveOrgMetadataResponse = client
+            .get(metadata_url)
+            .send()
+            .await
+            .context("failed to request archive.org metadata")?
+            .error_for_status()
+            .context("archive.org metadata returned an error status")?
+            .json()
+            .await
+            .context("archive.org metadata was not valid JSON")?;
+        if let Some(error) = metadata.error.as_deref() {
+            bail!("{error}");
+        }
+        let server = metadata
+            .server
+            .or(metadata.d1)
+            .or(metadata.d2)
+            .context("archive.org metadata did not include a download server")?;
+        let dir = metadata
+            .dir
+            .context("archive.org metadata did not include an item directory")?;
+        let title = metadata
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata_string(metadata, "title"));
+        let files = metadata
+            .files
+            .into_iter()
+            .filter(archive_org_file_is_upload_candidate)
+            .filter_map(|file| {
+                let url = archive_org_file_url(&server, &dir, &file.name).ok()?;
+                Some(ArchiveOrgFileCandidate {
+                    file_name: sanitize_download_filename(&file.name),
+                    url,
+                })
+            })
+            .collect();
+        Ok(ArchiveOrgItem { title, files })
     }
 
     /// Resolves an HTTP(S) link into a local file ready for the normal upload pipeline.
@@ -6640,6 +6948,96 @@ fn message_text_for_links(message: &Message) -> Option<String> {
         .filter(|text| !text.trim().is_empty())
 }
 
+/// Extracts an Internet Archive item identifier from item-level archive.org URLs.
+fn archive_org_identifier(url: &Url) -> Option<String> {
+    if !host_matches(url, &["archive.org", "www.archive.org"]) {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["details", identifier, ..] | ["metadata", identifier, ..] => {
+            decode_path_segment(identifier)
+        }
+        ["download", identifier] => decode_path_segment(identifier),
+        ["download", identifier, ""] => decode_path_segment(identifier),
+        _ => None,
+    }
+}
+
+/// Returns true when an archive.org metadata file is a user file worth trying to upload.
+fn archive_org_file_is_upload_candidate(file: &ArchiveOrgMetadataFile) -> bool {
+    if archive_org_file_is_sidecar(file) {
+        return false;
+    }
+    if file
+        .source
+        .as_deref()
+        .is_some_and(|source| !source.eq_ignore_ascii_case("original"))
+    {
+        return false;
+    }
+    let extension = file_extension_for_name(&file.name).unwrap_or_default();
+    convert::is_uploadable_archive_member(&file.name)
+        || should_try_ffmpeg_media_conversion(Some(&file.name), None, &extension)
+}
+
+/// Skips Internet Archive metadata, thumbnails, torrents, and bookkeeping sidecars.
+fn archive_org_file_is_sidecar(file: &ArchiveOrgMetadataFile) -> bool {
+    let name = file.name.to_ascii_lowercase();
+    let format = file
+        .format
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let source = file
+        .source
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    source == "metadata"
+        || format.contains("metadata")
+        || format.contains("thumbnail")
+        || format.contains("torrent")
+        || name == "__ia_thumb.jpg"
+        || name.ends_with("_files.xml")
+        || name.ends_with("_meta.xml")
+        || name.ends_with("_reviews.xml")
+        || name.ends_with("_meta.sqlite")
+        || name.ends_with("_archive.torrent")
+        || name.ends_with(".torrent")
+}
+
+/// Builds a direct archive.org download URL for one file entry.
+fn archive_org_file_url(server: &str, dir: &str, name: &str) -> Result<Url> {
+    let encoded_name = name
+        .split('/')
+        .map(urlencoding::encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    let dir = dir.trim_matches('/');
+    Url::parse(&format!("https://{server}/{dir}/{encoded_name}"))
+        .context("archive.org metadata contained an invalid file URL")
+}
+
+/// Decodes one URL path segment.
+fn decode_path_segment(segment: &str) -> Option<String> {
+    urlencoding::decode(segment)
+        .ok()
+        .map(|segment| segment.into_owned())
+        .filter(|segment| !segment.trim().is_empty())
+}
+
+/// Reads a metadata string, accepting either a scalar string or first string array element.
+fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
+    match metadata.get(key)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| value.as_str().map(str::to_string)),
+        _ => None,
+    }
+}
+
 /// Finds the first external URL in a Telegram text/caption.
 fn first_external_url(text: &str) -> Option<LinkCandidate> {
     text.split_whitespace().find_map(|raw| {
@@ -6697,6 +7095,8 @@ fn known_link_host_token(lower: &str) -> bool {
         "rutube.ru/",
         "www.rutube.ru/",
         "podcasts.apple.com/",
+        "archive.org/",
+        "www.archive.org/",
     ];
     HOSTS.iter().any(|host| lower.starts_with(host))
 }
@@ -7484,13 +7884,14 @@ mod tests {
     use super::{
         COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FfmpegPlan, FfmpegPlanKind, MediaProbe,
         MediaStreamInfo, TEXT_CONTEXTS, TextContext, UPDATE_ALREADY_IN_PROGRESS_ERROR,
-        accounts_keyboard, caption_without_link, commons_max_file_size_message,
-        conversion_rejection_reason, direct_link_looks_like_commons_file,
-        dropmefiles_download_url_from_page, dropmefiles_file_ids, dropmefiles_upload_id,
-        effective_filename_prefix, ensure_commons_file_size_limit, ffmpeg_plan_for_probe,
-        filename_needs_descriptive_context, first_external_url, is_dropmefiles_url,
-        media_group_upload_progress, merge_categories, now_ts, parse_category_list,
-        register_media_group_upload, remember_text_context, settings_keyboard,
+        accounts_keyboard, archive_org_file_is_upload_candidate, archive_org_identifier,
+        caption_without_link, commons_max_file_size_message, conversion_rejection_reason,
+        direct_link_looks_like_commons_file, dropmefiles_download_url_from_page,
+        dropmefiles_file_ids, dropmefiles_upload_id, effective_filename_prefix,
+        ensure_commons_file_size_limit, ffmpeg_plan_for_probe, filename_needs_descriptive_context,
+        first_external_url, is_dropmefiles_url, media_group_upload_progress, merge_categories,
+        now_ts, parse_category_list, register_media_group_upload, remember_text_context,
+        remember_used_categories, settings_categories_keyboard, settings_keyboard,
         settings_license_keyboard, settings_prefix_keyboard, should_try_ffmpeg_media_conversion,
         status_for_webhook_error, take_text_context, text_context_for_upload,
     };
@@ -7579,6 +7980,72 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
+    }
+
+    #[test]
+    fn remembers_used_categories_recent_first_without_duplicates() {
+        let mut profile = Profile {
+            used_categories: vec!["Old".into(), "Minsk".into()],
+            ..Profile::default()
+        };
+
+        remember_used_categories(&mut profile, &["Minsk".into(), "Churches".into()]);
+
+        assert_eq!(profile.used_categories, vec!["Minsk", "Churches", "Old"]);
+    }
+
+    #[test]
+    fn archive_org_identifier_accepts_item_links() {
+        let details =
+            url::Url::parse("https://archive.org/details/bot_telegram_rutracker_lecture").unwrap();
+        let metadata =
+            url::Url::parse("https://archive.org/metadata/bot_telegram_rutracker_lecture").unwrap();
+        let download = url::Url::parse("https://archive.org/download/example_item").unwrap();
+        let direct_file =
+            url::Url::parse("https://archive.org/download/example_item/file.mp4").unwrap();
+
+        assert_eq!(
+            archive_org_identifier(&details).as_deref(),
+            Some("bot_telegram_rutracker_lecture")
+        );
+        assert_eq!(
+            archive_org_identifier(&metadata).as_deref(),
+            Some("bot_telegram_rutracker_lecture")
+        );
+        assert_eq!(
+            archive_org_identifier(&download).as_deref(),
+            Some("example_item")
+        );
+        assert_eq!(archive_org_identifier(&direct_file), None);
+    }
+
+    #[test]
+    fn archive_org_file_filter_skips_sidecars_and_keeps_convertible_media() {
+        let metadata = super::ArchiveOrgMetadataFile {
+            name: "item_files.xml".into(),
+            source: Some("original".into()),
+            format: Some("Metadata".into()),
+        };
+        let mp4 = super::ArchiveOrgMetadataFile {
+            name: "lecture.mp4".into(),
+            source: Some("original".into()),
+            format: Some("MPEG4".into()),
+        };
+        let heic = super::ArchiveOrgMetadataFile {
+            name: "photo.heic".into(),
+            source: Some("original".into()),
+            format: Some("HEIC".into()),
+        };
+        let derivative = super::ArchiveOrgMetadataFile {
+            name: "lecture_64kb.mp3".into(),
+            source: Some("derivative".into()),
+            format: Some("64Kbps MP3".into()),
+        };
+
+        assert!(!archive_org_file_is_upload_candidate(&metadata));
+        assert!(archive_org_file_is_upload_candidate(&mp4));
+        assert!(archive_org_file_is_upload_candidate(&heic));
+        assert!(!archive_org_file_is_upload_candidate(&derivative));
     }
 
     #[test]
@@ -8183,6 +8650,47 @@ mod tests {
             .expect("settings should include a filename-prefix submenu");
 
         assert!(prefix_button.text.starts_with("Filename prefix: "));
+    }
+
+    #[test]
+    fn settings_keyboard_places_categories_after_prefix() {
+        let profile = Profile {
+            filename_prefix: "Trip".into(),
+            default_categories: vec!["Minsk".into(), "Churches".into()],
+            ..Profile::default()
+        };
+        let keyboard = settings_keyboard(&profile);
+        let callbacks: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .map(|row| row[0].callback_data.as_deref().unwrap_or_default())
+            .collect();
+        let prefix_index = callbacks
+            .iter()
+            .position(|callback| *callback == "set:prefix")
+            .unwrap();
+
+        assert_eq!(callbacks[prefix_index + 1], "set:categories");
+    }
+
+    #[test]
+    fn settings_categories_keyboard_marks_selected_with_green_checkbox() {
+        let profile = Profile {
+            default_categories: vec!["Minsk".into()],
+            used_categories: vec!["Minsk".into(), "Churches".into()],
+            ..Profile::default()
+        };
+        let keyboard = settings_categories_keyboard(&profile);
+        let labels: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|button| button.text.as_str())
+            .collect();
+
+        assert!(labels.contains(&"✅ Minsk"));
+        assert!(labels.contains(&"Churches"));
+        assert!(labels.contains(&"Select none"));
     }
 
     #[test]
