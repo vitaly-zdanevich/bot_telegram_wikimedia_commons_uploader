@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// OAuth2 endpoints on the central wiki.
+/// OAuth2 endpoints on the wiki where the consumer is applicable.
 #[derive(Clone, Debug)]
 pub struct OAuth2Endpoints {
     /// User-facing authorization endpoint.
@@ -20,9 +20,12 @@ pub struct OAuth2Endpoints {
 }
 
 impl OAuth2Endpoints {
-    /// Endpoints for Wikimedia projects (OAuth is centralised on meta.wikimedia.org).
+    /// Endpoints for this Commons uploader.
+    ///
+    /// The consumer is registered on Meta, but its applicable project is `commonswiki`, so the
+    /// authorization, token, and profile calls must use Commons' REST endpoint.
     pub fn wikimedia() -> Self {
-        let base = "https://meta.wikimedia.org/w/rest.php/oauth2";
+        let base = "https://commons.wikimedia.org/w/rest.php/oauth2";
         Self {
             authorize: format!("{base}/authorize"),
             token: format!("{base}/access_token"),
@@ -197,9 +200,9 @@ mod tests {
                 redirect_url: "https://example.org/oauth2/callback".into(),
             },
             OAuth2Endpoints {
-                authorize: "https://meta.wikimedia.org/w/rest.php/oauth2/authorize".into(),
-                token: "https://meta.wikimedia.org/w/rest.php/oauth2/access_token".into(),
-                profile: "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile".into(),
+                authorize: "https://commons.wikimedia.org/w/rest.php/oauth2/authorize".into(),
+                token: "https://commons.wikimedia.org/w/rest.php/oauth2/access_token".into(),
+                profile: "https://commons.wikimedia.org/w/rest.php/oauth2/resource/profile".into(),
             },
             "test",
         )
