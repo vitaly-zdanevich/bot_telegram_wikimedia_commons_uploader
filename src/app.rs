@@ -1797,9 +1797,32 @@ impl Bot {
                     }
                     touch(&mut profile);
                     self.store.put_profile(user_id, &profile).await?;
+                    let existing_categories = match self
+                        .commons
+                        .missing_categories(&profile.default_categories)
+                        .await
+                    {
+                        Ok(missing) => profile
+                            .default_categories
+                            .iter()
+                            .filter(|category| !missing.contains(category))
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "failed to check default category existence"
+                            );
+                            Vec::new()
+                        }
+                    };
                     return self
                         .telegram
-                        .send_message(chat_id, &defaults_summary(&profile), None)
+                        .send_message(
+                            chat_id,
+                            &defaults_summary(&profile, &existing_categories),
+                            None,
+                        )
                         .await;
                 }
                 self.telegram
@@ -6249,37 +6272,63 @@ fn image_count_label(count: usize) -> &'static str {
 }
 
 /// Summarizes a user's upload defaults after a settings directive.
-fn defaults_summary(profile: &Profile) -> String {
+fn defaults_summary(profile: &Profile, linked_categories: &[String]) -> String {
     let mut parts = Vec::new();
     if !profile.default_categories.is_empty() {
         parts.push(format!(
             "categories: {}",
-            profile.default_categories.join(", ")
+            format_default_categories(&profile.default_categories, linked_categories)
         ));
     }
     if let Some(author) = &profile.default_author {
-        parts.push(format!("author: {author}"));
-    }
-    if !profile.filename_prefix.is_empty() {
-        parts.push(format!("filename prefix: {}", profile.filename_prefix));
+        parts.push(format!("author: {}", escape_html(author)));
     }
     if let Some(description) = &profile.default_description {
-        parts.push(format!("description: {description}"));
+        parts.push(format!("description: {}", escape_html(description)));
     }
     if let Some(lang) = &profile.default_lang {
-        parts.push(format!("language: {lang}"));
+        parts.push(format!("language: {}", escape_html(lang)));
     }
     if let Some(license) = &profile.license_override {
-        parts.push(format!("license: {license}"));
+        parts.push(format!("license: {}", escape_html(license)));
     }
-    if parts.is_empty() {
+    let has_prefix = !profile.filename_prefix.is_empty();
+    if parts.is_empty() && !has_prefix {
         "✅ Upload defaults cleared.".to_string()
-    } else {
+    } else if parts.is_empty() {
         format!(
-            "✅ Your upload defaults — {}",
-            escape_html(&parts.join("; "))
+            "✅ Your upload defaults\nfilename prefix: <code>{}</code>",
+            escape_html(&profile.filename_prefix)
         )
+    } else {
+        let mut text = format!("✅ Your upload defaults — {}", parts.join("; "));
+        if has_prefix {
+            text.push_str(&format!(
+                "\nfilename prefix: <code>{}</code>",
+                escape_html(&profile.filename_prefix)
+            ));
+        }
+        text
     }
+}
+
+/// Formats default categories, linking only categories confirmed to exist on Commons.
+fn format_default_categories(categories: &[String], linked_categories: &[String]) -> String {
+    categories
+        .iter()
+        .map(|category| {
+            if linked_categories.contains(category) {
+                format!(
+                    "<a href=\"{}\">{}</a>",
+                    html_attribute(&category_url(category)),
+                    escape_html(category)
+                )
+            } else {
+                escape_html(category)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Builds the OAuth client when a consumer is configured (otherwise OAuth is disabled).
@@ -7985,6 +8034,40 @@ mod tests {
             parse_category_list("Minsk, Old town , , Belarus"),
             vec!["Minsk", "Old town", "Belarus"]
         );
+    }
+
+    #[test]
+    fn defaults_summary_links_existing_categories_and_moves_prefix_to_code_line() {
+        let profile = Profile {
+            default_categories: vec!["Porplišča".into(), "Missing <category>".into()],
+            filename_prefix: "Порплище july2026".into(),
+            ..Profile::default()
+        };
+
+        let text = super::defaults_summary(&profile, &["Porplišča".into()]);
+
+        assert!(text.contains(
+            "categories: <a href=\"https://commons.wikimedia.org/wiki/Category:Porpli%C5%A1%C4%8Da\">Porplišča</a>, Missing &lt;category&gt;"
+        ));
+        assert!(text.contains("\nfilename prefix: <code>Порплище july2026</code>"));
+        assert!(!text.contains("; filename prefix:"));
+    }
+
+    #[test]
+    fn defaults_summary_escapes_non_category_defaults() {
+        let profile = Profile {
+            default_author: Some("A <B>".into()),
+            default_description: Some("D & E".into()),
+            default_lang: Some("ru".into()),
+            license_override: Some("{{PD-Russia}}".into()),
+            ..Profile::default()
+        };
+
+        let text = super::defaults_summary(&profile, &[]);
+
+        assert!(text.contains("author: A &lt;B&gt;"));
+        assert!(text.contains("description: D &amp; E"));
+        assert!(text.contains("license: {{PD-Russia}}"));
     }
 
     #[test]
