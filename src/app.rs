@@ -700,7 +700,7 @@ async fn handle_http_request(
             let headers = request.headers().clone();
             match request.into_body().collect().await {
                 Ok(collected) => {
-                    match handle_webhook_payload(&headers, &collected.to_bytes()).await {
+                    match enqueue_webhook_payload(&headers, &collected.to_bytes()).await {
                         Ok(()) => text_response(StatusCode::OK, "ok"),
                         Err(error) => {
                             let status = status_for_webhook_error(&error);
@@ -749,19 +749,51 @@ fn status_for_webhook_error(error: &anyhow::Error) -> StatusCode {
 }
 
 async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> {
+    let (config, update) = parse_webhook_payload(headers, body)?;
+    let Some(reserved) = reserve_webhook_update(config, update, false).await? else {
+        return Ok(());
+    };
+    process_reserved_webhook_update(reserved).await
+}
+
+/// Verifies, parses, reserves, and queues a Toolforge webhook update.
+async fn enqueue_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> {
+    let (config, update) = parse_webhook_payload(headers, body)?;
+    let Some(reserved) = reserve_webhook_update(config, update, true).await? else {
+        return Ok(());
+    };
+    tokio::spawn(async move {
+        if let Err(error) = process_reserved_webhook_update(reserved).await {
+            tracing::error!(error = %format!("{error:#}"), "background webhook update failed");
+        }
+    });
+    Ok(())
+}
+
+/// Parses a Telegram webhook payload after checking the configured secret header.
+fn parse_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<(Config, Update)> {
     let config = Config::from_env();
     verify_telegram_secret(&config, headers)?;
     let update: Update = serde_json::from_slice(body).context("invalid Telegram update JSON")?;
+    Ok((config, update))
+}
 
+/// Reserves webhook idempotency keys before an update is processed.
+async fn reserve_webhook_update(
+    config: Config,
+    update: Update,
+    acknowledge_in_progress: bool,
+) -> Result<Option<ReservedWebhookUpdate>> {
     let bot = Bot::from_config(config);
     let mut in_progress_key = None;
     let mut done_key = None;
-    if let Some(update_id) = update.update_id {
+    let update_id = update.update_id;
+    if let Some(update_id) = update_id {
         let done = format!("TELEGRAM_UPDATE_DONE#{update_id}");
         match bot.store.has_idempotency(&done).await {
             Ok(true) => {
                 tracing::info!(update_id, "skipping already processed Telegram update");
-                return Ok(());
+                return Ok(None);
             }
             Ok(false) => {}
             Err(error) => {
@@ -777,6 +809,9 @@ async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> 
         {
             Ok(false) => {
                 tracing::info!(update_id, "Telegram update is already being processed");
+                if acknowledge_in_progress {
+                    return Ok(None);
+                }
                 anyhow::bail!("{UPDATE_ALREADY_IN_PROGRESS_ERROR}: {update_id}");
             }
             Ok(true) => {
@@ -788,7 +823,24 @@ async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> 
             }
         }
     }
+    Ok(Some(ReservedWebhookUpdate {
+        bot,
+        update,
+        update_id,
+        in_progress_key,
+        done_key,
+    }))
+}
 
+/// Processes a reserved webhook update and records the final idempotency state.
+async fn process_reserved_webhook_update(reserved: ReservedWebhookUpdate) -> Result<()> {
+    let ReservedWebhookUpdate {
+        bot,
+        update,
+        update_id,
+        in_progress_key,
+        done_key,
+    } = reserved;
     let result = bot.handle_update(update).await;
     if let Some(key) = in_progress_key.as_deref()
         && let Err(error) = bot.store.forget_idempotency(key).await
@@ -807,7 +859,11 @@ async fn handle_webhook_payload(headers: &HeaderMap, body: &[u8]) -> Result<()> 
             }
         }
         Err(error) => {
-            tracing::error!(error = %format!("{error:#}"), "failed to handle Telegram update");
+            tracing::error!(
+                update_id,
+                error = %format!("{error:#}"),
+                "failed to handle Telegram update"
+            );
             return Err(error);
         }
     }
@@ -1124,6 +1180,15 @@ struct UploadSuccessReply<'a> {
     progress: Option<UploadProgress>,
     processing: Option<&'a UploadProcessingInfo>,
     report_metadata: Option<&'a UploadReportMetadata>,
+}
+
+/// One Telegram update reserved for processing under the webhook idempotency keys.
+struct ReservedWebhookUpdate {
+    bot: Bot,
+    update: Update,
+    update_id: Option<i64>,
+    in_progress_key: Option<String>,
+    done_key: Option<String>,
 }
 
 impl Bot {
