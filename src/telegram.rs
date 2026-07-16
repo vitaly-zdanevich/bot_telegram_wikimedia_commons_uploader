@@ -118,6 +118,43 @@ impl TelegramClient {
         Ok(())
     }
 
+    /// Sends a message with a one-time keyboard button that asks Telegram for location.
+    pub async fn send_location_request(&self, chat_id: i64, text: &str) -> Result<()> {
+        self.post_json(
+            "sendMessage",
+            &json!({
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+                "reply_markup": {
+                    "keyboard": [[{"text": "📍 Share location", "request_location": true}]],
+                    "resize_keyboard": true,
+                    "one_time_keyboard": true,
+                    "input_field_placeholder": "Share location"
+                }
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Sends a message that removes a previously shown custom reply keyboard.
+    pub async fn send_remove_keyboard_message(&self, chat_id: i64, text: &str) -> Result<()> {
+        self.post_json(
+            "sendMessage",
+            &json!({
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+                "reply_markup": {"remove_keyboard": true}
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Edits one HTML-formatted message in place.
     pub async fn edit_message_text(
         &self,

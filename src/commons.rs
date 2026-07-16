@@ -3,6 +3,7 @@ use crate::oauth::OAuthClient;
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, multipart};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Attribution category added to every file uploaded by this bot.
@@ -53,6 +54,15 @@ pub enum UploadOutcome {
         /// Whether `message` is trusted Telegram HTML built by this module.
         html: bool,
     },
+}
+
+/// Commons category counters shown in category picker buttons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CategoryCounts {
+    /// Number of direct subcategories.
+    pub subcategories: u64,
+    /// Number of direct files.
+    pub files: u64,
 }
 
 /// How an upload authenticates to Commons.
@@ -887,6 +897,65 @@ impl CommonsClient {
                     .filter(|page| page.get("missing").is_some())
                     .filter_map(|page| page.get("title").and_then(Value::as_str))
                     .map(|title| title.strip_prefix("Category:").unwrap_or(title).to_string())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Returns Commons category page counters keyed by bare category name.
+    pub async fn category_counts(
+        &self,
+        categories: &[String],
+    ) -> Result<HashMap<String, CategoryCounts>> {
+        if categories.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.session_client()?;
+        let titles = categories
+            .iter()
+            .map(|category| format!("Category:{category}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let response: Value = client
+            .get(&self.api_url)
+            .query(&[
+                ("action", "query"),
+                ("prop", "categoryinfo"),
+                ("titles", &titles),
+                ("format", "json"),
+                ("formatversion", "2"),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("Commons category count response was not valid JSON")?;
+        Ok(response
+            .get("query")
+            .and_then(|query| query.get("pages"))
+            .and_then(Value::as_array)
+            .map(|pages| {
+                pages
+                    .iter()
+                    .filter_map(|page| {
+                        let title = page.get("title")?.as_str()?;
+                        let category = title.strip_prefix("Category:").unwrap_or(title);
+                        let info = page.get("categoryinfo")?;
+                        Some((
+                            category.to_string(),
+                            CategoryCounts {
+                                subcategories: info
+                                    .get("subcats")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default(),
+                                files: info
+                                    .get("files")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default(),
+                            },
+                        ))
+                    })
                     .collect()
             })
             .unwrap_or_default())

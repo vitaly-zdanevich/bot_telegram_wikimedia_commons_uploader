@@ -1,5 +1,6 @@
+use crate::category_resolver::{CategoryReference, CategoryResolver, ResolvedCategories};
 use crate::commons::{
-    BOT_CATEGORY, CommonsBotPasswordSession, CommonsClient, DescriptionParams,
+    BOT_CATEGORY, CategoryCounts, CommonsBotPasswordSession, CommonsClient, DescriptionParams,
     StructuredDataRequest, UploadAuth, UploadData, UploadOutcome, UploadRequest, build_filename,
     build_wikitext, category_url, parse_caption,
 };
@@ -8,9 +9,10 @@ use crate::convert;
 use crate::crypto::Cipher;
 use crate::metadata;
 use crate::models::{
-    CallbackQuery, CommonsAccount, DngMode, License, Message, OnboardingStep, Profile, Update,
-    UploadProvenance,
+    CallbackQuery, CommonsAccount, DngMode, License, Location, Message, OnboardingStep, Profile,
+    Update, UploadProvenance,
 };
+use crate::nearby_categories::{Coordinates, NearbyCategory, NearbyCategoryClient};
 use crate::oauth::{Consumer, OAuthClient, OAuthEndpoints};
 use crate::oauth2::{OAuth2Client, OAuth2Consumer, OAuth2Endpoints, OAuth2Token};
 use crate::store::Store;
@@ -71,6 +73,12 @@ const UPDATE_IN_PROGRESS_SECONDS: i64 = 10 * 60;
 const UPDATE_ALREADY_IN_PROGRESS_ERROR: &str = "telegram update is already being processed";
 /// Maximum time spent linking default categories before replying to Telegram.
 const DEFAULT_CATEGORY_LINK_TIMEOUT_SECONDS: u64 = 3;
+/// Maximum time spent finding nearby Commons categories.
+const NEARBY_CATEGORY_LOOKUP_TIMEOUT_SECS: u64 = 20;
+/// Maximum time spent resolving article/QID/Commons links into categories.
+const CATEGORY_REFERENCE_LOOKUP_TIMEOUT_SECS: u64 = 20;
+/// Maximum time spent fetching category counters for inline buttons.
+const CATEGORY_COUNT_LOOKUP_TIMEOUT_SECS: u64 = 3;
 /// Maximum age of an OAuth2 callback state token.
 const OAUTH2_STATE_TTL_SECONDS: i64 = 30 * 60;
 /// Message shown once onboarding is complete.
@@ -933,6 +941,8 @@ struct Bot {
     telegram: TelegramClient,
     store: Store,
     commons: CommonsClient,
+    nearby_categories: NearbyCategoryClient,
+    category_resolver: CategoryResolver,
     cipher: Option<Cipher>,
     oauth: Option<OAuthClient>,
     oauth2: Option<OAuth2Client>,
@@ -1208,6 +1218,17 @@ impl Bot {
             oauth.clone(),
             config.commons_ignore_exists_normalized_warning,
         );
+        let nearby_categories = NearbyCategoryClient::new(
+            config.user_agent.clone(),
+            config.wikidata_sparql_url.clone(),
+            config.nearby_category_radius_meters,
+            config.nearby_category_limit,
+        );
+        let category_resolver = CategoryResolver::new(
+            config.user_agent.clone(),
+            config.commons_api_url.clone(),
+            config.nearby_category_limit as usize,
+        );
         let cipher = config
             .credential_enc_key
             .as_deref()
@@ -1217,6 +1238,8 @@ impl Bot {
             telegram,
             store,
             commons,
+            nearby_categories,
+            category_resolver,
             cipher,
             oauth,
             oauth2,
@@ -1242,6 +1265,71 @@ impl Bot {
         };
         let user_id = user.id;
         self.remember_group_caption(&message).await;
+        let settings_profile = self.store.get_profile(user_id).await;
+        let waiting_for_category_input = matches!(
+            settings_profile.onboarding_step,
+            OnboardingStep::AwaitingCategoryLocation | OnboardingStep::AwaitingCategoryPhoto
+        );
+        if let Some(location) = message.location {
+            if settings_profile.is_ready() || waiting_for_category_input {
+                return self
+                    .handle_category_location(chat_id, user_id, settings_profile, location)
+                    .await;
+            }
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Run /start first to connect your Commons account.",
+                    None,
+                )
+                .await;
+        }
+        if settings_profile.onboarding_step == OnboardingStep::AwaitingCategoryLocation {
+            let text = message_text_for_links(&message).unwrap_or_default();
+            if let Some(coordinates) = coordinates_from_text(&text, true) {
+                return self
+                    .suggest_categories_from_coordinates(
+                        chat_id,
+                        user_id,
+                        settings_profile,
+                        coordinates,
+                    )
+                    .await;
+            }
+            if let Some(reference) = category_reference_from_text(&text) {
+                return self
+                    .suggest_categories_from_reference(
+                        chat_id,
+                        user_id,
+                        settings_profile,
+                        reference,
+                    )
+                    .await;
+            }
+            return self
+                .telegram
+                .send_location_request(
+                    chat_id,
+                    "Send a Telegram location, map link, coordinates, Wikipedia article, Wikidata QID, or Commons link and I will suggest Commons categories.",
+                )
+                .await;
+        }
+        if settings_profile.onboarding_step == OnboardingStep::AwaitingCategoryPhoto {
+            let Some(file) = extract_file(&message) else {
+                return self
+                    .telegram
+                    .send_message(
+                        chat_id,
+                        "Send an original geotagged photo as a file/document so I can read its GPS coordinates.",
+                        None,
+                    )
+                    .await;
+            };
+            return self
+                .handle_category_photo(chat_id, user_id, settings_profile, &file)
+                .await;
+        }
 
         if let Some(file) = extract_file(&message) {
             if message.media_group_id.is_some() && defer_uploads_after_ack() {
@@ -1268,12 +1356,38 @@ impl Bot {
         if trimmed.starts_with('/') {
             return self.handle_command(chat_id, user_id, &trimmed).await;
         }
-        if let Some(url) = first_external_url(&trimmed) {
+        let profile = settings_profile;
+        let external_url = first_external_url(&trimmed);
+        if let Some(link) = external_url.as_ref()
+            && profile.is_ready()
+            && map_url_looks_supported(&link.url)
+        {
+            if let Some(coordinates) = coordinates_from_url(&link.url) {
+                return self
+                    .suggest_categories_from_coordinates(chat_id, user_id, profile, coordinates)
+                    .await;
+            }
+            return self
+                .telegram
+                .send_message(
+                    chat_id,
+                    "I recognized a map link, but could not find coordinates in it. Send a Telegram location or a map link that includes latitude/longitude.",
+                    None,
+                )
+                .await;
+        }
+        if profile.is_ready()
+            && let Some(reference) = category_reference_from_text(&trimmed)
+        {
+            return self
+                .suggest_categories_from_reference(chat_id, user_id, profile, reference)
+                .await;
+        }
+        if let Some(url) = external_url {
             return self
                 .handle_link_upload(chat_id, user_id, &message, url)
                 .await;
         }
-        let profile = self.store.get_profile(user_id).await;
         if profile.is_ready()
             && crate::commons::parse_settings_command(&trimmed).is_empty()
             && remember_text_context(chat_id, user_id, &message, &trimmed).await
@@ -1443,6 +1557,23 @@ impl Bot {
                         chat_id,
                         "Send the new <b>filename prefix</b> as a message, or /cancel.",
                         None,
+                    )
+                    .await
+            }
+            OnboardingStep::AwaitingCategoryLocation => {
+                self.telegram
+                    .send_location_request(
+                        chat_id,
+                        "Send a Telegram location, map link, coordinates, Wikipedia article, Wikidata QID, or Commons link and I will suggest Commons categories.",
+                    )
+                    .await
+            }
+            OnboardingStep::AwaitingCategoryPhoto => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        "Send an original geotagged photo as a file/document so I can read its GPS coordinates, or /cancel.",
+                        Some(settings_category_wait_keyboard()),
                     )
                     .await
             }
@@ -1758,6 +1889,24 @@ impl Bot {
                         &settings_overview(&profile),
                         Some(settings_keyboard(&profile)),
                     )
+                    .await
+            }
+            OnboardingStep::AwaitingCategoryLocation => {
+                if let Some(coordinates) = coordinates_from_text(text, true) {
+                    return self
+                        .suggest_categories_from_coordinates(chat_id, user_id, profile, coordinates)
+                        .await;
+                }
+                if let Some(reference) = category_reference_from_text(text) {
+                    return self
+                        .suggest_categories_from_reference(chat_id, user_id, profile, reference)
+                        .await;
+                }
+                self.prompt_step(chat_id, OnboardingStep::AwaitingCategoryLocation)
+                    .await
+            }
+            OnboardingStep::AwaitingCategoryPhoto => {
+                self.prompt_step(chat_id, OnboardingStep::AwaitingCategoryPhoto)
                     .await
             }
             #[cfg(feature = "archive")]
@@ -2087,12 +2236,48 @@ impl Bot {
         }
 
         if data == "set:categories" {
+            if matches!(
+                profile.onboarding_step,
+                OnboardingStep::AwaitingCategoryLocation | OnboardingStep::AwaitingCategoryPhoto
+            ) {
+                profile.onboarding_step = OnboardingStep::Done;
+                touch(&mut profile);
+                self.store.put_profile(user_id, &profile).await?;
+            }
+            let counts = self.category_counts_for_picker(&profile).await;
             return self
                 .replace_message_text_or_send(
                     chat_id,
                     callback_message_id,
                     &settings_categories_overview(&profile),
-                    Some(settings_categories_keyboard(&profile)),
+                    Some(settings_categories_keyboard_with_counts(&profile, &counts)),
+                )
+                .await;
+        }
+
+        if data == "set:categories:nearby" {
+            profile.onboarding_step = OnboardingStep::AwaitingCategoryLocation;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .telegram
+                .send_location_request(
+                    chat_id,
+                    "Send a Telegram location, map link, coordinates, Wikipedia article, Wikidata QID, or Commons link and I will suggest Commons categories.",
+                )
+                .await;
+        }
+
+        if data == "set:categories:photo" {
+            profile.onboarding_step = OnboardingStep::AwaitingCategoryPhoto;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            return self
+                .replace_message_text_or_send(
+                    chat_id,
+                    callback_message_id,
+                    "🏷 <b>Categories from photo geolocation</b>\nSend an original geotagged photo as a file/document. I will read its GPS coordinates and return the closest Commons category buttons.",
+                    Some(settings_category_wait_keyboard()),
                 )
                 .await;
         }
@@ -2101,12 +2286,13 @@ impl Bot {
             profile.default_categories.clear();
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
+            let counts = self.category_counts_for_picker(&profile).await;
             return self
                 .replace_message_text_or_send(
                     chat_id,
                     callback_message_id,
                     &settings_categories_overview(&profile),
-                    Some(settings_categories_keyboard(&profile)),
+                    Some(settings_categories_keyboard_with_counts(&profile, &counts)),
                 )
                 .await;
         }
@@ -2118,12 +2304,13 @@ impl Bot {
                     toggle_selected_category(&mut profile, category);
                     touch(&mut profile);
                     self.store.put_profile(user_id, &profile).await?;
+                    let counts = self.category_counts_for_picker(&profile).await;
                     return self
                         .replace_message_text_or_send(
                             chat_id,
                             callback_message_id,
                             &settings_categories_overview(&profile),
-                            Some(settings_categories_keyboard(&profile)),
+                            Some(settings_categories_keyboard_with_counts(&profile, &counts)),
                         )
                         .await;
                 }
@@ -2163,7 +2350,12 @@ impl Bot {
         }
 
         if data == "set:main" {
-            if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+            if matches!(
+                profile.onboarding_step,
+                OnboardingStep::AwaitingSettingsPrefix
+                    | OnboardingStep::AwaitingCategoryLocation
+                    | OnboardingStep::AwaitingCategoryPhoto
+            ) {
                 profile.onboarding_step = OnboardingStep::Done;
                 touch(&mut profile);
                 self.store.put_profile(user_id, &profile).await?;
@@ -2358,6 +2550,231 @@ impl Bot {
         }
     }
 
+    /// Handles a user-shared Telegram location for nearby category suggestions.
+    async fn handle_category_location(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        profile: Profile,
+        location: Location,
+    ) -> Result<()> {
+        let Some(coordinates) = Coordinates::new(location.latitude, location.longitude) else {
+            return self
+                .telegram
+                .send_message(chat_id, "Telegram sent invalid coordinates.", None)
+                .await;
+        };
+        self.telegram
+            .send_remove_keyboard_message(chat_id, "Looking up nearby Commons categories…")
+            .await
+            .ok();
+        self.suggest_categories_from_coordinates(chat_id, user_id, profile, coordinates)
+            .await
+    }
+
+    /// Handles a geotagged photo/file sent for nearby category suggestions.
+    async fn handle_category_photo(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        profile: Profile,
+        file: &FileRef,
+    ) -> Result<()> {
+        if file
+            .file_size
+            .is_some_and(|size| size > self.config.max_file_bytes)
+        {
+            return self.reject_too_large(chat_id).await;
+        }
+        send_chat_action_best_effort(&self.telegram, chat_id, "typing").await;
+        let original = match self
+            .telegram
+            .resolve_by_file_id(&file.file_id, self.config.max_file_bytes)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "category photo download failed");
+                return self.reject_too_large(chat_id).await;
+            }
+        };
+        let metadata = metadata_from_telegram_file(&original);
+        let Some((latitude, longitude)) = metadata.coordinates() else {
+            let mut profile = profile;
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+            let text = if file.compressed_photo {
+                "I could not find GPS coordinates. Telegram photos often lose EXIF; send the original photo as a file/document."
+            } else {
+                "I could not find GPS coordinates in this file. Send an original geotagged photo."
+            };
+            return self
+                .telegram
+                .send_message(chat_id, text, Some(settings_categories_keyboard(&profile)))
+                .await;
+        };
+        let Some(coordinates) = Coordinates::new(latitude, longitude) else {
+            return self
+                .telegram
+                .send_message(chat_id, "The photo has invalid GPS coordinates.", None)
+                .await;
+        };
+        self.suggest_categories_from_coordinates(chat_id, user_id, profile, coordinates)
+            .await
+    }
+
+    /// Finds nearby Commons categories and returns them as selectable settings buttons.
+    async fn suggest_categories_from_coordinates(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        mut profile: Profile,
+        coordinates: Coordinates,
+    ) -> Result<()> {
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        profile.onboarding_step = OnboardingStep::Done;
+        let categories = match tokio::time::timeout(
+            std::time::Duration::from_secs(NEARBY_CATEGORY_LOOKUP_TIMEOUT_SECS),
+            self.nearby_categories.nearby_categories(coordinates),
+        )
+        .await
+        {
+            Ok(Ok(categories)) => categories,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    error = %format!("{error:#}"),
+                    "nearby category lookup failed"
+                );
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    timeout_seconds = NEARBY_CATEGORY_LOOKUP_TIMEOUT_SECS,
+                    "nearby category lookup timed out"
+                );
+                Vec::new()
+            }
+        };
+
+        if !categories.is_empty() {
+            let names = categories
+                .iter()
+                .map(|category| category.category.clone())
+                .collect::<Vec<_>>();
+            remember_used_categories(&mut profile, &names);
+        }
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await?;
+
+        let text = nearby_categories_message(&categories, coordinates);
+        let counts = self.category_counts_for_picker(&profile).await;
+        self.telegram
+            .send_message(
+                chat_id,
+                &text,
+                Some(settings_categories_keyboard_with_counts(&profile, &counts)),
+            )
+            .await
+    }
+
+    /// Resolves a wiki/QID/Commons reference and returns selectable category buttons.
+    async fn suggest_categories_from_reference(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        mut profile: Profile,
+        reference: CategoryReference,
+    ) -> Result<()> {
+        self.telegram.send_chat_action(chat_id, "typing").await.ok();
+        profile.onboarding_step = OnboardingStep::Done;
+        let source_label = reference.label();
+        let resolved = match tokio::time::timeout(
+            std::time::Duration::from_secs(CATEGORY_REFERENCE_LOOKUP_TIMEOUT_SECS),
+            self.category_resolver.categories_for_reference(&reference),
+        )
+        .await
+        {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    source = source_label,
+                    error = %format!("{error:#}"),
+                    "category reference lookup failed"
+                );
+                ResolvedCategories {
+                    source_label,
+                    categories: Vec::new(),
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    user_id,
+                    chat_id,
+                    source = source_label,
+                    timeout_seconds = CATEGORY_REFERENCE_LOOKUP_TIMEOUT_SECS,
+                    "category reference lookup timed out"
+                );
+                ResolvedCategories {
+                    source_label,
+                    categories: Vec::new(),
+                }
+            }
+        };
+
+        if !resolved.categories.is_empty() {
+            remember_used_categories(&mut profile, &resolved.categories);
+        }
+        touch(&mut profile);
+        self.store.put_profile(user_id, &profile).await?;
+
+        let text = resolved_categories_message(&resolved);
+        let counts = self.category_counts_for_picker(&profile).await;
+        self.telegram
+            .send_message(
+                chat_id,
+                &text,
+                Some(settings_categories_keyboard_with_counts(&profile, &counts)),
+            )
+            .await
+    }
+
+    /// Fetches category counters for the current picker, with a short timeout.
+    async fn category_counts_for_picker(
+        &self,
+        profile: &Profile,
+    ) -> HashMap<String, CategoryCounts> {
+        let categories = category_picker_entries(profile);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(CATEGORY_COUNT_LOOKUP_TIMEOUT_SECS),
+            self.commons.category_counts(&categories),
+        )
+        .await
+        {
+            Ok(Ok(counts)) => counts,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "category count lookup failed"
+                );
+                HashMap::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = CATEGORY_COUNT_LOOKUP_TIMEOUT_SECS,
+                    "category count lookup timed out"
+                );
+                HashMap::new()
+            }
+        }
+    }
+
     /// Deletes the user's stored credentials and profile.
     async fn cmd_forget(&self, chat_id: i64, user_id: i64) -> Result<()> {
         self.store.delete_profile(user_id).await?;
@@ -2409,6 +2826,14 @@ impl Bot {
             self.store.put_profile(user_id, &profile).await?;
         }
         if profile.onboarding_step == OnboardingStep::AwaitingSettingsPrefix {
+            profile.onboarding_step = OnboardingStep::Done;
+            touch(&mut profile);
+            self.store.put_profile(user_id, &profile).await?;
+        }
+        if matches!(
+            profile.onboarding_step,
+            OnboardingStep::AwaitingCategoryLocation | OnboardingStep::AwaitingCategoryPhoto
+        ) {
             profile.onboarding_step = OnboardingStep::Done;
             touch(&mut profile);
             self.store.put_profile(user_id, &profile).await?;
@@ -6036,6 +6461,14 @@ fn settings_categories_overview(profile: &Profile) -> String {
 
 /// Builds the multi-select keyboard for remembered upload categories.
 fn settings_categories_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
+    settings_categories_keyboard_with_counts(profile, &HashMap::new())
+}
+
+/// Builds the category picker keyboard, optionally showing Commons category counters.
+fn settings_categories_keyboard_with_counts(
+    profile: &Profile,
+    counts: &HashMap<String, CategoryCounts>,
+) -> InlineKeyboardMarkup {
     let categories = category_picker_entries(profile);
     let mut rows: Vec<Vec<InlineKeyboardButton>> = categories
         .iter()
@@ -6046,11 +6479,21 @@ fn settings_categories_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             } else {
                 ""
             };
-            vec![InlineKeyboardButton {
-                text: format!("{selected}{}", compact_button_value(category)),
-                callback_data: Some(format!("set:category:{index}")),
-                url: None,
-            }]
+            vec![
+                InlineKeyboardButton {
+                    text: format!(
+                        "{selected}{}",
+                        category_button_label(category, counts.get(category))
+                    ),
+                    callback_data: Some(format!("set:category:{index}")),
+                    url: None,
+                },
+                InlineKeyboardButton {
+                    text: "↗".to_string(),
+                    callback_data: None,
+                    url: Some(category_url(category)),
+                },
+            ]
         })
         .collect();
     if rows.is_empty() {
@@ -6060,6 +6503,16 @@ fn settings_categories_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
             url: None,
         }]);
     }
+    rows.push(vec![InlineKeyboardButton {
+        text: "📍 Find closest from location".to_string(),
+        callback_data: Some("set:categories:nearby".to_string()),
+        url: None,
+    }]);
+    rows.push(vec![InlineKeyboardButton {
+        text: "📷 Categories from photo geolocation".to_string(),
+        callback_data: Some("set:categories:photo".to_string()),
+        url: None,
+    }]);
     rows.push(vec![InlineKeyboardButton {
         text: if profile.default_categories.is_empty() {
             "Select none (already none)"
@@ -6077,6 +6530,94 @@ fn settings_categories_keyboard(profile: &Profile) -> InlineKeyboardMarkup {
     }]);
     InlineKeyboardMarkup {
         inline_keyboard: rows,
+    }
+}
+
+/// Formats one category button as `Name (2 C 10 F)` when counts fit.
+fn category_button_label(category: &str, counts: Option<&CategoryCounts>) -> String {
+    const MAX_WITH_COUNTS_CHARS: usize = 36;
+    let Some(counts) = counts else {
+        return compact_button_value(category);
+    };
+    let with_counts = format!(
+        "{} ({} C {} F)",
+        category, counts.subcategories, counts.files
+    );
+    if with_counts.chars().count() <= MAX_WITH_COUNTS_CHARS {
+        with_counts
+    } else {
+        compact_button_value(category)
+    }
+}
+
+/// Builds a minimal keyboard shown while waiting for category geolocation input.
+fn settings_category_wait_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "← Back to categories".to_string(),
+            callback_data: Some("set:categories".to_string()),
+            url: None,
+        }]],
+    }
+}
+
+/// Formats nearby category suggestions above the category picker keyboard.
+fn nearby_categories_message(categories: &[NearbyCategory], coordinates: Coordinates) -> String {
+    if categories.is_empty() {
+        return format!(
+            "🏷 <b>Closest Commons categories</b>\nCoordinates: <code>{:.6}, {:.6}</code>\n\nNo nearby Wikidata items with Commons categories were found. Try another location or add categories manually.",
+            coordinates.latitude, coordinates.longitude
+        );
+    }
+    let mut text = format!(
+        "🏷 <b>Closest Commons categories</b>\nCoordinates: <code>{:.6}, {:.6}</code>\n\nTap buttons below to select or unselect categories.",
+        coordinates.latitude, coordinates.longitude
+    );
+    for category in categories {
+        text.push_str(&format!(
+            "\n• <a href=\"{}\">{}</a>{}",
+            html_attribute(&category_url(&category.category)),
+            escape_html(&category.category),
+            nearby_category_context(category)
+        ));
+    }
+    text
+}
+
+/// Formats category suggestions resolved from a wiki page, Commons link, or Wikidata item.
+fn resolved_categories_message(resolved: &ResolvedCategories) -> String {
+    let source = escape_html(&resolved.source_label);
+    if resolved.categories.is_empty() {
+        return format!(
+            "🏷 <b>Commons categories</b>\nSource: <code>{source}</code>\n\nNo Commons categories were found from this reference."
+        );
+    }
+    let mut text = format!(
+        "🏷 <b>Commons categories</b>\nSource: <code>{source}</code>\n\nTap buttons below to select or unselect categories."
+    );
+    for category in &resolved.categories {
+        text.push_str(&format!(
+            "\n• <a href=\"{}\">{}</a>",
+            html_attribute(&category_url(category)),
+            escape_html(category)
+        ));
+    }
+    text
+}
+
+/// Formats optional distance and label context for one nearby category.
+fn nearby_category_context(category: &NearbyCategory) -> String {
+    let mut parts = Vec::new();
+    if let Some(distance) = category.distance_km {
+        parts.push(format!("{distance:.1} km"));
+    }
+    if let Some(label) = &category.label {
+        parts.push(escape_html(label));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", parts.join(", "))
     }
 }
 
@@ -7198,11 +7739,87 @@ fn first_external_url(text: &str) -> Option<LinkCandidate> {
     })
 }
 
+/// Parses coordinates from plain text or from the first map URL in the text.
+fn coordinates_from_text(text: &str, allow_plain: bool) -> Option<Coordinates> {
+    if allow_plain
+        && let Some((latitude, longitude)) = crate::geo::parse_coordinates(text)
+        && let Some(coordinates) = Coordinates::new(latitude, longitude)
+    {
+        return Some(coordinates);
+    }
+    let link = first_external_url(text)?;
+    coordinates_from_url(&link.url)
+}
+
+/// Parses coordinates from a URL using the shared map-link parser.
+fn coordinates_from_url(url: &Url) -> Option<Coordinates> {
+    let (latitude, longitude) = crate::geo::parse_coordinates(url.as_str())?;
+    Coordinates::new(latitude, longitude)
+}
+
+/// Returns true when a URL host belongs to a map provider with coordinate links.
+fn map_url_looks_supported(url: &Url) -> bool {
+    host_matches(
+        url,
+        &[
+            "google.com",
+            "goo.gl",
+            "maps.app.goo.gl",
+            "yandex.ru",
+            "yandex.com",
+            "2gis.ru",
+            "2gis.com",
+            "maps.apple.com",
+            "openstreetmap.org",
+            "osm.org",
+            "wikimapia.org",
+            "bing.com",
+            "here.com",
+            "mapy.cz",
+            "amap.com",
+            "autonavi.com",
+            "gaode.com",
+            "map.baidu.com",
+            "baidu.com",
+            "map.qq.com",
+            "maps.qq.com",
+            "qq.com",
+            "osmand.net",
+            "geohack.toolforge.org",
+        ],
+    )
+}
+
+/// Parses a category reference from QID text or the first supported wiki URL in text.
+fn category_reference_from_text(text: &str) -> Option<CategoryReference> {
+    CategoryReference::from_qid_text(text).or_else(|| {
+        let link = first_external_url(text)?;
+        CategoryReference::from_url(&link.url)
+    })
+}
+
+/// Returns true when a token starts with a wiki host the bot can resolve to categories.
+fn wiki_link_host_token(lower: &str) -> bool {
+    const HOSTS: &[&str] = &[
+        "wikidata.org/",
+        "www.wikidata.org/",
+        "commons.wikimedia.org/",
+        "commons.m.wikimedia.org/",
+    ];
+    HOSTS.iter().any(|host| lower.starts_with(host))
+        || lower.split('/').next().is_some_and(|host| {
+            host.ends_with(".wikipedia.org") || host.ends_with(".m.wikipedia.org")
+        })
+}
+
 /// Parses a token as an URL, accepting common link forms without an explicit scheme.
 fn parse_url_token(token: &str) -> Option<Url> {
     Url::parse(token).ok().or_else(|| {
         let lower = token.to_ascii_lowercase();
-        if known_link_host_token(&lower) || looks_like_bare_url(&lower) {
+        if known_link_host_token(&lower)
+            || wiki_link_host_token(&lower)
+            || looks_like_bare_url(&lower)
+        {
             Url::parse(&format!("https://{token}")).ok()
         } else {
             None
@@ -7238,6 +7855,33 @@ fn known_link_host_token(lower: &str) -> bool {
         "podcasts.apple.com/",
         "archive.org/",
         "www.archive.org/",
+        "google.com/maps/",
+        "www.google.com/maps/",
+        "maps.google.com/",
+        "maps.app.goo.gl/",
+        "yandex.ru/maps/",
+        "yandex.com/maps/",
+        "2gis.ru/",
+        "2gis.com/",
+        "maps.apple.com/",
+        "openstreetmap.org/",
+        "www.openstreetmap.org/",
+        "osm.org/",
+        "wikimapia.org/",
+        "www.wikimapia.org/",
+        "bing.com/maps/",
+        "www.bing.com/maps/",
+        "here.com/",
+        "www.here.com/",
+        "mapy.cz/",
+        "amap.com/",
+        "uri.amap.com/",
+        "autonavi.com/",
+        "map.baidu.com/",
+        "map.qq.com/",
+        "maps.qq.com/",
+        "osmand.net/",
+        "geohack.toolforge.org/",
     ];
     HOSTS.iter().any(|host| lower.starts_with(host))
 }
@@ -8030,19 +8674,23 @@ mod tests {
         COMMONS_MAX_FILE_BYTES, COMMONS_MAX_FILE_SIZE_DOC, FfmpegPlan, FfmpegPlanKind, MediaProbe,
         MediaStreamInfo, TEXT_CONTEXTS, TextContext, UPDATE_ALREADY_IN_PROGRESS_ERROR,
         accounts_keyboard, archive_org_file_is_upload_candidate, archive_org_identifier,
-        caption_without_link, commons_max_file_size_message, conversion_rejection_reason,
+        caption_without_link, category_button_label, category_reference_from_text,
+        commons_max_file_size_message, conversion_rejection_reason, coordinates_from_text,
         direct_link_looks_like_commons_file, dropmefiles_download_url_from_page,
         dropmefiles_file_ids, dropmefiles_upload_id, effective_filename_prefix,
         ensure_commons_file_size_limit, ffmpeg_plan_for_probe, filename_needs_descriptive_context,
-        first_external_url, is_dropmefiles_url, media_group_upload_progress, merge_categories,
-        now_ts, parse_category_list, register_media_group_upload, remember_text_context,
-        remember_used_categories, settings_categories_keyboard, settings_keyboard,
-        settings_license_keyboard, settings_prefix_keyboard, should_try_ffmpeg_media_conversion,
-        status_for_webhook_error, take_text_context, text_context_for_upload,
+        first_external_url, is_dropmefiles_url, map_url_looks_supported,
+        media_group_upload_progress, merge_categories, now_ts, parse_category_list,
+        register_media_group_upload, remember_text_context, remember_used_categories,
+        settings_categories_keyboard, settings_keyboard, settings_license_keyboard,
+        settings_prefix_keyboard, should_try_ffmpeg_media_conversion, status_for_webhook_error,
+        take_text_context, text_context_for_upload,
     };
-    use crate::commons::{build_filename, parse_caption};
+    use crate::category_resolver::CategoryReference;
+    use crate::commons::{CategoryCounts, build_filename, parse_caption};
     use crate::convert::SourceFormat;
     use crate::models::{Chat, CommonsAccount, DngMode, License, Message, Profile, User};
+    use crate::nearby_categories::Coordinates;
     use http::StatusCode;
 
     fn test_message(chat_id: i64, user_id: i64, forwarded: bool) -> Message {
@@ -8064,6 +8712,7 @@ mod tests {
             audio: None,
             voice: None,
             video: None,
+            location: None,
         }
     }
 
@@ -8309,6 +8958,75 @@ mod tests {
         assert_eq!(
             caption_without_link("Archive: https://example.org/a.rar", &direct),
             "Archive:"
+        );
+    }
+
+    #[test]
+    fn map_links_are_recognized_for_nearby_categories() {
+        let link = first_external_url("https://maps.apple.com/?ll=55.75,37.61&q=Pin").unwrap();
+        assert!(map_url_looks_supported(&link.url));
+        assert_eq!(
+            coordinates_from_text("see https://maps.apple.com/?ll=55.75,37.61&q=Pin", false),
+            Some(Coordinates {
+                latitude: 55.75,
+                longitude: 37.61,
+            })
+        );
+        assert_eq!(
+            coordinates_from_text("55.75, 37.61", true),
+            Some(Coordinates {
+                latitude: 55.75,
+                longitude: 37.61,
+            })
+        );
+        assert_eq!(coordinates_from_text("55.75, 37.61", false), None);
+    }
+
+    #[test]
+    fn category_references_are_recognized_from_qids_and_wiki_links() {
+        assert_eq!(
+            category_reference_from_text("Q140382791"),
+            Some(CategoryReference::WikidataItem {
+                qid: "Q140382791".into()
+            })
+        );
+        assert_eq!(
+            category_reference_from_text("https://commons.wikimedia.org/wiki/Category:Batumi"),
+            Some(CategoryReference::CommonsPage {
+                title: "Category:Batumi".into()
+            })
+        );
+        assert_eq!(
+            category_reference_from_text("en.wikipedia.org/wiki/Batumi"),
+            Some(CategoryReference::WikipediaPage {
+                api_url: "https://en.wikipedia.org/w/api.php".into(),
+                title: "Batumi".into(),
+                project_label: "en.wikipedia.org".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn category_button_counts_match_commons_order_when_short_enough() {
+        assert_eq!(
+            category_button_label(
+                "Batumi",
+                Some(&CategoryCounts {
+                    subcategories: 2,
+                    files: 10,
+                })
+            ),
+            "Batumi (2 C 10 F)"
+        );
+        assert_eq!(
+            category_button_label(
+                "A very very very very very long category",
+                Some(&CategoryCounts {
+                    subcategories: 2,
+                    files: 10,
+                })
+            ),
+            "A very very very very very l…"
         );
     }
 
@@ -8872,8 +9590,21 @@ mod tests {
             .collect();
 
         assert!(labels.contains(&"✅ Minsk"));
+        assert!(labels.contains(&"↗"));
         assert!(labels.contains(&"Churches"));
+        assert!(labels.contains(&"📍 Find closest from location"));
+        assert!(labels.contains(&"📷 Categories from photo geolocation"));
         assert!(labels.contains(&"Select none"));
+
+        let minsk_link = keyboard
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|button| {
+                button.url.as_deref() == Some("https://commons.wikimedia.org/wiki/Category:Minsk")
+            })
+            .expect("category row should include an open-link button");
+        assert_eq!(minsk_link.text, "↗");
     }
 
     #[test]

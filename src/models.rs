@@ -156,6 +156,10 @@ pub enum OnboardingStep {
     AwaitingPrefix,
     /// Waiting for a filename prefix requested from `/settings`.
     AwaitingSettingsPrefix,
+    /// Waiting for a Telegram location to suggest nearby Commons categories.
+    AwaitingCategoryLocation,
+    /// Waiting for a geotagged photo/file to suggest nearby Commons categories.
+    AwaitingCategoryPhoto,
     /// Waiting for a filename prefix required by a staged archive with generic names.
     AwaitingArchivePrefix,
     /// Onboarding complete; ready to upload.
@@ -173,6 +177,8 @@ impl OnboardingStep {
             "awaiting_license" => Some(OnboardingStep::AwaitingLicense),
             "awaiting_prefix" => Some(OnboardingStep::AwaitingPrefix),
             "awaiting_settings_prefix" => Some(OnboardingStep::AwaitingSettingsPrefix),
+            "awaiting_category_location" => Some(OnboardingStep::AwaitingCategoryLocation),
+            "awaiting_category_photo" => Some(OnboardingStep::AwaitingCategoryPhoto),
             "awaiting_archive_prefix" => Some(OnboardingStep::AwaitingArchivePrefix),
             "done" => Some(OnboardingStep::Done),
             _ => None,
@@ -189,6 +195,8 @@ impl OnboardingStep {
             OnboardingStep::AwaitingLicense => "awaiting_license",
             OnboardingStep::AwaitingPrefix => "awaiting_prefix",
             OnboardingStep::AwaitingSettingsPrefix => "awaiting_settings_prefix",
+            OnboardingStep::AwaitingCategoryLocation => "awaiting_category_location",
+            OnboardingStep::AwaitingCategoryPhoto => "awaiting_category_photo",
             OnboardingStep::AwaitingArchivePrefix => "awaiting_archive_prefix",
             OnboardingStep::Done => "done",
         }
@@ -511,6 +519,8 @@ pub struct Message {
     pub voice: Option<Voice>,
     /// Video attachment (e.g. WebM).
     pub video: Option<Video>,
+    /// User-shared Telegram location.
+    pub location: Option<Location>,
 }
 
 impl Message {
@@ -536,6 +546,15 @@ pub struct Chat {
 pub struct User {
     /// User id.
     pub id: i64,
+}
+
+/// Telegram location payload.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Location {
+    /// Latitude in decimal degrees.
+    pub latitude: f64,
+    /// Longitude in decimal degrees.
+    pub longitude: f64,
 }
 
 /// Telegram callback query subset (inline keyboard presses).
@@ -660,6 +679,8 @@ mod tests {
             OnboardingStep::AwaitingLicense,
             OnboardingStep::AwaitingPrefix,
             OnboardingStep::AwaitingSettingsPrefix,
+            OnboardingStep::AwaitingCategoryLocation,
+            OnboardingStep::AwaitingCategoryPhoto,
             OnboardingStep::AwaitingArchivePrefix,
             OnboardingStep::Done,
         ] {
@@ -762,6 +783,7 @@ mod tests {
             audio: None,
             voice: None,
             video: None,
+            location: None,
         };
         assert!(!normal.is_forwarded());
 

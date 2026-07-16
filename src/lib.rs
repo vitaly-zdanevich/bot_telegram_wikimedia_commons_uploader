@@ -8,6 +8,7 @@ pub mod app;
 #[cfg(feature = "archive")]
 pub mod archive;
 pub mod aws;
+pub mod category_resolver;
 pub mod commons;
 pub mod config;
 pub mod convert;
@@ -15,6 +16,7 @@ pub mod crypto;
 pub mod geo;
 pub mod metadata;
 pub mod models;
+pub mod nearby_categories;
 pub mod oauth;
 pub mod oauth2;
 pub mod store;

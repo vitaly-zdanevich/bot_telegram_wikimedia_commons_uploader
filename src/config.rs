@@ -13,6 +13,12 @@ const DEFAULT_MAX_ARCHIVE_FILE_MB: u64 = 100;
 const DEFAULT_WEBP_QUALITY: f32 = 90.0;
 /// Default Commons Action API endpoint.
 const DEFAULT_COMMONS_API_URL: &str = "https://commons.wikimedia.org/w/api.php";
+/// Default Wikidata Query Service endpoint for nearby category suggestions.
+const DEFAULT_WIKIDATA_SPARQL_URL: &str = "https://query.wikidata.org/sparql";
+/// Default radius for nearby category suggestions, in meters.
+const DEFAULT_NEARBY_CATEGORY_RADIUS_METERS: u32 = 10_000;
+/// Default maximum number of nearby category suggestions.
+const DEFAULT_NEARBY_CATEGORY_LIMIT: u32 = 20;
 /// Default project repository URL shown in `/help`.
 const DEFAULT_GITHUB_URL: &str =
     "https://github.com/vitaly-zdanevich/bot_telegram_wikimedia_commons_uploader";
@@ -73,6 +79,12 @@ pub struct Config {
     pub archive_thumbnail_resize: bool,
     /// Commons Action API endpoint.
     pub commons_api_url: String,
+    /// Wikidata Query Service endpoint for nearby category suggestions.
+    pub wikidata_sparql_url: String,
+    /// Radius for nearby Commons category suggestions, in meters.
+    pub nearby_category_radius_meters: u32,
+    /// Maximum number of nearby Commons category suggestions.
+    pub nearby_category_limit: u32,
     /// User-Agent sent to Commons, per MediaWiki API etiquette.
     pub user_agent: String,
     /// Optional HTTP(S) proxy URL for Commons traffic (to upload from a non-blocked IP).
@@ -198,6 +210,16 @@ impl Config {
             commons_api_url: lookup("COMMONS_API_URL")
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| DEFAULT_COMMONS_API_URL.into()),
+            wikidata_sparql_url: lookup("WIKIDATA_SPARQL_URL")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_WIKIDATA_SPARQL_URL.into()),
+            nearby_category_radius_meters: lookup("NEARBY_CATEGORY_RADIUS_METERS")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_NEARBY_CATEGORY_RADIUS_METERS),
+            nearby_category_limit: lookup("NEARBY_CATEGORY_LIMIT")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_NEARBY_CATEGORY_LIMIT)
+                .clamp(1, 30),
             user_agent,
             commons_proxy: lookup("COMMONS_PROXY").filter(|value| !value.trim().is_empty()),
             commons_ignore_exists_normalized_warning,
@@ -257,7 +279,8 @@ mod tests {
         Config, DEFAULT_ARCHIVE_THUMBNAIL_RESIZE, DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING,
         DEFAULT_FFMPEG_PATH, DEFAULT_FFPROBE_PATH, DEFAULT_MAX_ARCHIVE_FILE_MB,
         DEFAULT_MAX_CONVERSION_FILE_MB, DEFAULT_MAX_VIDEO_AUDIO_CONVERSION_FILE_MB,
-        DEFAULT_WEBP_QUALITY, DEFAULT_YTDLP_PATH, parse_admin_ids,
+        DEFAULT_NEARBY_CATEGORY_LIMIT, DEFAULT_NEARBY_CATEGORY_RADIUS_METERS, DEFAULT_WEBP_QUALITY,
+        DEFAULT_YTDLP_PATH, parse_admin_ids,
     };
     use crate::models::License;
     use std::collections::HashMap;
@@ -307,6 +330,15 @@ mod tests {
             "https://commons.wikimedia.org/w/api.php"
         );
         assert_eq!(
+            config.wikidata_sparql_url,
+            "https://query.wikidata.org/sparql"
+        );
+        assert_eq!(
+            config.nearby_category_radius_meters,
+            DEFAULT_NEARBY_CATEGORY_RADIUS_METERS
+        );
+        assert_eq!(config.nearby_category_limit, DEFAULT_NEARBY_CATEGORY_LIMIT);
+        assert_eq!(
             config.commons_ignore_exists_normalized_warning,
             DEFAULT_COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING
         );
@@ -334,6 +366,9 @@ mod tests {
             ("MAX_VIDEO_AUDIO_CONVERSION_FILE_MB", "3072"),
             ("MAX_ARCHIVE_FILE_MB", "2048"),
             ("ARCHIVE_THUMBNAIL_RESIZE", "false"),
+            ("WIKIDATA_SPARQL_URL", "https://example.org/sparql"),
+            ("NEARBY_CATEGORY_RADIUS_METERS", "2500"),
+            ("NEARBY_CATEGORY_LIMIT", "99"),
             ("COMMONS_IGNORE_EXISTS_NORMALIZED_WARNING", "false"),
             ("OAUTH2_CLIENT_ID", "client-id"),
             ("OAUTH2_CLIENT_SECRET", "client-secret"),
@@ -360,6 +395,9 @@ mod tests {
         );
         assert_eq!(config.max_archive_file_bytes, 2048 * 1024 * 1024);
         assert!(!config.archive_thumbnail_resize);
+        assert_eq!(config.wikidata_sparql_url, "https://example.org/sparql");
+        assert_eq!(config.nearby_category_radius_meters, 2500);
+        assert_eq!(config.nearby_category_limit, 30);
         assert!(!config.commons_ignore_exists_normalized_warning);
         assert_eq!(config.ytdlp_path, "/opt/bin/yt-dlp");
         assert_eq!(
