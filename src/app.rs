@@ -69,6 +69,8 @@ const UPDATE_IDEMPOTENCY_SECONDS: i64 = 24 * 60 * 60;
 const UPDATE_IN_PROGRESS_SECONDS: i64 = 10 * 60;
 /// Error marker used to make duplicate in-flight webhooks retryable by Telegram.
 const UPDATE_ALREADY_IN_PROGRESS_ERROR: &str = "telegram update is already being processed";
+/// Maximum time spent linking default categories before replying to Telegram.
+const DEFAULT_CATEGORY_LINK_TIMEOUT_SECONDS: u64 = 3;
 /// Maximum age of an OAuth2 callback state token.
 const OAUTH2_STATE_TTL_SECONDS: i64 = 30 * 60;
 /// Message shown once onboarding is complete.
@@ -1797,25 +1799,9 @@ impl Bot {
                     }
                     touch(&mut profile);
                     self.store.put_profile(user_id, &profile).await?;
-                    let existing_categories = match self
-                        .commons
-                        .missing_categories(&profile.default_categories)
-                        .await
-                    {
-                        Ok(missing) => profile
-                            .default_categories
-                            .iter()
-                            .filter(|category| !missing.contains(category))
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %format!("{error:#}"),
-                                "failed to check default category existence"
-                            );
-                            Vec::new()
-                        }
-                    };
+                    let existing_categories = self
+                        .existing_default_categories(&profile.default_categories)
+                        .await;
                     return self
                         .telegram
                         .send_message(
@@ -4448,6 +4434,39 @@ impl Bot {
             }
         }
         self.telegram.send_message(chat_id, &text, None).await
+    }
+
+    /// Returns default categories confirmed to exist without blocking the Telegram webhook.
+    async fn existing_default_categories(&self, categories: &[String]) -> Vec<String> {
+        if categories.is_empty() {
+            return Vec::new();
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(DEFAULT_CATEGORY_LINK_TIMEOUT_SECONDS),
+            self.commons.missing_categories(categories),
+        )
+        .await
+        {
+            Ok(Ok(missing)) => categories
+                .iter()
+                .filter(|category| !missing.contains(category))
+                .cloned()
+                .collect(),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "failed to check default category existence"
+                );
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = DEFAULT_CATEGORY_LINK_TIMEOUT_SECONDS,
+                    "timed out checking default category existence"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Tells the user a file is over the configured upload limit.
