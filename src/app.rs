@@ -104,6 +104,8 @@ const TEXT_CONTEXT_MATCH_SECONDS: i64 = 60;
 const TEXT_CONTEXT_WAIT_ATTEMPTS: usize = 20;
 /// Delay between adjacent-text context checks.
 const TEXT_CONTEXT_WAIT_MS: u64 = 300;
+/// Delay before acknowledging text-only upload context if no nearby media consumed it.
+const TEXT_CONTEXT_ACK_DELAY_MS: u64 = MEDIA_GROUP_UPLOAD_DELAY_MS + 2_000;
 /// Maximum number of remembered categories per user profile.
 const MAX_USED_CATEGORIES: usize = 80;
 /// Maximum number of category rows shown in the settings picker.
@@ -139,6 +141,8 @@ struct TextContext {
     text: String,
     expires_at: i64,
     message_date: Option<i64>,
+    message_id: Option<i64>,
+    used: bool,
 }
 
 /// Stable key for one Telegram media group inside a chat.
@@ -1278,6 +1282,7 @@ impl Bot {
             && crate::commons::parse_settings_command(&trimmed).is_empty()
             && remember_text_context(chat_id, user_id, &message, &trimmed).await
         {
+            spawn_text_context_ack(self.telegram.clone(), chat_id, user_id, message.message_id);
             return Ok(());
         }
         self.handle_onboarding_text(chat_id, user_id, &message, &trimmed)
@@ -6468,10 +6473,45 @@ async fn remember_text_context(chat_id: i64, user_id: i64, message: &Message, te
             text: text.to_string(),
             expires_at: now + TEXT_CONTEXT_TTL_SECONDS,
             message_date: message.date.or(Some(now)),
+            message_id: message.message_id,
+            used: false,
         },
     );
     tracing::info!(user_id, chat_id, "remembered text for nearby upload");
     true
+}
+
+/// Sends a delayed acknowledgement if a text-only message remains standalone.
+fn spawn_text_context_ack(
+    telegram: TelegramClient,
+    chat_id: i64,
+    user_id: i64,
+    message_id: Option<i64>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(TEXT_CONTEXT_ACK_DELAY_MS)).await;
+        if !text_context_ack_pending(chat_id, user_id, message_id).await {
+            return;
+        }
+        telegram
+            .send_message(
+                chat_id,
+                "📝 Saved this text as caption/filename prefix for files sent within 1 minute.",
+                None,
+            )
+            .await
+            .ok();
+    });
+}
+
+/// Returns true when a remembered text-only message has not been used by nearby media.
+async fn text_context_ack_pending(chat_id: i64, user_id: i64, message_id: Option<i64>) -> bool {
+    let now = now_ts();
+    let mut contexts = TEXT_CONTEXTS.write().await;
+    contexts.retain(|_, context| context.expires_at >= now);
+    contexts
+        .get(&(chat_id, user_id))
+        .is_some_and(|context| context.message_id == message_id && !context.used)
 }
 
 /// Returns recent text for an uncaptained upload.
@@ -6492,11 +6532,13 @@ async fn peek_text_context(chat_id: i64, user_id: i64, message: &Message) -> Opt
     let now = now_ts();
     let mut contexts = TEXT_CONTEXTS.write().await;
     contexts.retain(|_, context| context.expires_at >= now);
-    contexts
-        .get(&(chat_id, user_id))
-        .filter(|context| context.expires_at >= now)
-        .filter(|context| text_context_matches_message(context, message))
-        .map(|context| context.text.clone())
+    let context = contexts.get_mut(&(chat_id, user_id))?;
+    if context.expires_at >= now && text_context_matches_message(context, message) {
+        context.used = true;
+        Some(context.text.clone())
+    } else {
+        None
+    }
 }
 
 /// Consumes recent text for the next normal uncaptained upload in the same chat.
@@ -8031,7 +8073,8 @@ mod tests {
         now_ts, parse_category_list, register_media_group_upload, remember_text_context,
         remember_used_categories, settings_categories_keyboard, settings_keyboard,
         settings_license_keyboard, settings_prefix_keyboard, should_try_ffmpeg_media_conversion,
-        status_for_webhook_error, take_text_context, text_context_for_upload,
+        status_for_webhook_error, take_text_context, text_context_ack_pending,
+        text_context_for_upload,
     };
     use crate::commons::{build_filename, parse_caption};
     use crate::convert::SourceFormat;
@@ -8410,6 +8453,8 @@ mod tests {
                 text: "Храм Вознесения Господня\nCategories: Churches".into(),
                 expires_at: now_ts() + 60,
                 message_date: Some(1_030),
+                message_id: Some(77),
+                used: false,
             },
         );
 
@@ -8438,6 +8483,8 @@ mod tests {
                 text: "Фонтан усадьбы".into(),
                 expires_at: now_ts() + 60,
                 message_date: Some(1_030),
+                message_id: Some(77),
+                used: false,
             },
         );
 
@@ -8473,6 +8520,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remembered_text_ack_is_suppressed_after_upload_uses_it() {
+        let chat_id = -9_001_007;
+        let user_id = 9_001_007;
+        let mut text_message = test_message(chat_id, user_id, false);
+        text_message.message_id = Some(55);
+        text_message.date = Some(1_030);
+        assert!(remember_text_context(chat_id, user_id, &text_message, "Фонтан усадьбы").await);
+        assert!(text_context_ack_pending(chat_id, user_id, Some(55)).await);
+
+        let mut media_message = test_message(chat_id, user_id, false);
+        media_message.date = Some(1_031);
+        assert_eq!(
+            text_context_for_upload(chat_id, user_id, &media_message)
+                .await
+                .as_deref(),
+            Some("Фонтан усадьбы")
+        );
+        assert!(!text_context_ack_pending(chat_id, user_id, Some(55)).await);
+    }
+
+    #[tokio::test]
     async fn text_context_requires_one_minute_send_time_window() {
         let chat_id = -9_001_006;
         let user_id = 9_001_006;
@@ -8483,6 +8551,8 @@ mod tests {
                 text: "Too far away".into(),
                 expires_at: now_ts() + 60,
                 message_date: Some(900),
+                message_id: Some(77),
+                used: false,
             },
         );
 
@@ -8502,6 +8572,8 @@ mod tests {
                 text: "Too old".into(),
                 expires_at: now_ts() - 1,
                 message_date: Some(1_000),
+                message_id: Some(77),
+                used: false,
             },
         );
 
