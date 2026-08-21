@@ -21,8 +21,9 @@ libvips-tools
 # Used by the Toolforge wrapper to register the local Bot API webhook on startup.
 curl
 
-# Build/runtime libs for HEIC->WebP.
-libheif-dev
+# Runtime libs for HEIC->WebP fallbacks. Do not install libheif-dev here:
+# Ubuntu noble ships libheif 1.17, and its libheif.pc shadows the vendored
+# libheif 1.23 that libheif-rs builds through the embedded-libheif feature.
 libde265-dev
 libheif1
 libde265-0
