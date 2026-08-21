@@ -1564,7 +1564,7 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
                 coordinates = Some(coords);
             }
         } else {
-            description_lines.push(line);
+            description_lines.push(clean_caption_description_line(line));
         }
     }
     ParsedCaption {
@@ -1574,6 +1574,28 @@ pub fn parse_caption(caption: &str) -> ParsedCaption {
         author,
         date,
         coordinates,
+    }
+}
+
+/// Removes Telegram caption markers that users add as directional hints, preserving other emoji.
+fn clean_caption_description_line(line: &str) -> String {
+    let mut cleaned = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '⬆' => {
+                if chars.peek() == Some(&'\u{fe0f}') {
+                    chars.next();
+                }
+            }
+            '📍' => {}
+            _ => cleaned.push(ch),
+        }
+    }
+    if cleaned == line {
+        cleaned
+    } else {
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -1963,6 +1985,18 @@ mod tests {
         let parsed = parse_caption("Just a description");
         assert_eq!(parsed.description, "Just a description");
         assert!(parsed.categories.is_empty());
+    }
+
+    #[test]
+    fn caption_drops_only_direction_markers() {
+        let parsed = parse_caption("Россоны ⬆️");
+        assert_eq!(parsed.description, "Россоны");
+
+        let parsed = parse_caption("Храм Вознесения Господня\n📍Ждановичи");
+        assert_eq!(parsed.description, "Храм Вознесения Господня\nЖдановичи");
+
+        let parsed = parse_caption("Россоны ✅");
+        assert_eq!(parsed.description, "Россоны ✅");
     }
 
     #[test]
