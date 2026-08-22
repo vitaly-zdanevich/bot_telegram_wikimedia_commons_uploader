@@ -22,6 +22,7 @@ install = [
     "libvips-tools",
     "curl",
     "libde265-dev",
+    "libnuma-dev",
     "libheif1",
     "libde265-0",
 ]
